@@ -175,12 +175,51 @@ int susfs_kstat_init(void)
             pr_info("kstat spoof armed: %d rules\n", nkstat);
         }
     }
+    susfs_kstat_syscall_diag_init();
     return 0;
 }
 
 void susfs_kstat_exit(void)
 {
+    susfs_kstat_syscall_diag_exit();
     unregister_kretprobe(&krp_nosec);
     unregister_kretprobe(&krp);
     nkstat = 0;
+}
+
+/* ---- temporary syscall diagnosis ---- */
+static int kp_statx_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+    pr_info("SYSCALL statx: comm=%s\n", current->comm);
+    return 0;
+}
+
+static int kp_newfstatat_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+    struct pt_regs *user = (struct pt_regs *)regs->regs[0];
+    pr_info("SYSCALL newfstatat: comm=%s\n", current->comm);
+    return 0;
+}
+
+static struct kprobe kp_statx = {
+    .symbol_name = "__arm64_sys_statx",
+    .pre_handler = kp_statx_pre,
+};
+
+static struct kprobe kp_newfstatat = {
+    .symbol_name = "__arm64_sys_newfstatat",
+    .pre_handler = kp_newfstatat_pre,
+};
+
+int susfs_kstat_syscall_diag_init(void)
+{
+    register_kprobe(&kp_statx);
+    register_kprobe(&kp_newfstatat);
+    return 0;
+}
+
+void susfs_kstat_syscall_diag_exit(void)
+{
+    unregister_kprobe(&kp_newfstatat);
+    unregister_kprobe(&kp_statx);
 }
