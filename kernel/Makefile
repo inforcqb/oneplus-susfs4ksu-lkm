@@ -16,6 +16,11 @@ susfs-objs := susfs_main.o patch_memory.o symbol_resolver.o lsm_hook.o
 KSU_NEW_DCACHE_FLUSH := $(shell grep -q __flush_dcache_area $(srctree)/arch/arm64/include/asm/cacheflush.h; echo $$?)
 ccflags-y += -DKSU_NEW_DCACHE_FLUSH=$(KSU_NEW_DCACHE_FLUSH)
 
+# Match SukiSU's build flags: upstream code declares after statements and
+# casts symbol addresses (unsigned long) to function pointers.
+ccflags-y += -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat -Wno-missing-prototypes
+ccflags-y += -Wno-declaration-after-statement -Wno-unused-function
+
 # SELinux private headers are only needed once selinux hooks are added.
 # Uncomment when the selinux feature lands:
 # ccflags-y += -I$(srctree)/security/selinux -I$(srctree)/security/selinux/include
