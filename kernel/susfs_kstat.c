@@ -109,11 +109,15 @@ static int kr_vfs_getattr_entry(struct kretprobe_instance *ri, struct pt_regs *r
 static int kr_vfs_getattr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     struct kstat_args *a = (struct kstat_args *)ri->data;
+    struct inode *inode;
 
-    if (regs_return_value(regs) != 0)
+    if (!a->path || !a->path->dentry || !a->stat)
         return 0;
-    if (a->path && a->path->dentry)
-        susfs_kstat_spoof(a->path->dentry->d_inode, a->stat);
+    inode = a->path->dentry->d_inode;
+    if (inode && inode->i_ino == param_target_ino)
+        pr_info_ratelimited("kstat hit: ino=%lu stat->ino=%lu\n",
+                            inode->i_ino, a->stat->ino);
+    susfs_kstat_spoof(inode, a->stat);
     return 0;
 }
 
@@ -130,6 +134,11 @@ int susfs_kstat_init(void)
     int rc;
 
     susfs_kstat_add_ino(param_target_ino, param_spoofed_ino);
+    if (nkstat == 0) {
+        pr_info("kstat spoof: no rules, hook not installed\n");
+        return 0;
+    }
+
     rc = register_kretprobe(&krp);
     if (rc)
         pr_warn("register_kretprobe(vfs_getattr) failed %d\n", rc);
