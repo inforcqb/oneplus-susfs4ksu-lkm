@@ -9,7 +9,12 @@
 
 obj-m += susfs.o
 
-susfs-objs := susfs_main.o
+susfs-objs := susfs_main.o patch_memory.o symbol_resolver.o lsm_hook.o
+
+# 5.14+ replaced __flush_dcache_area/__flush_icache_range with
+# dcache_clean_inval_poc/caches_clean_inval_pou.  Detect which to use.
+KSU_NEW_DCACHE_FLUSH := $(shell grep -q __flush_dcache_area $(srctree)/arch/arm64/include/asm/cacheflush.h; echo $$?)
+ccflags-y += -DKSU_NEW_DCACHE_FLUSH=$(KSU_NEW_DCACHE_FLUSH)
 
 # SELinux private headers are only needed once selinux hooks are added.
 # Uncomment when the selinux feature lands:
