@@ -103,6 +103,7 @@ static int kr_vfs_getattr_entry(struct kretprobe_instance *ri, struct pt_regs *r
     /* vfs_getattr(path, stat, request_mask, query_flags): direct args */
     a->path = (const struct path *)regs->regs[0];
     a->stat = (struct kstat *)regs->regs[1];
+    pr_info_ratelimited("vfs_getattr entry: path=%px stat=%px\n", a->path, a->stat);
     return 0;
 }
 
