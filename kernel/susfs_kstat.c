@@ -203,6 +203,18 @@ static int kp_newfstatat_pre(struct kprobe *kp, struct pt_regs *regs)
     return 0;
 }
 
+static int kp_fstatat64_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+    pr_info("SYSCALL fstatat64: comm=%s\n", current->comm);
+    return 0;
+}
+
+static int kp_fstat_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+    pr_info("SYSCALL fstat: comm=%s\n", current->comm);
+    return 0;
+}
+
 static struct kprobe kp_statx = {
     .symbol_name = "__arm64_sys_statx",
     .pre_handler = kp_statx_pre,
@@ -213,15 +225,29 @@ static struct kprobe kp_newfstatat = {
     .pre_handler = kp_newfstatat_pre,
 };
 
+static struct kprobe kp_fstatat64 = {
+    .symbol_name = "__arm64_sys_fstatat64",
+    .pre_handler = kp_fstatat64_pre,
+};
+
+static struct kprobe kp_fstat = {
+    .symbol_name = "__arm64_sys_fstat",
+    .pre_handler = kp_fstat_pre,
+};
+
 int susfs_kstat_syscall_diag_init(void)
 {
     register_kprobe(&kp_statx);
     register_kprobe(&kp_newfstatat);
+    register_kprobe(&kp_fstatat64);
+    register_kprobe(&kp_fstat);
     return 0;
 }
 
 void susfs_kstat_syscall_diag_exit(void)
 {
+    unregister_kprobe(&kp_fstat);
+    unregister_kprobe(&kp_fstatat64);
     unregister_kprobe(&kp_newfstatat);
     unregister_kprobe(&kp_statx);
 }
