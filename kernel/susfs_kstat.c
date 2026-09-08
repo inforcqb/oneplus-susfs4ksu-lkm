@@ -115,6 +115,9 @@ static int kr_vfs_getattr_ret(struct kretprobe_instance *ri, struct pt_regs *reg
     if (!a->path || !a->path->dentry || !a->stat)
         return 0;
     inode = a->path->dentry->d_inode;
+    pr_info_ratelimited("KSTAT TRACE getattr: inode=%lu stat=%lu ret=%ld comm=%s\n",
+                        inode ? inode->i_ino : 0, a->stat->ino,
+                        regs_return_value(regs), current->comm);
     matched = inode && (inode->i_ino == param_target_ino ||
                         a->stat->ino == param_target_ino);
     if (matched)
@@ -135,6 +138,14 @@ static struct kretprobe krp = {
     .maxactive = 64,
 };
 
+static struct kretprobe krp_nosec = {
+    .kp.symbol_name = "vfs_getattr_nosec",
+    .entry_handler = kr_vfs_getattr_entry,
+    .handler = kr_vfs_getattr_ret,
+    .data_size = sizeof(struct kstat_args),
+    .maxactive = 64,
+};
+
 int susfs_kstat_init(void)
 {
     int rc;
@@ -148,13 +159,21 @@ int susfs_kstat_init(void)
     rc = register_kretprobe(&krp);
     if (rc)
         pr_warn("register_kretprobe(vfs_getattr) failed %d\n", rc);
-    else
-        pr_info("kstat spoof armed: %d rules\n", nkstat);
+    else {
+        rc = register_kretprobe(&krp_nosec);
+        if (rc) {
+            pr_warn("register_kretprobe(vfs_getattr_nosec) failed %d\n", rc);
+            unregister_kretprobe(&krp);
+        } else {
+            pr_info("kstat spoof armed: %d rules\n", nkstat);
+        }
+    }
     return 0;
 }
 
 void susfs_kstat_exit(void)
 {
+    unregister_kretprobe(&krp_nosec);
     unregister_kretprobe(&krp);
     nkstat = 0;
 }
