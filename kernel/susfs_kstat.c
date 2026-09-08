@@ -13,6 +13,7 @@
 #include <linux/module.h>
 #include <linux/kprobes.h>
 #include <linux/fs.h>
+#include <linux/path.h>
 #include <linux/stat.h>
 #include "susfs_log.h"
 
@@ -91,32 +92,35 @@ static void susfs_kstat_spoof(struct inode *inode, struct kstat *stat)
 }
 
 struct kstat_args {
-    struct inode *inode;
+    const struct path *path;
     struct kstat *stat;
 };
 
-static int kr_generic_fillattr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+static int kr_vfs_getattr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     struct kstat_args *a = (struct kstat_args *)ri->data;
 
-    /* generic_fillattr(mnt_userns, inode, stat): direct args, no wrapper nesting */
-    a->inode = (struct inode *)regs->regs[1];
-    a->stat = (struct kstat *)regs->regs[2];
+    /* vfs_getattr(path, stat, request_mask, query_flags): direct args */
+    a->path = (const struct path *)regs->regs[0];
+    a->stat = (struct kstat *)regs->regs[1];
     return 0;
 }
 
-static int kr_generic_fillattr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+static int kr_vfs_getattr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     struct kstat_args *a = (struct kstat_args *)ri->data;
 
-    susfs_kstat_spoof(a->inode, a->stat);
+    if (regs_return_value(regs) != 0)
+        return 0;
+    if (a->path && a->path->dentry)
+        susfs_kstat_spoof(a->path->dentry->d_inode, a->stat);
     return 0;
 }
 
 static struct kretprobe krp = {
-    .kp.symbol_name = "generic_fillattr",
-    .entry_handler = kr_generic_fillattr_entry,
-    .handler = kr_generic_fillattr_ret,
+    .kp.symbol_name = "vfs_getattr",
+    .entry_handler = kr_vfs_getattr_entry,
+    .handler = kr_vfs_getattr_ret,
     .data_size = sizeof(struct kstat_args),
     .maxactive = 64,
 };
@@ -128,7 +132,7 @@ int susfs_kstat_init(void)
     susfs_kstat_add_ino(param_target_ino, param_spoofed_ino);
     rc = register_kretprobe(&krp);
     if (rc)
-        pr_warn("register_kretprobe(generic_fillattr) failed %d\n", rc);
+        pr_warn("register_kretprobe(vfs_getattr) failed %d\n", rc);
     else
         pr_info("kstat spoof armed: %d rules\n", nkstat);
     return 0;
