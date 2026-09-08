@@ -13,11 +13,9 @@
 
 #include "symbol_resolver.h"
 #include "lsm_hook.h"
+#include "susfs.h"
 
-#define SUSFS_LKM_VERSION "0.2.0-dev"
-
-int susfs_uname_init(void);
-void susfs_uname_exit(void);
+#define SUSFS_LKM_VERSION "0.3.0-dev"
 
 static int __init susfs_init(void)
 {
@@ -25,11 +23,13 @@ static int __init susfs_init(void)
     ksu_init_symbol_resolver();
     ksu_lsm_hook_init();
     susfs_uname_init();
+    susfs_kstat_init();
     return 0;
 }
 
 static void __exit susfs_exit(void)
 {
+    susfs_kstat_exit();
     susfs_uname_exit();
     ksu_lsm_hook_exit();
     pr_info("susfs-lkm: exit\n");
