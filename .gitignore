@@ -1,0 +1,15 @@
+# kernel module build outputs
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.order
+.modules.order
+Module.symvers
+modules.order
+*.cmd
+.tmp_versions/
+
+# downloaded CI artifacts
+artifacts/

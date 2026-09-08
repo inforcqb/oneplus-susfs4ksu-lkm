@@ -1,0 +1,49 @@
+name: build-lkm-ddk
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      # DDK-min image with GKI android13-5.15 kernel headers (modules_prepare
+      # done), Module.symvers and the matching Clang toolchain.  KMI freezing
+      # guarantees symbol CRCs match the GKI kernel.
+      image: ghcr.io/ylarod/ddk-min:android13-5.15-20260313
+      options: --privileged
+
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@v4
+
+      - name: Inspect DDK environment
+        run: |
+          echo "KDIR=$KDIR"
+          echo "KERNEL_SRC=$KERNEL_SRC"
+          echo "CLANG_PATH=$CLANG_PATH"
+          clang --version | head -1
+
+      - name: Build susfs.ko (DDK way)
+        run: |
+          set -e
+          make -C $KDIR M=$PWD/kernel \
+               ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+               modules -j$(nproc) 2>&1 | tail -50
+          ls -la kernel/susfs.ko
+          file kernel/susfs.ko
+
+      - name: Verify sections (__versions / .BTF / cfi)
+        run: |
+          f=kernel/susfs.ko
+          readelf -S "$f" | grep -E "__versions|\.BTF|cfi|\.llvm_addrsig|\.plt|modinfo" || true
+          echo "--- vermagic"
+          modinfo "$f" 2>/dev/null | grep -E "vermagic|srcversion" || true
+
+      - name: Upload .ko
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs.ko-ddk
+          path: kernel/susfs.ko
+          if-no-files-found: error
