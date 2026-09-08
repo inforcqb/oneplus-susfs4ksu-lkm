@@ -153,6 +153,9 @@ static struct kretprobe krp_nosec = {
     .maxactive = 64,
 };
 
+int susfs_kstat_syscall_diag_init(void);
+void susfs_kstat_syscall_diag_exit(void);
+
 int susfs_kstat_init(void)
 {
     int rc;
@@ -196,7 +199,6 @@ static int kp_statx_pre(struct kprobe *kp, struct pt_regs *regs)
 
 static int kp_newfstatat_pre(struct kprobe *kp, struct pt_regs *regs)
 {
-    struct pt_regs *user = (struct pt_regs *)regs->regs[0];
     pr_info("SYSCALL newfstatat: comm=%s\n", current->comm);
     return 0;
 }
