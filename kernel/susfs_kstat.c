@@ -110,17 +110,18 @@ static int kr_vfs_getattr_ret(struct kretprobe_instance *ri, struct pt_regs *reg
 {
     struct kstat_args *a = (struct kstat_args *)ri->data;
     struct inode *inode;
+    bool matched;
 
     if (!a->path || !a->path->dentry || !a->stat)
         return 0;
     inode = a->path->dentry->d_inode;
-    if (inode && (inode->i_ino == param_target_ino ||
-                  a->stat->ino == param_target_ino))
+    matched = inode && (inode->i_ino == param_target_ino ||
+                        a->stat->ino == param_target_ino);
+    if (matched)
         pr_info("KSTAT HIT before: inode->i_ino=%lu stat->ino=%lu target=%lu spoof=%lu\n",
             inode->i_ino, a->stat->ino, param_target_ino, param_spoofed_ino);
     susfs_kstat_spoof(inode, a->stat);
-    if (inode && (inode->i_ino == param_target_ino ||
-                  a->stat->ino == param_target_ino))
+    if (matched)
         pr_info("KSTAT HIT after: inode->i_ino=%lu stat->ino=%lu\n",
                 inode->i_ino, a->stat->ino);
     return 0;
