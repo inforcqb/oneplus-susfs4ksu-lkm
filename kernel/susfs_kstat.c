@@ -71,7 +71,7 @@ static void susfs_kstat_spoof(struct inode *inode, struct kstat *stat)
 
     for (i = 0; i < nkstat; i++) {
         struct sus_kstat_entry *e = &kstat_entries[i];
-        if (e->target_ino != ino)
+        if (e->target_ino != ino && e->target_ino != stat->ino)
             continue;
         if (e->target_dev && e->target_dev != dev)
             continue;
@@ -114,11 +114,13 @@ static int kr_vfs_getattr_ret(struct kretprobe_instance *ri, struct pt_regs *reg
     if (!a->path || !a->path->dentry || !a->stat)
         return 0;
     inode = a->path->dentry->d_inode;
-    if (inode && inode->i_ino == param_target_ino)
+    if (inode && (inode->i_ino == param_target_ino ||
+                  a->stat->ino == param_target_ino))
         pr_info("KSTAT HIT before: inode->i_ino=%lu stat->ino=%lu target=%lu spoof=%lu\n",
             inode->i_ino, a->stat->ino, param_target_ino, param_spoofed_ino);
     susfs_kstat_spoof(inode, a->stat);
-    if (inode && inode->i_ino == param_target_ino)
+    if (inode && (inode->i_ino == param_target_ino ||
+                  a->stat->ino == param_target_ino))
         pr_info("KSTAT HIT after: inode->i_ino=%lu stat->ino=%lu\n",
                 inode->i_ino, a->stat->ino);
     return 0;
