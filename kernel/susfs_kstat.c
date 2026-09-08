@@ -99,10 +99,16 @@ struct kstat_args {
 static int kr_vfs_getattr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     struct kstat_args *a = (struct kstat_args *)ri->data;
+    struct dentry *d;
 
     /* vfs_getattr(path, stat, request_mask, query_flags): direct args */
     a->path = (const struct path *)regs->regs[0];
     a->stat = (struct kstat *)regs->regs[1];
+
+    d = (a->path) ? a->path->dentry : NULL;
+    if (d && d->d_inode && current->comm && strcmp(current->comm, "stat") == 0)
+        pr_info("GETATTR stat: name=%.*s i_ino=%lu\n",
+                (int)d->d_name.len, d->d_name.name, d->d_inode->i_ino);
     return 0;
 }
 
