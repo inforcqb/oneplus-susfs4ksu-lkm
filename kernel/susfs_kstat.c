@@ -15,6 +15,7 @@
 #include <linux/fs.h>
 #include <linux/path.h>
 #include <linux/stat.h>
+#include <linux/uaccess.h>
 #include "susfs_log.h"
 
 #define KSTAT_SPOOF_INO      (1 << 0)
@@ -215,6 +216,17 @@ static int kp_fstat_pre(struct kprobe *kp, struct pt_regs *regs)
     return 0;
 }
 
+static int kp_vfs_statx_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+    char buf[64];
+    const char __user *filename = (const char __user *)regs->regs[1];
+    long n = strncpy_from_user_nofault(buf, filename, sizeof(buf));
+    pr_info("VFS_STATX: comm=%s dfd=%ld filename=%.*s\n",
+            current->comm, regs->regs[0],
+            (int)(n > 0 ? n : 0), n > 0 ? buf : "");
+    return 0;
+}
+
 static struct kprobe kp_statx = {
     .symbol_name = "__arm64_sys_statx",
     .pre_handler = kp_statx_pre,
@@ -235,17 +247,24 @@ static struct kprobe kp_fstat = {
     .pre_handler = kp_fstat_pre,
 };
 
+static struct kprobe kp_vfs_statx = {
+    .symbol_name = "vfs_statx",
+    .pre_handler = kp_vfs_statx_pre,
+};
+
 int susfs_kstat_syscall_diag_init(void)
 {
     register_kprobe(&kp_statx);
     register_kprobe(&kp_newfstatat);
     register_kprobe(&kp_fstatat64);
     register_kprobe(&kp_fstat);
+    register_kprobe(&kp_vfs_statx);
     return 0;
 }
 
 void susfs_kstat_syscall_diag_exit(void)
 {
+    unregister_kprobe(&kp_vfs_statx);
     unregister_kprobe(&kp_fstat);
     unregister_kprobe(&kp_fstatat64);
     unregister_kprobe(&kp_newfstatat);
