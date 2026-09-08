@@ -106,8 +106,8 @@ static int kr_vfs_getattr_entry(struct kretprobe_instance *ri, struct pt_regs *r
     a->stat = (struct kstat *)regs->regs[1];
 
     d = (a->path) ? a->path->dentry : NULL;
-    if (d && d->d_inode && strstr(d->d_name.name, "susfs") != NULL)
-        pr_info("GETATTR susfs: name=%.*s i_ino=%lu comm=%s\n",
+    if (d && d->d_inode)
+        pr_info_ratelimited("GETATTR: name=%.*s i_ino=%lu comm=%s\n",
                 (int)d->d_name.len, d->d_name.name, d->d_inode->i_ino,
                 current->comm);
     return 0;
