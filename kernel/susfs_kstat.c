@@ -44,8 +44,8 @@ static int nkstat;
  * adds a single ino-spoofing rule (extended to a full add/update interface). */
 static unsigned long param_target_ino;
 static unsigned long param_spoofed_ino;
-module_param(param_target_ino, ulong, 0644);
-module_param(param_spoofed_ino, ulong, 0644);
+module_param_named(target_ino, param_target_ino, ulong, 0644);
+module_param_named(spoofed_ino, param_spoofed_ino, ulong, 0644);
 
 static void susfs_kstat_add_ino(unsigned long target_ino, unsigned long spoofed_ino)
 {
