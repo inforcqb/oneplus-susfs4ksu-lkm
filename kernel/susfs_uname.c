@@ -55,10 +55,12 @@ static int kr_newuname_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
     if (!uname_spoof_enabled || !a->name)
         return 0;
 
-    copy_to_user((char __user *)a->name + offsetof(struct new_utsname, release),
-                 fake_release, SUSFS_UNAME_LEN);
-    copy_to_user((char __user *)a->name + offsetof(struct new_utsname, version),
-                 fake_version, SUSFS_UNAME_LEN);
+    if (copy_to_user((char __user *)a->name + offsetof(struct new_utsname, release),
+                     fake_release, SUSFS_UNAME_LEN))
+        return 0;
+    if (copy_to_user((char __user *)a->name + offsetof(struct new_utsname, version),
+                     fake_version, SUSFS_UNAME_LEN))
+        return 0;
     return 0;
 }
 
