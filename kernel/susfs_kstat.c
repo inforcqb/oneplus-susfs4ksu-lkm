@@ -103,12 +103,6 @@ static int kr_vfs_getattr_entry(struct kretprobe_instance *ri, struct pt_regs *r
     /* vfs_getattr(path, stat, request_mask, query_flags): direct args */
     a->path = (const struct path *)regs->regs[0];
     a->stat = (struct kstat *)regs->regs[1];
-    pr_info_ratelimited("entry: x0=%px x1=%px x2=%lx x3=%lx comm=%s dentry=%px ino=%lu\n",
-                        (void *)regs->regs[0], (void *)regs->regs[1],
-                        regs->regs[2], regs->regs[3], current->comm,
-                        (a->path && a->path->dentry) ? a->path->dentry : NULL,
-                        (a->path && a->path->dentry && a->path->dentry->d_inode) ?
-                            a->path->dentry->d_inode->i_ino : 0);
     return 0;
 }
 
@@ -117,13 +111,12 @@ static int kr_vfs_getattr_ret(struct kretprobe_instance *ri, struct pt_regs *reg
     struct kstat_args *a = (struct kstat_args *)ri->data;
     struct inode *inode;
 
-    if (!a->path || !a->path->dentry || !a->stat) {
-        pr_info_ratelimited("vfs_getattr ret: NULL path=%px stat=%px\n", a->path, a->stat);
+    if (!a->path || !a->path->dentry || !a->stat)
         return 0;
-    }
     inode = a->path->dentry->d_inode;
-    pr_info_ratelimited("vfs_getattr ret: ino=%lu (target=%lu)\n",
-                        inode ? inode->i_ino : 0, param_target_ino);
+    if (inode && inode->i_ino == param_target_ino)
+        pr_info("KSTAT HIT: ino=%lu stat->ino=%lu -> %lu\n",
+                inode->i_ino, a->stat->ino, param_spoofed_ino);
     susfs_kstat_spoof(inode, a->stat);
     return 0;
 }
