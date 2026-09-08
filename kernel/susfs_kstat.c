@@ -112,12 +112,13 @@ static int kr_vfs_getattr_ret(struct kretprobe_instance *ri, struct pt_regs *reg
     struct kstat_args *a = (struct kstat_args *)ri->data;
     struct inode *inode;
 
-    if (!a->path || !a->path->dentry || !a->stat)
+    if (!a->path || !a->path->dentry || !a->stat) {
+        pr_info_ratelimited("vfs_getattr ret: NULL path=%px stat=%px\n", a->path, a->stat);
         return 0;
+    }
     inode = a->path->dentry->d_inode;
-    if (inode && inode->i_ino == param_target_ino)
-        pr_info_ratelimited("kstat hit: ino=%lu stat->ino=%lu\n",
-                            inode->i_ino, a->stat->ino);
+    pr_info_ratelimited("vfs_getattr ret: ino=%lu (target=%lu)\n",
+                        inode ? inode->i_ino : 0, param_target_ino);
     susfs_kstat_spoof(inode, a->stat);
     return 0;
 }
