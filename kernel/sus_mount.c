@@ -21,6 +21,12 @@
 
 #define DEFAULT_KSU_MNT_ID 2000000000ULL
 
+/* NOTE: upstream SUSFS makes KSU mounts get mnt_id >= DEFAULT_KSU_MNT_ID by
+ * patching mnt_alloc_id() to call ida_alloc_min(&mnt_id_ida, DEFAULT_KSU_MNT_ID)
+ * for the ksu domain.  This LKM does NOT patch that, so on a stock KernelSU
+ * device KSU mounts keep normal (small) mnt_ids.  min_mnt_id is therefore a
+ * tunable: set it to the actual KSU mount id range, or adapt the match to a
+ * mountpoint/device name list instead of a numeric threshold. */
 static unsigned long param_min_mnt_id = DEFAULT_KSU_MNT_ID;
 module_param_named(min_mnt_id, param_min_mnt_id, ulong, 0644);
 
