@@ -57,7 +57,7 @@ static void syscall_test_exit(void *data, struct pt_regs *regs, long ret)
         if (copy_from_user(&ino, (void __user *)(state->statbuf + 8),
                            sizeof(ino)))
             ino = 0;
-        if (copy_from_user(&size, (void __user *)(state->statbuf + 40),
+        if (copy_from_user(&size, (void __user *)(state->statbuf + 48),
                            sizeof(size)))
             size = 0;
     }
