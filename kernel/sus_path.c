@@ -107,7 +107,7 @@ static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret)
         regs->regs[0] = new_count;   /* shrink the returned byte count */
 }
 
-static int __init sus_path_init(void)
+int sus_path_init(void)
 {
     int rc;
 
@@ -130,15 +130,10 @@ static int __init sus_path_init(void)
     return 0;
 }
 
-static void __exit sus_path_exit(void)
+void sus_path_exit(void)
 {
     unregister_trace_sys_exit(sus_path_sys_exit, NULL);
     tracepoint_synchronize_unregister();
     kfree(dirent_tmp);
     dirent_tmp = NULL;
 }
-
-module_init(sus_path_init);
-module_exit(sus_path_exit);
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("sus_path getdents hiding (LKM)");
