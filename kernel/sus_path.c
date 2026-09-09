@@ -103,8 +103,8 @@ static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret)
         return;
 
     new_count = sus_path_filter(dirent_buf, ret);
-    if (new_count != ret)
-        regs->regs[0] = new_count;   /* shrink the returned byte count */
+    /* TEST: do not touch the return value yet */
+    (void)new_count;
 }
 
 int sus_path_init(void)
@@ -134,6 +134,6 @@ void sus_path_exit(void)
 {
     unregister_trace_sys_exit(sus_path_sys_exit, NULL);
     tracepoint_synchronize_unregister();
-    /* TEST: skip kfree to bisect the panic */
-    /* kfree(dirent_tmp); */
+    kfree(dirent_tmp);
+    dirent_tmp = NULL;
 }
