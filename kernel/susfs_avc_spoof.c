@@ -59,12 +59,14 @@ struct selinux_audit_data {
 
 /* avc_audit_post_callback(ab, a): ab=regs[0], a=regs[1] */
 static atomic_t avc_hit_count = ATOMIC_INIT(0);
+static atomic_t avc_enter_count = ATOMIC_INIT(0);
 
 static int avc_audit_post_pre(struct kprobe *kp, struct pt_regs *regs)
 {
 	struct common_audit_data *ad = (struct common_audit_data *)regs->regs[1];
 	struct selinux_audit_data *sad;
 
+	atomic_inc(&avc_enter_count);
 	if (!ad)
 		return 0;
 	sad = ad->selinux_audit_data;
@@ -109,9 +111,9 @@ static void avc_unregister(void)
 /* ---- /proc/susfs_avc_spoof ---- */
 static int avc_proc_show(struct seq_file *m, void *v)
 {
-	seq_printf(m, "%d (su_sid=%u priv_app_sid=%u hits=%d)\n",
+	seq_printf(m, "%d (su_sid=%u priv_app_sid=%u enter=%d hits=%d)\n",
 		   avc_spoof_enabled ? 1 : 0, avc_su_sid, avc_priv_app_sid,
-		   atomic_read(&avc_hit_count));
+		   atomic_read(&avc_enter_count), atomic_read(&avc_hit_count));
 	return 0;
 }
 
