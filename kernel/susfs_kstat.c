@@ -283,6 +283,25 @@ static struct kretprobe krp_vfs_getattr = {
     .maxactive = 64,
 };
 
+/* ---- /proc/susfs_kstat: runtime rule management ---- */
+static DEFINE_MUTEX(kstat_lock);
+
+static int kstat_proc_show(struct seq_file *m, void *v);
+static int kstat_proc_open(struct inode *inode, struct file *file);
+static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
+                                size_t len, loff_t *off);
+static void kstat_del_rule(unsigned long target_ino);
+
+static const struct proc_ops kstat_proc_ops = {
+    .proc_open = kstat_proc_open,
+    .proc_read = seq_read,
+    .proc_write = kstat_proc_write,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+
+static struct proc_dir_entry *kstat_proc_entry;
+
 static bool kstat_tp_registered;
 static bool kstat_krp_registered;
 
@@ -329,9 +348,6 @@ void susfs_kstat_exit(void)
     }
     nkstat = 0;
 }
-
-/* ---- /proc/susfs_kstat: runtime rule management ---- */
-static DEFINE_MUTEX(kstat_lock);
 
 static int kstat_proc_show(struct seq_file *m, void *v)
 {
@@ -392,13 +408,3 @@ static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
 
     return len;
 }
-
-static const struct proc_ops kstat_proc_ops = {
-    .proc_open = kstat_proc_open,
-    .proc_read = seq_read,
-    .proc_write = kstat_proc_write,
-    .proc_lseek = seq_lseek,
-    .proc_release = single_release,
-};
-
-static struct proc_dir_entry *kstat_proc_entry;
