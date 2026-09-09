@@ -33,8 +33,10 @@ jobs:
                modules -j$(nproc) 2>&1 | tail -50
           ls -la kernel/susfs.ko
           ls -la kernel/syscall_test.ko
+          ls -la kernel/kstat_probe_test.ko
           file kernel/susfs.ko
           file kernel/syscall_test.ko
+          file kernel/kstat_probe_test.ko
 
       - name: Verify sections (__versions / .BTF / cfi)
         run: |
@@ -54,4 +56,5 @@ jobs:
           path: |
             kernel/susfs.ko
             kernel/syscall_test.ko
+            kernel/kstat_probe_test.ko
           if-no-files-found: error
