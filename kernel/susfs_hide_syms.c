@@ -60,6 +60,7 @@ static bool name_should_hide(const char *name)
 }
 
 static atomic_t hide_hit_count = ATOMIC_INIT(0);
+static atomic_t hide_enter_count = ATOMIC_INIT(0);
 
 /* s_show(m, p): m is arg #1 (regs->regs[0]) */
 static int hide_syms_s_show_pre(struct kprobe *kp, struct pt_regs *regs)
@@ -67,13 +68,17 @@ static int hide_syms_s_show_pre(struct kprobe *kp, struct pt_regs *regs)
 	struct seq_file *m = (struct seq_file *)regs->regs[0];
 	struct kallsym_iter_local *iter;
 
+	atomic_inc(&hide_enter_count);
 	if (!m || !m->private)
 		return 0;
 	iter = (struct kallsym_iter_local *)m->private;
 	if (!iter->name[0])
 		return 0;
 
-	if (name_should_hide(iter->name)) {
+	/* hide by name prefix OR by our module name (module symbols carry the
+	 * real name like __kstrtab_susfs_xxx, with susfs_guard_lkm in module_name) */
+	if (name_should_hide(iter->name) ||
+	    !strcmp(iter->module_name, "susfs_guard_lkm")) {
 		atomic_inc(&hide_hit_count);
 		regs->regs[0] = 0;              /* s_show returns 0 */
 		regs->pc = regs->regs[30];      /* skip the line */
@@ -109,4 +114,6 @@ void susfs_hide_syms_exit(void)
 		unregister_kprobe(&kp_s_show);
 		hide_registered = false;
 	}
+	pr_info("susfs_hide_syms: exit enter=%d hit=%d\n",
+		atomic_read(&hide_enter_count), atomic_read(&hide_hit_count));
 }
