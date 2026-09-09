@@ -39,7 +39,11 @@
 #define ST_BLKSIZE_OFF  56
 #define ST_BLOCKS_OFF   64
 
-/* arm64 compat struct compat_stat offsets (32-bit, arch/arm64/include/asm/compat.h) */
+/* arm64 compat (AArch32) struct compat_stat offsets.
+ * Layout: arch/arm64/include/asm/compat.h lines 38-66; type widths from
+ * asm-generic/compat.h (compat_ino_t=u32, compat_ushort_t=u16,
+ * compat_off_t=s32).  Field widths differ from native: st_ino is u32@4,
+ * st_nlink u16@10, st_size s32@20. */
 #define COMPAT_ST_DEV_OFF      0
 #define COMPAT_ST_INO_OFF      4
 #define COMPAT_ST_NLINK_OFF    10
@@ -47,7 +51,11 @@
 #define COMPAT_ST_BLKSIZE_OFF  24
 #define COMPAT_ST_BLOCKS_OFF   28
 
-/* ARM EABI fstatat64 (compat newfstatat maps here) */
+/* ARM EABI syscall number for fstatat64, which compat newfstatat maps to.
+ * Source: arch/arm64/include/asm/unistd32.h line 667:
+ *   #define __NR_fstatat64 327
+ * Only valid in the is_compat_task() branch; never compare it against the
+ * native __NR_newfstatat (262, asm-generic). */
 #define COMPAT_FSTATAT64_NR 327
 
 struct sus_kstat_entry {
@@ -157,6 +165,11 @@ static void susfs_kstat_spoof_compat_statbuf(unsigned long statbuf)
     if (e->flags & KSTAT_SPOOF_INO) {
         v32 = (unsigned int)e->spoofed_ino;
         if (copy_to_user((void __user *)(statbuf + COMPAT_ST_INO_OFF), &v32, sizeof(v32)))
+            return;
+    }
+    if (e->flags & KSTAT_SPOOF_DEV) {
+        v32 = (unsigned int)e->spoofed_dev;
+        if (copy_to_user((void __user *)(statbuf + COMPAT_ST_DEV_OFF), &v32, sizeof(v32)))
             return;
     }
     if (e->flags & KSTAT_SPOOF_NLINK) {
