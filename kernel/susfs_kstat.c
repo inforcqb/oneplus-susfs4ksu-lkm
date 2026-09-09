@@ -16,6 +16,9 @@
 #include <linux/uaccess.h>
 #include <linux/syscalls.h>
 #include <linux/stat.h>
+#include <linux/tracepoint.h>
+#include <trace/events/syscalls.h>
+#include <asm/syscall.h>
 #include "susfs_log.h"
 
 #define KSTAT_SPOOF_INO      (1 << 0)
@@ -124,41 +127,25 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
     }
 }
 
-struct stat_args {
+/* sys_exit tracepoint: the user statbuf is fully written by now, and
+ * syscall_get_arguments() still returns the original args (verified: args[2]
+ * == statbuf), so no per-cpu state is needed.  This is much cheaper on the
+ * hot newfstatat path than a kretprobe (jump label vs BRK + trampoline). */
+static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
+{
+    unsigned long args[6];
     unsigned long statbuf;
-};
 
-static int kr_newfstatat_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-    struct stat_args *a = (struct stat_args *)ri->data;
-    struct pt_regs *user = (struct pt_regs *)regs->regs[0];
-
-    /* syscall wrapper does NOT auto-adjust regs on this GKI kernel:
-     * regs->regs[0] is the struct pt_regs* argument; user args live in
-     * user->regs[0..3] = dfd, filename, statbuf, flag. */
-    a->statbuf = user->regs[2];
-    return 0;
+    if (syscall_get_nr(current, regs) != __NR_newfstatat)
+        return;
+    if (ret != 0)
+        return;
+    syscall_get_arguments(current, regs, args);
+    statbuf = args[2];
+    if (!statbuf)
+        return;
+    susfs_kstat_spoof_statbuf(statbuf);
 }
-
-static int kr_newfstatat_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-    struct stat_args *a = (struct stat_args *)ri->data;
-
-    if (regs_return_value(regs) != 0)
-        return 0;
-    if (!a->statbuf)
-        return 0;
-    susfs_kstat_spoof_statbuf(a->statbuf);
-    return 0;
-}
-
-static struct kretprobe krp = {
-    .kp.symbol_name = "__arm64_sys_newfstatat",
-    .entry_handler = kr_newfstatat_entry,
-    .handler = kr_newfstatat_ret,
-    .data_size = sizeof(struct stat_args),
-    .maxactive = 64,
-};
 
 /* fallback: some paths (vfs_fstat, statx, direct callers) still reach the
  * exported vfs_getattr copy; rewrite the kernel kstat there too. */
@@ -229,21 +216,22 @@ int susfs_kstat_init(void)
         return 0;
     }
 
-    rc = register_kretprobe(&krp);
+    rc = register_trace_sys_exit(kstat_sys_exit, NULL);
     if (rc)
-        pr_warn("register_kretprobe(newfstatat) failed %d\n", rc);
+        pr_warn("register_trace_sys_exit failed %d\n", rc);
 
     rc = register_kretprobe(&krp_vfs_getattr);
     if (rc)
         pr_warn("register_kretprobe(vfs_getattr) failed %d\n", rc);
 
-    pr_info("kstat spoof armed: %d rules\n", nkstat);
+    pr_info("kstat spoof armed: %d rules (tracepoint + vfs_getattr fallback)\n", nkstat);
     return 0;
 }
 
 void susfs_kstat_exit(void)
 {
     unregister_kretprobe(&krp_vfs_getattr);
-    unregister_kretprobe(&krp);
+    unregister_trace_sys_exit(kstat_sys_exit, NULL);
+    tracepoint_synchronize_unregister();
     nkstat = 0;
 }
