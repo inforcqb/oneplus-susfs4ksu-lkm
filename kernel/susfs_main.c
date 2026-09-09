@@ -28,11 +28,13 @@ static int __init susfs_init(void)
     sus_path_init();
     susfs_sus_mount_init();
     susfs_spoof_cmdline_init();
+    susfs_open_redirect_init();
     return 0;
 }
 
 static void __exit susfs_exit(void)
 {
+    susfs_open_redirect_exit();
     susfs_spoof_cmdline_exit();
     susfs_sus_mount_exit();
     sus_path_exit();
