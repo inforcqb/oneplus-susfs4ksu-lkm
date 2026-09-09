@@ -12,6 +12,7 @@
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
 #include <linux/string.h>
+#include <linux/path.h>
 #include "susfs_log.h"
 
 #define NPROBES 7
@@ -37,6 +38,14 @@ static int probe_pre(struct kprobe *kp, struct pt_regs *regs)
     struct probe_stat *ps = container_of(kp, struct probe_stat, kp);
 
     atomic_inc(&ps->hits);
+    if (strcmp(kp->symbol_name, "vfs_getattr") == 0) {
+        const struct path *path = (const struct path *)regs->regs[0];
+        if (path && path->dentry && path->dentry->d_inode &&
+            path->dentry->d_inode->i_ino == 461584)
+            pr_info("VFS_GETATTR TARGET 461584: name=%.*s comm=%s\n",
+                    (int)path->dentry->d_name.len, path->dentry->d_name.name,
+                    current->comm);
+    }
     return 0;
 }
 
