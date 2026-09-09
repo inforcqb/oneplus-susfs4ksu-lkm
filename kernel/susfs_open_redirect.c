@@ -75,6 +75,8 @@ static struct sus_or_entry *or_find(const char *target)
 }
 
 /* do_filp_open(dfd, pathname, op): pathname is arg #2 (regs->regs[1]) */
+static atomic_t or_hit_count = ATOMIC_INIT(0);
+
 static int or_do_filp_open_pre(struct kprobe *kp, struct pt_regs *regs)
 {
 	struct filename *pathname = (struct filename *)regs->regs[1];
@@ -94,6 +96,9 @@ static int or_do_filp_open_pre(struct kprobe *kp, struct pt_regs *regs)
 
 		if (strcmp(name, e->target_pathname))
 			continue;
+		atomic_inc(&or_hit_count);
+		pr_info("open_redirect: MATCH '%s' -> '%s' uid_scheme=%d\n",
+			name, e->redirected_pathname, e->uid_scheme);
 		if (!or_uid_matches(e->uid_scheme))
 			continue;
 		strcpy((char *)pathname->name, e->redirected_pathname);
@@ -177,6 +182,7 @@ static int or_proc_show(struct seq_file *m, void *v)
 	if (nor == 0) {
 		seq_puts(m, "(empty)\n");
 	} else {
+		seq_printf(m, "hit_count=%d\n", atomic_read(&or_hit_count));
 		for (i = 0; i < nor; i++)
 			seq_printf(m, "%s -> %s uid=%d\n",
 				   or_entries[i].target_pathname,
