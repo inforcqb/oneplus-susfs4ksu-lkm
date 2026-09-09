@@ -24,4 +24,8 @@ void susfs_spoof_cmdline_exit(void);
 int susfs_open_redirect_init(void);
 void susfs_open_redirect_exit(void);
 
+int susfs_enable_log_init(void);
+void susfs_enable_log_exit(void);
+bool susfs_log_enabled(void);
+
 #endif

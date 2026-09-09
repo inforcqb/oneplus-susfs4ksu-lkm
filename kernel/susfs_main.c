@@ -29,11 +29,13 @@ static int __init susfs_init(void)
     susfs_sus_mount_init();
     susfs_spoof_cmdline_init();
     susfs_open_redirect_init();
+    susfs_enable_log_init();
     return 0;
 }
 
 static void __exit susfs_exit(void)
 {
+    susfs_enable_log_exit();
     susfs_open_redirect_exit();
     susfs_spoof_cmdline_exit();
     susfs_sus_mount_exit();
