@@ -18,3 +18,6 @@ artifacts/
 last_kmsg*.gz
 last_kmsg*.txt
 kmsg.dat.gz
+
+# temporary device test scripts (hardcode /data/local/tmp paths)
+test_*.sh
