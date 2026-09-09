@@ -12,4 +12,7 @@ void susfs_kstat_exit(void);
 int susfs_sus_map_init(void);
 void susfs_sus_map_exit(void);
 
+int sus_path_init(void);
+void sus_path_exit(void);
+
 #endif
