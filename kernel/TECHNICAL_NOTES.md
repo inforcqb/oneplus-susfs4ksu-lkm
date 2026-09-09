@@ -87,3 +87,9 @@ st_rdev=32  __pad1=40  st_size=48  st_blksize=56  __pad2=60  st_blocks=64
   -Wno-int-conversion` 等。
 - SELinux 私有头路径：`-I$(srctree)/security/selinux -I$(srctree)/security/selinux/include
   -I$(objtree)/security/selinux`（flask.h 是生成头，在 objtree）。
+- **`init` 有条件注册、`exit` 无条件 unregister 会 panic**（unregister 一个从未
+  register 的 kretprobe/kprobe → NULL 解引用）。每个功能都要用
+  `static bool *_registered` 标志配对 register/unregister。
+- 一个 `.ko` 里多文件（`susfs-objs := a.o b.o ...`）时，只有主文件可以有
+  `module_init/module_exit`；其余文件的 init/exit 必须是**非 static** 的普通函数
+  （供主文件调用），否则 duplicate symbol 或链接失败。
