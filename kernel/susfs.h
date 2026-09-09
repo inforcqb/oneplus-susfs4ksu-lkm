@@ -9,4 +9,7 @@ void susfs_uname_exit(void);
 int susfs_kstat_init(void);
 void susfs_kstat_exit(void);
 
+int susfs_sus_map_init(void);
+void susfs_sus_map_exit(void);
+
 #endif

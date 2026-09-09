@@ -16,6 +16,7 @@
 #include <linux/uaccess.h>
 #include <linux/syscalls.h>
 #include <linux/stat.h>
+#include <linux/compat.h>
 #include <linux/tracepoint.h>
 #include <trace/events/syscalls.h>
 #include <asm/syscall.h>
@@ -30,13 +31,24 @@
 
 #define SUS_KSTAT_MAX 32
 
-/* arm64 asm-generic struct stat offsets */
+/* arm64 asm-generic struct stat offsets (native 64-bit) */
 #define ST_DEV_OFF      0
 #define ST_INO_OFF      8
 #define ST_NLINK_OFF    20
 #define ST_SIZE_OFF     48
 #define ST_BLKSIZE_OFF  56
 #define ST_BLOCKS_OFF   64
+
+/* arm64 compat struct compat_stat offsets (32-bit, arch/arm64/include/asm/compat.h) */
+#define COMPAT_ST_DEV_OFF      0
+#define COMPAT_ST_INO_OFF      4
+#define COMPAT_ST_NLINK_OFF    10
+#define COMPAT_ST_SIZE_OFF     20
+#define COMPAT_ST_BLKSIZE_OFF  24
+#define COMPAT_ST_BLOCKS_OFF   28
+
+/* ARM EABI fstatat64 (compat newfstatat maps here) */
+#define COMPAT_FSTATAT64_NR 327
 
 struct sus_kstat_entry {
     unsigned long target_ino;
@@ -127,6 +139,48 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
     }
 }
 
+/* compat (32-bit) statbuf: struct compat_stat, st_ino is u32 at offset 4 */
+static void susfs_kstat_spoof_compat_statbuf(unsigned long statbuf)
+{
+    struct sus_kstat_entry *e;
+    unsigned int ino = 0;
+    unsigned int v32;
+    unsigned short v16;
+    int v;
+
+    if (copy_from_user(&ino, (void __user *)(statbuf + COMPAT_ST_INO_OFF), sizeof(ino)))
+        return;
+    e = susfs_kstat_lookup(ino);
+    if (!e)
+        return;
+
+    if (e->flags & KSTAT_SPOOF_INO) {
+        v32 = (unsigned int)e->spoofed_ino;
+        if (copy_to_user((void __user *)(statbuf + COMPAT_ST_INO_OFF), &v32, sizeof(v32)))
+            return;
+    }
+    if (e->flags & KSTAT_SPOOF_NLINK) {
+        v16 = (unsigned short)e->spoofed_nlink;
+        if (copy_to_user((void __user *)(statbuf + COMPAT_ST_NLINK_OFF), &v16, sizeof(v16)))
+            return;
+    }
+    if (e->flags & KSTAT_SPOOF_SIZE) {
+        v = (int)e->spoofed_size;
+        if (copy_to_user((void __user *)(statbuf + COMPAT_ST_SIZE_OFF), &v, sizeof(v)))
+            return;
+    }
+    if (e->flags & KSTAT_SPOOF_BLKSIZE) {
+        v = (int)e->spoofed_blksize;
+        if (copy_to_user((void __user *)(statbuf + COMPAT_ST_BLKSIZE_OFF), &v, sizeof(v)))
+            return;
+    }
+    if (e->flags & KSTAT_SPOOF_BLOCKS) {
+        v = (int)e->spoofed_blocks;
+        if (copy_to_user((void __user *)(statbuf + COMPAT_ST_BLOCKS_OFF), &v, sizeof(v)))
+            return;
+    }
+}
+
 /* sys_exit tracepoint: the user statbuf is fully written by now, and
  * syscall_get_arguments() still returns the original args (verified: args[2]
  * == statbuf), so no per-cpu state is needed.  This is much cheaper on the
@@ -136,15 +190,22 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
     unsigned long args[6];
     unsigned long statbuf;
 
-    if (syscall_get_nr(current, regs) != __NR_newfstatat)
-        return;
     if (ret != 0)
         return;
     syscall_get_arguments(current, regs, args);
     statbuf = args[2];
     if (!statbuf)
         return;
-    susfs_kstat_spoof_statbuf(statbuf);
+
+    if (is_compat_task()) {
+        if (syscall_get_nr(current, regs) != COMPAT_FSTATAT64_NR)
+            return;
+        susfs_kstat_spoof_compat_statbuf(statbuf);
+    } else {
+        if (syscall_get_nr(current, regs) != __NR_newfstatat)
+            return;
+        susfs_kstat_spoof_statbuf(statbuf);
+    }
 }
 
 /* fallback: some paths (vfs_fstat, statx, direct callers) still reach the

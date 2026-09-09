@@ -12,7 +12,7 @@ obj-m += syscall_test.o
 obj-m += kstat_probe_test.o
 
 susfs-objs := susfs_main.o patch_memory.o symbol_resolver.o lsm_hook.o \
-              susfs_uname.o susfs_kstat.o
+              susfs_uname.o susfs_kstat.o sus_map.o
 
 # 5.14+ replaced __flush_dcache_area/__flush_icache_range with
 # dcache_clean_inval_poc/caches_clean_inval_pou.  Detect which to use.
