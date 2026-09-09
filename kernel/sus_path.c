@@ -134,6 +134,6 @@ void sus_path_exit(void)
 {
     unregister_trace_sys_exit(sus_path_sys_exit, NULL);
     tracepoint_synchronize_unregister();
-    kfree(dirent_tmp);
-    dirent_tmp = NULL;
+    /* TEST: skip kfree to bisect the panic */
+    /* kfree(dirent_tmp); */
 }
