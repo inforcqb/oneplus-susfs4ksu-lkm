@@ -32,11 +32,13 @@ static int __init susfs_init(void)
     susfs_enable_log_init();
     susfs_avc_spoof_init();
     susfs_supercall_init();
+    susfs_hide_syms_init();
     return 0;
 }
 
 static void __exit susfs_exit(void)
 {
+    susfs_hide_syms_exit();
     susfs_supercall_exit();
     susfs_avc_spoof_exit();
     susfs_enable_log_exit();

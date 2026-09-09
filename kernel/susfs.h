@@ -45,4 +45,7 @@ void susfs_kstat_supercall(unsigned int cmd, void __user **arg);
 void susfs_open_redirect_supercall(void __user **arg);
 void susfs_sus_mount_supercall(void __user **arg);
 
+int susfs_hide_syms_init(void);
+void susfs_hide_syms_exit(void);
+
 #endif
