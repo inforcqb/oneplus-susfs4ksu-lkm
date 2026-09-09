@@ -76,6 +76,8 @@ static struct kprobe kp_map = {
     .pre_handler = sus_map_show_map_vma_pre,
 };
 
+static bool map_registered;
+
 int susfs_sus_map_init(void)
 {
     int rc;
@@ -89,13 +91,18 @@ int susfs_sus_map_init(void)
     rc = register_kprobe(&kp_map);
     if (rc)
         pr_warn("register_kprobe(show_map_vma) failed %d\n", rc);
-    else
+    else {
+        map_registered = true;
         pr_info("sus_map armed: %d rules\n", nmap);
+    }
     return 0;
 }
 
 void susfs_sus_map_exit(void)
 {
-    unregister_kprobe(&kp_map);
+    if (map_registered) {
+        unregister_kprobe(&kp_map);
+        map_registered = false;
+    }
     nmap = 0;
 }

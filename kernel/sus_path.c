@@ -103,9 +103,11 @@ static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret)
         return;
 
     new_count = sus_path_filter(dirent_buf, ret);
-    /* TEST: do not touch the return value yet */
-    (void)new_count;
+    if (new_count != ret)
+        regs->regs[0] = new_count;   /* shrink the returned byte count */
 }
+
+static bool path_registered;
 
 int sus_path_init(void)
 {
@@ -125,15 +127,20 @@ int sus_path_init(void)
     rc = register_trace_sys_exit(sus_path_sys_exit, NULL);
     if (rc)
         pr_warn("register_trace_sys_exit(getdents64) failed %d\n", rc);
-    else
+    else {
+        path_registered = true;
         pr_info("sus_path armed: hide_name=%s\n", hide_name);
+    }
     return 0;
 }
 
 void sus_path_exit(void)
 {
-    unregister_trace_sys_exit(sus_path_sys_exit, NULL);
-    tracepoint_synchronize_unregister();
+    if (path_registered) {
+        unregister_trace_sys_exit(sus_path_sys_exit, NULL);
+        tracepoint_synchronize_unregister();
+        path_registered = false;
+    }
     kfree(dirent_tmp);
     dirent_tmp = NULL;
 }

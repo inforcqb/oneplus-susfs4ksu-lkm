@@ -13,3 +13,8 @@ modules.order
 
 # downloaded CI artifacts
 artifacts/
+
+# device panic logs (debug artifacts, contain device info)
+last_kmsg*.gz
+last_kmsg*.txt
+kmsg.dat.gz
