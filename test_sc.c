@@ -53,6 +53,14 @@ static void puthex(unsigned int v)
     sc_write(1, b, 8);
 }
 
+/* no libc: provide our own memset for struct zero-initialization */
+void *memset(void *s, int c, unsigned long n)
+{
+    volatile unsigned char *p = s;
+    while (n--) *p++ = (unsigned char)c;
+    return s;
+}
+
 static int strequal(const char *a, const char *b)
 {
     while (*a && *b) { if (*a != *b) return 0; a++; b++; }
