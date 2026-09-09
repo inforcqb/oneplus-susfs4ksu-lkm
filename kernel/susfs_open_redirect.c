@@ -76,6 +76,7 @@ static struct sus_or_entry *or_find(const char *target)
 
 /* do_filp_open(dfd, pathname, op): pathname is arg #2 (regs->regs[1]) */
 static atomic_t or_hit_count = ATOMIC_INIT(0);
+static atomic_t or_enter_count = ATOMIC_INIT(0);
 
 static int or_do_filp_open_pre(struct kprobe *kp, struct pt_regs *regs)
 {
@@ -83,11 +84,17 @@ static int or_do_filp_open_pre(struct kprobe *kp, struct pt_regs *regs)
 	const char *name;
 	int i;
 
+	atomic_inc(&or_enter_count);
 	if (!pathname || IS_ERR(pathname) || !pathname->name)
 		return 0;
 	name = pathname->name;
 	if (!*name)
 		return 0;
+
+	if ((atomic_read(&or_enter_count) & 0x3ff) == 0)
+		pr_info("open_redirect: enter_count=%d regs0=%lx regs1=%lx name='%s'\n",
+			atomic_read(&or_enter_count), regs->regs[0],
+			regs->regs[1], name);
 
 	/* read-mostly: rules are mutated under or_lock, but a torn read here
 	 * only affects a single open, never kernel safety. */
@@ -182,7 +189,8 @@ static int or_proc_show(struct seq_file *m, void *v)
 	if (nor == 0) {
 		seq_puts(m, "(empty)\n");
 	} else {
-		seq_printf(m, "hit_count=%d\n", atomic_read(&or_hit_count));
+		seq_printf(m, "enter_count=%d hit_count=%d\n",
+			   atomic_read(&or_enter_count), atomic_read(&or_hit_count));
 		for (i = 0; i < nor; i++)
 			seq_printf(m, "%s -> %s uid=%d\n",
 				   or_entries[i].target_pathname,
