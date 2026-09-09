@@ -43,8 +43,8 @@
 #define SUSFS_MAX_VERSION_BUFSIZE               16
 #define SUSFS_MAX_VARIANT_BUFSIZE               16
 
-#define SUSFS_VERSION_STR "v1.5.2"
-#define SUSFS_VARIANT_STR "gki"
+#define SUSFS_VERSION_STR "v2.3.0"
+#define SUSFS_VARIANT_STR "GKI"
 
 /* ---- payload structs (must match userspace #[repr(C)] layouts) ---- */
 
