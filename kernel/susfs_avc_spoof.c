@@ -32,8 +32,10 @@
 #include "susfs_abi.h"
 #include "susfs_log.h"
 
-/* module_param overrides for the two domains */
-static char avc_su_ctx[128] = "u:r:su:s0";
+/* module_param overrides for the two domains.
+ * Default su domain is the SukiSU variant ("ksu"); stock KernelSU uses "su".
+ * The sid is resolved at init time via security_secctx_to_secid(). */
+static char avc_su_ctx[128] = "u:r:ksu:s0";
 static char avc_priv_app_ctx[128] = "u:r:priv_app:s0:c512,c768";
 module_param_string(avc_su_ctx, avc_su_ctx, sizeof(avc_su_ctx), 0644);
 module_param_string(avc_priv_app_ctx, avc_priv_app_ctx, sizeof(avc_priv_app_ctx), 0644);

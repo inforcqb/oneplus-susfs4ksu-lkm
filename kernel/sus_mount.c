@@ -61,23 +61,10 @@ static bool mount_registered;
 
 int susfs_sus_mount_init(void)
 {
-    int rc;
-
-    rc = register_kprobe(&kp_vfsstat);
-    if (rc) {
-        pr_warn("register_kprobe(show_vfsstat) failed %d\n", rc);
-        return 0;
-    }
-
-    rc = register_kprobe(&kp_mountinfo);
-    if (rc) {
-        pr_warn("register_kprobe(show_mountinfo) failed %d\n", rc);
-        unregister_kprobe(&kp_vfsstat);
-        return 0;
-    }
-
-    mount_registered = true;
-    pr_info("sus_mount armed: hide mnt_id >= %llu\n", DEFAULT_KSU_MNT_ID);
+    /* upstream defaults this OFF (static key false) so zygisk can see sus
+     * mounts during post-fs-data; the LKM mirrors that: no hook until
+     * CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS enables it. */
+    pr_info("sus_mount: disabled by default (enable via CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS)\n");
     return 0;
 }
 
