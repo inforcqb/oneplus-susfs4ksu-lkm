@@ -3,16 +3,26 @@
  * susfs_open_redirect.c - redirect open of a target path to another path
  * (SUSFS OPEN_REDIRECT feature), LKM port.
  *
- * Upstream SUSFS hooks path_openat() and, once the target inode is resolved,
- * swaps the filename for the redirected pathname via getname_kernel() and
- * re-walks the path.  path_openat is static and inlined into do_filp_open on
- * this LTO GKI, so an LKM cannot kprobe it.
+ * Upstream SUSFS hooks path_openat() and swaps the filename once the target
+ * inode is resolved.  path_openat / do_sys_openat2 / do_filp_open are all
+ * LTO-inlined into the syscall entry, so none of them can be kprobed.
+ * A layer-by-layer probe showed the only out-of-line symbol on the user-open
+ * path is vfs_open(path, file) (123/123 hits for `cat`), so we hook that.
  *
- * Instead we kprobe do_filp_open(dfd, pathname, op): pathname->name is a
- * kernel-side writable buffer (struct filename.iname[], EMBEDDED_NAME_MAX
- * ~= 4064 bytes), far larger than the 128-byte path limit.  On a match we
- * strcpy() the redirected pathname over pathname->name in place.  No
- * getname_kernel()/putname() juggling, no kretprobe, no lifetime hazards.
+ * vfs_open is the inode layer: path->dentry->d_inode is already resolved, so
+ * we match rules by (target_ino, target_dev) exactly like upstream.
+ *
+ * The kprobe pre_handler runs in interrupt context (preempt disabled), so it
+ * must not sleep.  We therefore resolve the redirected path at RULE-ADD time
+ * (proc write, process context) with kern_path() and cache its `struct path`
+ * in the entry.  The pre_handler only does: match (ino,dev), then point
+ * regs->regs[0] at the cached path.  vfs_open copies *path into file->f_path
+ * and do_dentry_open does path_get(&f->f_path), so the file takes its own
+ * reference; the entry keeps the base reference until del/clear path_put()s it.
+ *
+ * No kretprobe needed.  The base reference is held for the entry's lifetime,
+ * so the redirected file stays pinned (like upstream's re-walk, which also
+ * pins the inode during the open).
  *
  * Interface mirrors upstream: /proc/susfs_open_redirect
  *   add_open_redirect <target> <redirected> <uid_scheme>
@@ -27,6 +37,8 @@
 #include <linux/kprobes.h>
 #include <linux/fs.h>
 #include <linux/cred.h>
+#include <linux/namei.h>
+#include <linux/dcache.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
@@ -46,6 +58,10 @@ enum uid_scheme {
 struct sus_or_entry {
 	char target_pathname[SUSFS_MAX_LEN_PATHNAME];
 	char redirected_pathname[SUSFS_MAX_LEN_PATHNAME];
+	unsigned long target_ino;
+	dev_t target_dev;
+	/* cached redirected path, resolved at add time (base ref) */
+	struct path redirected_path;
 	int uid_scheme;
 };
 
@@ -64,7 +80,7 @@ static bool or_uid_matches(int scheme)
 	}
 }
 
-static struct sus_or_entry *or_find(const char *target)
+static struct sus_or_entry *or_find_by_path(const char *target)
 {
 	int i;
 
@@ -74,49 +90,45 @@ static struct sus_or_entry *or_find(const char *target)
 	return NULL;
 }
 
-/* do_filp_open(dfd, pathname, op): pathname is arg #2 (regs->regs[1]) */
-static atomic_t or_hit_count = ATOMIC_INIT(0);
-static atomic_t or_enter_count = ATOMIC_INIT(0);
-
-static int or_do_filp_open_pre(struct kprobe *kp, struct pt_regs *regs)
+static struct sus_or_entry *or_find_by_inode(unsigned long ino, dev_t dev)
 {
-	struct filename *pathname = (struct filename *)regs->regs[1];
-	const char *name;
 	int i;
 
-	atomic_inc(&or_enter_count);
-	if (!pathname || IS_ERR(pathname) || !pathname->name)
+	for (i = 0; i < nor; i++)
+		if (or_entries[i].target_ino == ino &&
+		    or_entries[i].target_dev == dev)
+			return &or_entries[i];
+	return NULL;
+}
+
+/* ---- vfs_open kprobe: swap path on match ----
+ * Runs in interrupt context: no sleeping, no kern_path here. */
+static int or_vfs_open_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	const struct path *path = (const struct path *)regs->regs[0];
+	struct inode *inode;
+	struct sus_or_entry *e;
+
+	if (!path || !path->dentry)
 		return 0;
-	name = pathname->name;
-	if (!*name)
+	inode = d_backing_inode(path->dentry);
+	if (!inode)
 		return 0;
 
-	if ((atomic_read(&or_enter_count) & 0x3ff) == 0)
-		pr_info("open_redirect: enter_count=%d regs0=%lx regs1=%lx name='%s'\n",
-			atomic_read(&or_enter_count), regs->regs[0],
-			regs->regs[1], name);
+	e = or_find_by_inode(inode->i_ino, inode->i_sb->s_dev);
+	if (!e)
+		return 0;
+	if (!or_uid_matches(e->uid_scheme))
+		return 0;
 
-	/* read-mostly: rules are mutated under or_lock, but a torn read here
-	 * only affects a single open, never kernel safety. */
-	for (i = 0; i < nor; i++) {
-		struct sus_or_entry *e = &or_entries[i];
-
-		if (strcmp(name, e->target_pathname))
-			continue;
-		atomic_inc(&or_hit_count);
-		pr_info("open_redirect: MATCH '%s' -> '%s' uid_scheme=%d\n",
-			name, e->redirected_pathname, e->uid_scheme);
-		if (!or_uid_matches(e->uid_scheme))
-			continue;
-		strcpy((char *)pathname->name, e->redirected_pathname);
-		break;
-	}
+	/* vfs_open does file->f_path = *path; do_dentry_open path_get()s it. */
+	regs->regs[0] = (unsigned long)&e->redirected_path;
 	return 0;
 }
 
 static struct kprobe kp_or = {
-	.symbol_name = "do_filp_open",
-	.pre_handler = or_do_filp_open_pre,
+	.symbol_name = "vfs_open",
+	.pre_handler = or_vfs_open_pre,
 };
 
 static bool or_registered;
@@ -131,7 +143,7 @@ static int or_register(void)
 	if (rc)
 		return rc;
 	or_registered = true;
-	pr_info("susfs_open_redirect: hook installed\n");
+	pr_info("susfs_open_redirect: hook installed (vfs_open)\n");
 	return 0;
 }
 
@@ -166,18 +178,21 @@ int susfs_open_redirect_init(void)
 	if (!or_proc_entry)
 		pr_warn("proc_create(susfs_open_redirect) failed\n");
 
-	/* hook installed lazily on first rule */
 	pr_info("susfs_open_redirect: %d rules (proc: /proc/susfs_open_redirect)\n", nor);
 	return 0;
 }
 
 void susfs_open_redirect_exit(void)
 {
+	int i;
+
 	or_unregister();
 	if (or_proc_entry) {
 		proc_remove(or_proc_entry);
 		or_proc_entry = NULL;
 	}
+	for (i = 0; i < nor; i++)
+		path_put(&or_entries[i].redirected_path);
 	nor = 0;
 }
 
@@ -189,13 +204,13 @@ static int or_proc_show(struct seq_file *m, void *v)
 	if (nor == 0) {
 		seq_puts(m, "(empty)\n");
 	} else {
-		seq_printf(m, "enter_count=%d hit_count=%d\n",
-			   atomic_read(&or_enter_count), atomic_read(&or_hit_count));
 		for (i = 0; i < nor; i++)
-			seq_printf(m, "%s -> %s uid=%d\n",
+			seq_printf(m, "%s -> %s uid=%d (ino=%lu dev=%lu)\n",
 				   or_entries[i].target_pathname,
 				   or_entries[i].redirected_pathname,
-				   or_entries[i].uid_scheme);
+				   or_entries[i].uid_scheme,
+				   or_entries[i].target_ino,
+				   (unsigned long)or_entries[i].target_dev);
 	}
 	mutex_unlock(&or_lock);
 	return 0;
@@ -228,6 +243,8 @@ static int split_ws(char *buf, char **argv, int max)
 static int or_add(const char *target, const char *redirected, int scheme)
 {
 	struct sus_or_entry *e;
+	struct path tp, rp;
+	struct inode *ti;
 	int rc;
 
 	if (scheme < UID_NON_APP_PROC || scheme > UID_UMOUNTED_PROC)
@@ -235,18 +252,46 @@ static int or_add(const char *target, const char *redirected, int scheme)
 	if (scheme != UID_NON_APP_PROC)
 		return -EOPNOTSUPP;
 
-	e = or_find(target);
+	/* resolve target for ino/dev (released immediately) */
+	rc = kern_path(target, LOOKUP_FOLLOW, &tp);
+	if (rc)
+		return rc;
+	ti = d_backing_inode(tp.dentry);
+	if (!ti) {
+		path_put(&tp);
+		return -ENOENT;
+	}
+
+	/* resolve redirected and CACHE it (base ref kept for entry lifetime) */
+	rc = kern_path(redirected, LOOKUP_FOLLOW, &rp);
+	if (rc) {
+		path_put(&tp);
+		return rc;
+	}
+
+	e = or_find_by_path(target);
 	if (!e) {
-		if (nor >= SUS_OR_MAX)
+		if (nor >= SUS_OR_MAX) {
+			path_put(&rp);
+			path_put(&tp);
 			return -ENOSPC;
+		}
 		e = &or_entries[nor];
 		strscpy(e->target_pathname, target, SUSFS_MAX_LEN_PATHNAME);
 		nor++;
+	} else {
+		/* replacing an existing rule: drop its old cached path */
+		path_put(&e->redirected_path);
 	}
+
 	strscpy(e->redirected_pathname, redirected, SUSFS_MAX_LEN_PATHNAME);
+	e->target_ino = ti->i_ino;
+	e->target_dev = ti->i_sb->s_dev;
+	e->redirected_path = rp;   /* transfer the cached reference */
 	e->uid_scheme = scheme;
 
-	/* lazy-register the hook now that we have at least one rule */
+	path_put(&tp);
+
 	rc = or_register();
 	if (rc)
 		return rc;
@@ -258,9 +303,10 @@ static void or_del(const char *target)
 	struct sus_or_entry *e;
 	int i;
 
-	e = or_find(target);
+	e = or_find_by_path(target);
 	if (!e)
 		return;
+	path_put(&e->redirected_path);
 	i = (int)(e - or_entries);
 	or_entries[i] = or_entries[--nor];
 	if (nor == 0)
@@ -289,17 +335,16 @@ static ssize_t or_proc_write(struct file *file, const char __user *buf,
 	err = -EINVAL;
 
 	if (!strcmp(argv[0], "add_open_redirect") && argc == 4) {
-		if (kstrtol(argv[3], 10, &scheme)) {
+		if (kstrtol(argv[3], 10, &scheme))
 			err = -EINVAL;
-		} else {
+		else
 			err = or_add(argv[1], argv[2], (int)scheme);
-		}
 	} else if (!strcmp(argv[0], "del") && argc == 2) {
 		or_del(argv[1]);
 		err = 0;
 	} else if (!strcmp(argv[0], "clear")) {
-		nor = 0;
-		or_unregister();
+		while (nor > 0)
+			or_del(or_entries[0].target_pathname);
 		err = 0;
 	}
 
