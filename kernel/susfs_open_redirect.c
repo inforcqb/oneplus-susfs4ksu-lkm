@@ -42,6 +42,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
+#include "susfs_abi.h"
 #include "susfs_log.h"
 
 #define SUS_OR_MAX 64
@@ -353,4 +354,25 @@ static ssize_t or_proc_write(struct file *file, const char __user *buf,
 	if (err)
 		pr_warn("open_redirect proc write '%s' -> err %d\n", argv[0], err);
 	return len;
+}
+
+/* supercall: CMD_SUSFS_ADD_OPEN_REDIRECT */
+void susfs_open_redirect_supercall(void __user **arg)
+{
+	struct st_susfs_open_redirect info = {0};
+	int err;
+
+	if (copy_from_user(&info, (void __user *)*arg, sizeof(info))) {
+		info.err = -EFAULT;
+		goto out;
+	}
+
+	mutex_lock(&or_lock);
+	err = or_add(info.target_pathname, info.redirected_pathname,
+		     info.uid_scheme);
+	mutex_unlock(&or_lock);
+	info.err = err;
+out:
+	if (copy_to_user((void __user *)*arg, &info, sizeof(info)))
+		pr_warn("open_redirect supercall copy_to_user failed\n");
 }

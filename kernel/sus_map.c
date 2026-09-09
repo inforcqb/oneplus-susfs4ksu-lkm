@@ -15,6 +15,10 @@
 #include <linux/kprobes.h>
 #include <linux/fs.h>
 #include <linux/mm_types.h>
+#include <linux/namei.h>
+#include <linux/dcache.h>
+#include <linux/uaccess.h>
+#include "susfs_abi.h"
 #include "susfs_log.h"
 
 #define SUS_MAP_MAX 64
@@ -105,4 +109,56 @@ void susfs_sus_map_exit(void)
         map_registered = false;
     }
     nmap = 0;
+}
+
+/* supercall: CMD_SUSFS_ADD_SUS_MAP (resolve path -> ino/dev, register hook) */
+void susfs_sus_map_supercall(void __user **arg)
+{
+    struct st_susfs_sus_map info = {0};
+    struct path p;
+    struct inode *inode;
+    int rc;
+
+    if (copy_from_user(&info, (void __user *)*arg, sizeof(info))) {
+        info.err = -EFAULT;
+        goto out;
+    }
+
+    rc = kern_path(info.target_pathname, LOOKUP_FOLLOW, &p);
+    if (rc) {
+        info.err = rc;
+        goto out;
+    }
+    inode = d_backing_inode(p.dentry);
+    if (!inode) {
+        path_put(&p);
+        info.err = -ENOENT;
+        goto out;
+    }
+
+    if (nmap >= SUS_MAP_MAX) {
+        path_put(&p);
+        info.err = -ENOSPC;
+        goto out;
+    }
+    sus_map_add(inode->i_ino);
+    map_entries[nmap - 1].target_dev = inode->i_sb->s_dev;
+    pr_info("sus_map: added %s (ino=%lu) via supercall\n",
+            info.target_pathname, inode->i_ino);
+    path_put(&p);
+
+    /* lazy-register the hook if this was the first rule */
+    if (!map_registered) {
+        rc = register_kprobe(&kp_map);
+        if (rc) {
+            pr_warn("register_kprobe(show_map_vma) failed %d\n", rc);
+            info.err = rc;
+            goto out;
+        }
+        map_registered = true;
+    }
+    info.err = 0;
+out:
+    if (copy_to_user((void __user *)*arg, &info, sizeof(info)))
+        pr_warn("sus_map supercall copy_to_user failed\n");
 }

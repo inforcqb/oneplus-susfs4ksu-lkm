@@ -29,6 +29,7 @@
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
 #include <linux/string.h>
+#include "susfs_abi.h"
 #include "susfs_log.h"
 
 /* module_param overrides for the two domains */
@@ -176,4 +177,35 @@ void susfs_avc_spoof_exit(void)
 		proc_remove(avc_proc_entry);
 		avc_proc_entry = NULL;
 	}
+}
+
+/* supercall: CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING */
+void susfs_avc_spoof_supercall(void __user **arg)
+{
+	struct st_susfs_avc_log_spoofing info = {0};
+
+	if (copy_from_user(&info, (void __user *)*arg, sizeof(info))) {
+		info.err = -EFAULT;
+		goto out;
+	}
+
+	if (info.enabled) {
+		if (!avc_spoof_enabled) {
+			int rc = avc_register();
+
+			if (rc) {
+				info.err = rc;
+				goto out;
+			}
+			avc_spoof_enabled = true;
+		}
+	} else {
+		avc_unregister();
+		avc_spoof_enabled = false;
+	}
+	info.err = 0;
+	pr_info("avc_spoof: %s (supercall)\n", info.enabled ? "enabled" : "disabled");
+out:
+	if (copy_to_user((void __user *)*arg, &info, sizeof(info)))
+		pr_warn("avc supercall copy_to_user failed\n");
 }

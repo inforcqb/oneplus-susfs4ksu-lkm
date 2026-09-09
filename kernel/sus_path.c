@@ -19,6 +19,7 @@
 #include <linux/syscalls.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include "susfs_abi.h"
 #include "susfs_log.h"
 
 #define DIRENT_BUF_SIZE 65536  /* getdents usually returns <= 32-64KB */
@@ -143,4 +144,48 @@ void sus_path_exit(void)
     }
     kfree(dirent_tmp);
     dirent_tmp = NULL;
+}
+
+/* supercall: CMD_SUSFS_ADD_SUS_PATH / _LOOP
+ * Upstream hides by inode; this LKM hides by dirent name substring, so we
+ * use the basename of the target path as the hide_name. */
+void sus_path_supercall(void __user **arg)
+{
+    struct st_susfs_sus_path info = {0};
+    char *base;
+    int rc;
+
+    if (copy_from_user(&info, (void __user *)*arg, sizeof(info))) {
+        info.err = -EFAULT;
+        goto out;
+    }
+
+    base = strrchr(info.target_pathname, '/');
+    base = base ? base + 1 : info.target_pathname;
+    if (!*base) {
+        info.err = -EINVAL;
+        goto out;
+    }
+    strscpy(hide_name, base, sizeof(hide_name));
+
+    if (!dirent_tmp) {
+        dirent_tmp = kmalloc(DIRENT_BUF_SIZE, GFP_KERNEL);
+        if (!dirent_tmp) {
+            info.err = -ENOMEM;
+            goto out;
+        }
+    }
+    if (!path_registered) {
+        rc = register_trace_sys_exit(sus_path_sys_exit, NULL);
+        if (rc) {
+            info.err = rc;
+            goto out;
+        }
+        path_registered = true;
+    }
+    info.err = 0;
+    pr_info("sus_path: hide '%s' via supercall\n", hide_name);
+out:
+    if (copy_to_user((void __user *)*arg, &info, sizeof(info)))
+        pr_warn("sus_path supercall copy_to_user failed\n");
 }

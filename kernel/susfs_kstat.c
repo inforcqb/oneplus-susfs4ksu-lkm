@@ -48,6 +48,7 @@
 #include <linux/namei.h>
 #include <linux/dcache.h>
 #include <linux/kdev_t.h>
+#include "susfs_abi.h"
 #include "susfs_log.h"
 
 /* KSTAT_SPOOF_* flags — bit values match original SUSFS (CTIME_TV_SEC fixed
@@ -589,6 +590,73 @@ static int susfs_kstat_add_statically(char **argv, int argc)
 		}
 	}
 	return 0;
+}
+
+/* statically-add from the supercall ABI struct (is_statically=1): copy the
+ * caller's 12 spoofed fields + flags verbatim; resolve target ino/dev here. */
+static int susfs_kstat_add_statically_abi(struct st_susfs_sus_kstat *info)
+{
+	struct sus_kstat_entry *e;
+	int err;
+
+	e = susfs_kstat_find_by_path(info->target_pathname);
+	if (!e) {
+		if (nkstat >= SUS_KSTAT_MAX)
+			return -ENOSPC;
+		e = &kstat_entries[nkstat];
+		strscpy(e->target_pathname, info->target_pathname,
+			SUSFS_MAX_LEN_PATHNAME);
+		nkstat++;
+	}
+
+	err = susfs_kstat_fill_from_path(e, info->target_pathname);
+	if (err)
+		return err;
+
+	e->spoofed_ino = info->spoofed_ino;
+	e->spoofed_dev = info->spoofed_dev;
+	e->spoofed_nlink = info->spoofed_nlink;
+	e->spoofed_size = info->spoofed_size;
+	e->spoofed_atime_tv_sec = info->spoofed_atime_tv_sec;
+	e->spoofed_atime_tv_nsec = info->spoofed_atime_tv_nsec;
+	e->spoofed_mtime_tv_sec = info->spoofed_mtime_tv_sec;
+	e->spoofed_mtime_tv_nsec = info->spoofed_mtime_tv_nsec;
+	e->spoofed_ctime_tv_sec = info->spoofed_ctime_tv_sec;
+	e->spoofed_ctime_tv_nsec = info->spoofed_ctime_tv_nsec;
+	e->spoofed_blocks = info->spoofed_blocks;
+	e->spoofed_blksize = info->spoofed_blksize;
+	e->flags = info->flags;
+	return 0;
+}
+
+/* supercall: CMD_SUSFS_ADD_SUS_KSTAT / UPDATE / STATICALLY */
+void susfs_kstat_supercall(unsigned int cmd, void __user **arg)
+{
+	struct st_susfs_sus_kstat info = {0};
+	int err = -EINVAL;
+
+	if (copy_from_user(&info, (void __user *)*arg, sizeof(info))) {
+		info.err = -EFAULT;
+		goto out;
+	}
+
+	mutex_lock(&kstat_lock);
+	switch (cmd) {
+	case CMD_SUSFS_ADD_SUS_KSTAT:
+		err = susfs_kstat_add(info.target_pathname);
+		break;
+	case CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY:
+		err = susfs_kstat_add_statically_abi(&info);
+		break;
+	case CMD_SUSFS_UPDATE_SUS_KSTAT:
+		err = susfs_kstat_update(info.target_pathname, false);
+		break;
+	}
+	mutex_unlock(&kstat_lock);
+	info.err = err;
+out:
+	if (copy_to_user((void __user *)*arg, &info, sizeof(info)))
+		pr_warn("kstat supercall copy_to_user failed\n");
 }
 
 /* ---- /proc/susfs_kstat: runtime rule management ---- */

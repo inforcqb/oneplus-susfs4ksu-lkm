@@ -126,7 +126,36 @@ static void susfs_tw_func(struct callback_head *cb)
 	case CMD_SUSFS_SHOW_ENABLED_FEATURES:
 		susfs_show_enabled_features(&arg);
 		break;
-	/* feature commands are added incrementally */
+	case CMD_SUSFS_ADD_SUS_PATH:
+	case CMD_SUSFS_ADD_SUS_PATH_LOOP:
+		sus_path_supercall(&arg);
+		break;
+	case CMD_SUSFS_ADD_SUS_MAP:
+		susfs_sus_map_supercall(&arg);
+		break;
+	case CMD_SUSFS_ADD_SUS_KSTAT:
+	case CMD_SUSFS_UPDATE_SUS_KSTAT:
+	case CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY:
+		susfs_kstat_supercall(tw->cmd, &arg);
+		break;
+	case CMD_SUSFS_SET_UNAME:
+		susfs_uname_supercall(&arg);
+		break;
+	case CMD_SUSFS_ENABLE_LOG:
+		susfs_enable_log_supercall(&arg);
+		break;
+	case CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING:
+		susfs_avc_spoof_supercall(&arg);
+		break;
+	case CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG:
+		susfs_spoof_cmdline_supercall(&arg);
+		break;
+	case CMD_SUSFS_ADD_OPEN_REDIRECT:
+		susfs_open_redirect_supercall(&arg);
+		break;
+	case CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS:
+		susfs_sus_mount_supercall(&arg);
+		break;
 	default:
 		pr_info("susfs supercall: unsupported cmd 0x%x\n", tw->cmd);
 		break;

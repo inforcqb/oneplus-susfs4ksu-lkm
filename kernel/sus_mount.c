@@ -16,7 +16,9 @@
 #include <linux/kprobes.h>
 #include <linux/fs.h>
 #include <linux/seq_file.h>
+#include <linux/uaccess.h>
 #include "mount.h"      /* fs/mount.h: struct mount + real_mount() */
+#include "susfs_abi.h"
 #include "susfs_log.h"
 
 #define DEFAULT_KSU_MNT_ID 2000000000ULL
@@ -86,4 +88,51 @@ void susfs_sus_mount_exit(void)
         unregister_kprobe(&kp_vfsstat);
         mount_registered = false;
     }
+}
+
+static int sus_mount_register(void)
+{
+    int rc;
+
+    if (mount_registered)
+        return 0;
+    rc = register_kprobe(&kp_vfsstat);
+    if (rc)
+        return rc;
+    rc = register_kprobe(&kp_mountinfo);
+    if (rc) {
+        unregister_kprobe(&kp_vfsstat);
+        return rc;
+    }
+    mount_registered = true;
+    return 0;
+}
+
+/* supercall: CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS */
+void susfs_sus_mount_supercall(void __user **arg)
+{
+    struct st_susfs_hide_sus_mnts info = {0};
+    int rc;
+
+    if (copy_from_user(&info, (void __user *)*arg, sizeof(info))) {
+        info.err = -EFAULT;
+        goto out;
+    }
+
+    if (info.enabled) {
+        rc = sus_mount_register();
+        if (rc) {
+            info.err = rc;
+            goto out;
+        }
+    } else if (mount_registered) {
+        unregister_kprobe(&kp_mountinfo);
+        unregister_kprobe(&kp_vfsstat);
+        mount_registered = false;
+    }
+    info.err = 0;
+    pr_info("sus_mount: %s (supercall)\n", info.enabled ? "hide" : "unhide");
+out:
+    if (copy_to_user((void __user *)*arg, &info, sizeof(info)))
+        pr_warn("sus_mount supercall copy_to_user failed\n");
 }

@@ -34,4 +34,15 @@ void susfs_avc_spoof_exit(void);
 int susfs_supercall_init(void);
 void susfs_supercall_exit(void);
 
+/* feature supercall handlers (upstream signature: void xxx(void __user **arg)) */
+void susfs_uname_supercall(void __user **arg);
+void susfs_enable_log_supercall(void __user **arg);
+void susfs_avc_spoof_supercall(void __user **arg);
+void susfs_spoof_cmdline_supercall(void __user **arg);
+void susfs_sus_map_supercall(void __user **arg);
+void sus_path_supercall(void __user **arg);
+void susfs_kstat_supercall(unsigned int cmd, void __user **arg);
+void susfs_open_redirect_supercall(void __user **arg);
+void susfs_sus_mount_supercall(void __user **arg);
+
 #endif

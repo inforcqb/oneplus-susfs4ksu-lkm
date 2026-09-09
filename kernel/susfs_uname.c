@@ -16,6 +16,7 @@
 #include <linux/utsname.h>
 #include <linux/string.h>
 #include <linux/version.h>
+#include "susfs_abi.h"
 #include "susfs_log.h"
 
 #define SUSFS_UNAME_LEN (__NEW_UTS_LEN + 1)
@@ -86,4 +87,23 @@ int susfs_uname_init(void)
 void susfs_uname_exit(void)
 {
     unregister_kretprobe(&krp);
+}
+
+/* supercall: CMD_SUSFS_SET_UNAME */
+void susfs_uname_supercall(void __user **arg)
+{
+    struct st_susfs_uname info = {0};
+
+    if (copy_from_user(&info, (void __user *)*arg, sizeof(info))) {
+        info.err = -EFAULT;
+        goto out;
+    }
+    strscpy(fake_release, info.release, sizeof(fake_release));
+    strscpy(fake_version, info.version, sizeof(fake_version));
+    uname_spoof_enabled = true;
+    info.err = 0;
+    pr_info("uname spoof set: release=%s version=%s\n", fake_release, fake_version);
+out:
+    if (copy_to_user((void __user *)*arg, &info, sizeof(info)))
+        pr_warn("uname supercall copy_to_user failed\n");
 }

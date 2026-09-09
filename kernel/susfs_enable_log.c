@@ -13,6 +13,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
+#include "susfs_abi.h"
 #include "susfs_log.h"
 
 static bool log_enabled;
@@ -78,4 +79,22 @@ void susfs_enable_log_exit(void)
 		log_proc_entry = NULL;
 	}
 	log_enabled = false;
+}
+
+/* supercall: CMD_SUSFS_ENABLE_LOG */
+void susfs_enable_log_supercall(void __user **arg)
+{
+    struct st_susfs_log info = {0};
+
+    if (copy_from_user(&info, (void __user *)*arg, sizeof(info))) {
+        info.err = -EFAULT;
+        goto out;
+    }
+    WRITE_ONCE(log_enabled, info.enabled);
+    info.err = 0;
+    pr_info("susfs: %s logging to kernel (supercall)\n",
+            log_enabled ? "enable" : "disable");
+out:
+    if (copy_to_user((void __user *)*arg, &info, sizeof(info)))
+        pr_warn("enable_log supercall copy_to_user failed\n");
 }
