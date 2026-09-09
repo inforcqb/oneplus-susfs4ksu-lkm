@@ -12,7 +12,7 @@ obj-m += syscall_test.o
 obj-m += kstat_probe_test.o
 
 susfs-objs := susfs_main.o patch_memory.o symbol_resolver.o lsm_hook.o \
-              susfs_uname.o susfs_kstat.o sus_map.o sus_path.o
+              susfs_uname.o susfs_kstat.o sus_map.o sus_path.o sus_mount.o
 
 # 5.14+ replaced __flush_dcache_area/__flush_icache_range with
 # dcache_clean_inval_poc/caches_clean_inval_pou.  Detect which to use.
@@ -23,6 +23,10 @@ ccflags-y += -DKSU_NEW_DCACHE_FLUSH=$(KSU_NEW_DCACHE_FLUSH)
 # casts symbol addresses (unsigned long) to function pointers.
 ccflags-y += -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat -Wno-missing-prototypes
 ccflags-y += -Wno-declaration-after-statement -Wno-unused-function
+
+# fs/mount.h (struct mount + real_mount) is a private header; its includes are
+# all public, so -I$(srctree)/fs is enough to reach it via #include "mount.h".
+ccflags-y += -I$(srctree)/fs
 
 # SELinux private headers are only needed once selinux hooks are added.
 # Uncomment when the selinux feature lands:
