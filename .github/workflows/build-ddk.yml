@@ -57,4 +57,5 @@ jobs:
             kernel/susfs.ko
             kernel/syscall_test.ko
             kernel/kstat_probe_test.ko
+            kernel/open_probe_test.ko
           if-no-files-found: error
