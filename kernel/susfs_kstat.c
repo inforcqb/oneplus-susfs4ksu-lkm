@@ -20,6 +20,9 @@
 #include <linux/tracepoint.h>
 #include <trace/events/syscalls.h>
 #include <asm/syscall.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/kernel.h>
 #include "susfs_log.h"
 
 #define KSTAT_SPOOF_INO      (1 << 0)
@@ -288,10 +291,10 @@ int susfs_kstat_init(void)
     int rc;
 
     susfs_kstat_add_ino(param_target_ino, param_spoofed_ino);
-    if (nkstat == 0) {
-        pr_info("kstat spoof: no rules, hook not installed\n");
-        return 0;
-    }
+
+    kstat_proc_entry = proc_create("susfs_kstat", 0666, NULL, &kstat_proc_ops);
+    if (!kstat_proc_entry)
+        pr_warn("proc_create(susfs_kstat) failed\n");
 
     rc = register_trace_sys_exit(kstat_sys_exit, NULL);
     if (rc)
@@ -305,7 +308,7 @@ int susfs_kstat_init(void)
     else
         kstat_krp_registered = true;
 
-    pr_info("kstat spoof armed: %d rules (tracepoint + vfs_getattr fallback)\n", nkstat);
+    pr_info("kstat armed: %d rules (proc: /proc/susfs_kstat)\n", nkstat);
     return 0;
 }
 
@@ -320,5 +323,82 @@ void susfs_kstat_exit(void)
         tracepoint_synchronize_unregister();
         kstat_tp_registered = false;
     }
+    if (kstat_proc_entry) {
+        proc_remove(kstat_proc_entry);
+        kstat_proc_entry = NULL;
+    }
     nkstat = 0;
 }
+
+/* ---- /proc/susfs_kstat: runtime rule management ---- */
+static DEFINE_MUTEX(kstat_lock);
+
+static int kstat_proc_show(struct seq_file *m, void *v)
+{
+    int i;
+
+    mutex_lock(&kstat_lock);
+    for (i = 0; i < nkstat; i++)
+        seq_printf(m, "%lu %lu\n",
+                   kstat_entries[i].target_ino,
+                   kstat_entries[i].spoofed_ino);
+    mutex_unlock(&kstat_lock);
+    if (nkstat == 0)
+        seq_puts(m, "(empty)\n");
+    return 0;
+}
+
+static int kstat_proc_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, kstat_proc_show, NULL);
+}
+
+static void kstat_del_rule(unsigned long target_ino)
+{
+    int i;
+
+    for (i = 0; i < nkstat; i++) {
+        if (kstat_entries[i].target_ino == target_ino) {
+            kstat_entries[i] = kstat_entries[--nkstat];
+            return;
+        }
+    }
+}
+
+static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
+                                size_t len, loff_t *off)
+{
+    char cmd[128];
+    char op[16];
+    unsigned long a = 0, b = 0;
+    int n;
+
+    if (len >= sizeof(cmd))
+        len = sizeof(cmd) - 1;
+    if (copy_from_user(cmd, buf, len))
+        return -EFAULT;
+    cmd[len] = 0;
+
+    n = sscanf(cmd, "%15s %lu %lu", op, &a, &b);
+
+    mutex_lock(&kstat_lock);
+    if (n == 3 && strcmp(op, "add") == 0)
+        susfs_kstat_add_ino(a, b);
+    else if (n >= 2 && strcmp(op, "del") == 0)
+        kstat_del_rule(a);
+    else if (strncmp(cmd, "clear", 5) == 0)
+        nkstat = 0;
+    mutex_unlock(&kstat_lock);
+
+    return len;
+}
+
+static const struct proc_ops kstat_proc_ops = {
+    .proc_open = kstat_proc_open,
+    .proc_read = seq_read,
+    .proc_write = kstat_proc_write,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+
+static struct proc_dir_entry *kstat_proc_entry;
