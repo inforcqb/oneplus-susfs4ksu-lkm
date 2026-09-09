@@ -21,6 +21,9 @@
 
 #define DEFAULT_KSU_MNT_ID 2000000000ULL
 
+static unsigned long param_min_mnt_id = DEFAULT_KSU_MNT_ID;
+module_param_named(min_mnt_id, param_min_mnt_id, ulong, 0644);
+
 static int sus_mount_show_pre(struct kprobe *kp, struct pt_regs *regs)
 {
     struct vfsmount *mnt = (struct vfsmount *)regs->regs[1];
@@ -29,7 +32,7 @@ static int sus_mount_show_pre(struct kprobe *kp, struct pt_regs *regs)
     if (!mnt)
         return 0;
     r = real_mount(mnt);
-    if (r->mnt_id >= DEFAULT_KSU_MNT_ID) {
+    if ((unsigned int)r->mnt_id >= param_min_mnt_id) {
         regs->pc = regs->regs[30];   /* skip this mount line */
         return 1;
     }
