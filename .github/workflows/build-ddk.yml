@@ -25,16 +25,16 @@ jobs:
           echo "CLANG_PATH=$CLANG_PATH"
           clang --version | head -1
 
-      - name: Build susfs.ko (DDK way)
+      - name: Build susfs_guard_lkm.ko (DDK way)
         run: |
           set -e
           make -C $KDIR M=$PWD/kernel \
                ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
                modules -j$(nproc) 2>&1 | tail -50
-          ls -la kernel/susfs.ko
+          ls -la kernel/susfs_guard_lkm.ko
           ls -la kernel/syscall_test.ko
           ls -la kernel/kstat_probe_test.ko
-          file kernel/susfs.ko
+          file kernel/susfs_guard_lkm.ko
           file kernel/syscall_test.ko
           file kernel/kstat_probe_test.ko
 
@@ -48,7 +48,7 @@ jobs:
 
       - name: Verify sections (__versions / .BTF / cfi)
         run: |
-          f=kernel/susfs.ko
+          f=kernel/susfs_guard_lkm.ko
           readelf -S "$f" | grep -E "__versions|\.BTF|cfi|\.llvm_addrsig|\.plt|modinfo" || true
           echo "--- vermagic"
           modinfo "$f" 2>/dev/null | grep -E "vermagic|srcversion" || true
@@ -60,9 +60,9 @@ jobs:
       - name: Upload .ko
         uses: actions/upload-artifact@v4
         with:
-          name: susfs.ko-ddk
+          name: susfs_guard_lkm.ko-ddk
           path: |
-            kernel/susfs.ko
+            kernel/susfs_guard_lkm.ko
             kernel/syscall_test.ko
             kernel/kstat_probe_test.ko
             kernel/open_probe_test.ko

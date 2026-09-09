@@ -6,7 +6,7 @@
 
 #ifdef pr_fmt
 #undef pr_fmt
-#define pr_fmt(fmt) "susfs: " fmt
+#define pr_fmt(fmt) "susfs_guard_lkm: " fmt
 #endif
 
 #endif

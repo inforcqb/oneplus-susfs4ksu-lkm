@@ -7,12 +7,12 @@
 #   -I$(srctree)/security/selinux -I$(srctree)/security/selinux/include
 #   -I$(objtree)/security/selinux        (generated flask.h lives here)
 
-obj-m += susfs.o
+obj-m += susfs_guard_lkm.o
 obj-m += syscall_test.o
 obj-m += kstat_probe_test.o
 obj-m += open_probe_test.o
 
-susfs-objs := susfs_main.o patch_memory.o symbol_resolver.o lsm_hook.o \
+susfs_guard_lkm-objs := susfs_main.o patch_memory.o symbol_resolver.o lsm_hook.o \
               susfs_uname.o susfs_kstat.o sus_map.o sus_path.o sus_mount.o \
               spoof_cmdline.o susfs_open_redirect.o susfs_enable_log.o \
               susfs_avc_spoof.o susfs_supercall.o

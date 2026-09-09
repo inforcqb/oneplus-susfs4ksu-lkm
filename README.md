@@ -32,9 +32,9 @@ make -C $KDIR M=$PWD/kernel ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules
 ## 加载
 
 ```sh
-ksud insmod /data/local/tmp/susfs.ko
+ksud insmod /data/local/tmp/susfs_guard_lkm.ko
 # 卸载
-rmmod susfs
+rmmod susfs_guard_lkm
 ```
 
 ## 移植参考

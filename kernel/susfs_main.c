@@ -15,11 +15,11 @@
 #include "lsm_hook.h"
 #include "susfs.h"
 
-#define SUSFS_LKM_VERSION "0.7.0-dev"
+#define SUSFS_LKM_VERSION "2.3.0-gki"
 
 static int __init susfs_init(void)
 {
-    pr_info("susfs-lkm: init %s\n", SUSFS_LKM_VERSION);
+    pr_info("susfs_guard_lkm: init v%s\n", SUSFS_LKM_VERSION);
     ksu_init_symbol_resolver();
     ksu_lsm_hook_init();
     susfs_uname_init();
@@ -48,10 +48,10 @@ static void __exit susfs_exit(void)
     susfs_kstat_exit();
     susfs_uname_exit();
     ksu_lsm_hook_exit();
-    pr_info("susfs-lkm: exit\n");
+    pr_info("susfs_guard_lkm: exit\n");
 }
 
 module_init(susfs_init);
 module_exit(susfs_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("SUSFS loadable kernel module (LKM)");
+MODULE_DESCRIPTION("SUSFS guard LKM (susfs_guard_lkm) v2.3.0-gki");

@@ -31,7 +31,7 @@ struct sus_map_entry {
 static struct sus_map_entry map_entries[SUS_MAP_MAX];
 static int nmap;
 
-/* temporary interface: insmod susfs.ko map_ino=<n> hides that inode */
+/* temporary interface: insmod susfs_guard_lkm.ko map_ino=<n> hides that inode */
 static unsigned long param_map_ino;
 module_param_named(map_ino, param_map_ino, ulong, 0644);
 
