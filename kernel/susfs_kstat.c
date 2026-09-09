@@ -280,6 +280,9 @@ static struct kretprobe krp_vfs_getattr = {
     .maxactive = 64,
 };
 
+static bool kstat_tp_registered;
+static bool kstat_krp_registered;
+
 int susfs_kstat_init(void)
 {
     int rc;
@@ -293,10 +296,14 @@ int susfs_kstat_init(void)
     rc = register_trace_sys_exit(kstat_sys_exit, NULL);
     if (rc)
         pr_warn("register_trace_sys_exit failed %d\n", rc);
+    else
+        kstat_tp_registered = true;
 
     rc = register_kretprobe(&krp_vfs_getattr);
     if (rc)
         pr_warn("register_kretprobe(vfs_getattr) failed %d\n", rc);
+    else
+        kstat_krp_registered = true;
 
     pr_info("kstat spoof armed: %d rules (tracepoint + vfs_getattr fallback)\n", nkstat);
     return 0;
@@ -304,8 +311,14 @@ int susfs_kstat_init(void)
 
 void susfs_kstat_exit(void)
 {
-    unregister_kretprobe(&krp_vfs_getattr);
-    unregister_trace_sys_exit(kstat_sys_exit, NULL);
-    tracepoint_synchronize_unregister();
+    if (kstat_krp_registered) {
+        unregister_kretprobe(&krp_vfs_getattr);
+        kstat_krp_registered = false;
+    }
+    if (kstat_tp_registered) {
+        unregister_trace_sys_exit(kstat_sys_exit, NULL);
+        tracepoint_synchronize_unregister();
+        kstat_tp_registered = false;
+    }
     nkstat = 0;
 }
