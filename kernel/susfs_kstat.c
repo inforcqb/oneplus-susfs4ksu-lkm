@@ -94,27 +94,33 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
 
     if (e->flags & KSTAT_SPOOF_INO) {
         v = e->spoofed_ino;
-        copy_to_user((void __user *)(statbuf + ST_INO_OFF), &v, sizeof(v));
+        if (copy_to_user((void __user *)(statbuf + ST_INO_OFF), &v, sizeof(v)))
+            return;
     }
     if (e->flags & KSTAT_SPOOF_DEV) {
         v = e->spoofed_dev;
-        copy_to_user((void __user *)(statbuf + ST_DEV_OFF), &v, sizeof(v));
+        if (copy_to_user((void __user *)(statbuf + ST_DEV_OFF), &v, sizeof(v)))
+            return;
     }
     if (e->flags & KSTAT_SPOOF_NLINK) {
         v32 = e->spoofed_nlink;
-        copy_to_user((void __user *)(statbuf + ST_NLINK_OFF), &v32, sizeof(v32));
+        if (copy_to_user((void __user *)(statbuf + ST_NLINK_OFF), &v32, sizeof(v32)))
+            return;
     }
     if (e->flags & KSTAT_SPOOF_SIZE) {
         v64 = e->spoofed_size;
-        copy_to_user((void __user *)(statbuf + ST_SIZE_OFF), &v64, sizeof(v64));
+        if (copy_to_user((void __user *)(statbuf + ST_SIZE_OFF), &v64, sizeof(v64)))
+            return;
     }
     if (e->flags & KSTAT_SPOOF_BLKSIZE) {
         v32 = (unsigned int)e->spoofed_blksize;
-        copy_to_user((void __user *)(statbuf + ST_BLKSIZE_OFF), &v32, sizeof(v32));
+        if (copy_to_user((void __user *)(statbuf + ST_BLKSIZE_OFF), &v32, sizeof(v32)))
+            return;
     }
     if (e->flags & KSTAT_SPOOF_BLOCKS) {
         v64 = e->spoofed_blocks;
-        copy_to_user((void __user *)(statbuf + ST_BLOCKS_OFF), &v64, sizeof(v64));
+        if (copy_to_user((void __user *)(statbuf + ST_BLOCKS_OFF), &v64, sizeof(v64)))
+            return;
     }
 }
 
