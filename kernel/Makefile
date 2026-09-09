@@ -10,6 +10,7 @@
 obj-m += susfs.o
 obj-m += syscall_test.o
 obj-m += kstat_probe_test.o
+obj-m += syscall_spoof.o
 
 susfs-objs := susfs_main.o patch_memory.o symbol_resolver.o lsm_hook.o \
               susfs_uname.o susfs_kstat.o
