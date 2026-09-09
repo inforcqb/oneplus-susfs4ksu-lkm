@@ -140,6 +140,20 @@ void susfs_uname_supercall(void __user **arg)
         goto out;
     }
 
+    /* debug: dump exact bytes to see why "default" may not match */
+    {
+        int i;
+        pr_info("uname supercall: release=");
+        for (i = 0; i < 12; i++)
+            pr_cont("%02x ", (unsigned char)info.release[i]);
+        pr_cont(" version=");
+        for (i = 0; i < 12; i++)
+            pr_cont("%02x ", (unsigned char)info.version[i]);
+        pr_cont(" rcmp=%d vcmp=%d\n",
+                strcmp(info.release, "default"),
+                strcmp(info.version, "default"));
+    }
+
     /* "default" copies the device's CURRENT uname at runtime */
     if (!strcmp(info.release, "default"))
         strscpy(fake_release, utsname()->release, sizeof(fake_release));
