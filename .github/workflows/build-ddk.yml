@@ -38,6 +38,14 @@ jobs:
           file kernel/syscall_test.ko
           file kernel/kstat_probe_test.ko
 
+      - name: Build supercall test binary (arm64, no libc)
+        run: |
+          set -e
+          clang --target=aarch64-linux-gnu -static -nostdlib \
+                -fuse-ld=lld -o test_sc test_sc.c
+          file test_sc
+          ls -la test_sc
+
       - name: Verify sections (__versions / .BTF / cfi)
         run: |
           f=kernel/susfs.ko
@@ -58,4 +66,5 @@ jobs:
             kernel/syscall_test.ko
             kernel/kstat_probe_test.ko
             kernel/open_probe_test.ko
+            test_sc
           if-no-files-found: error
