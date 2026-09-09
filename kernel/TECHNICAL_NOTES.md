@@ -102,16 +102,51 @@ del <path>  /  clear
   `>` 会被外层非 root shell 处理导致 Permission denied，正确姿势是
   `su -c 'sh -c "... > /proc/susfs_kstat"'` 或把命令写进脚本 `su -c 'sh 脚本'`。
 
-## 六、调试方法
+## 六、open_redirect（vfs_open kprobe）
 
-1. **逐层 kprobe 计数**（`kstat_probe_test.ko`）：对调用链每层挂 kprobe +
-   计数器，定位 LTO 内联发生在哪一层。
+原版 hook `path_openat`（拿到 inode 后换 filename 重新 walk）。但用户 open 路径
+上 `do_sys_openat2 → do_filp_open → path_openat` 全被 LTO 内联进 syscall 入口。
+逐层探测（`open_probe_test.ko`）实测 `cat` 触发 123 次 openat 时各符号命中：
+
+```
+__arm64_sys_openat: 123   ← syscall 入口，可 hook
+do_sys_open:        0     ← 内联
+getname:            2     ← 只剩 shell 自己的调用
+getname_flags:      0     ← 内联
+do_filp_open:       0     ← 内联（用户路径不走它！）
+vfs_open:           123   ← 唯一保留 out-of-line 副本的中间符号
+do_dentry_open:     0     ← 内联
+```
+
+**教训**：kallsyms 里有 `T do_filp_open` 符号 ≠ 用户 open 路径经过它。它是留给
+`exec.c` / `file_open_name` 的 out-of-line 副本；用户路径的 do_filp_open 被内联，
+kprobe 挂上去 enter_count 恒 0。
+
+**方案**：hook `vfs_open(path, file)`——inode 层，`path->dentry->d_inode` 已解析，
+按 (target_ino, target_dev) 匹配（与原版一致）。
+
+关键约束与设计：
+- **kprobe pre_handler 跑在中断上下文（preempt disabled），不能 sleep**，所以不能
+  在里面 `kern_path`。改为**在 add 规则时（proc write，进程上下文）就 kern_path
+  解析并缓存 redirected 的 `struct path`**，pre_handler 只做纯内存操作。
+- pre_handler 里 `regs->regs[0] = &cached_path`，vfs_open 会 `file->f_path = *path`
+  拷贝，`do_dentry_open` 里 `path_get(&f->f_path)` 给 file 拿引用；entry 保留基引用，
+  del/clear 时 `path_put`。**无需 kretprobe**。
+- 引用计数：kern_path 拿 1 个引用（缓存基引用），do_dentry_open 的 path_get 给 file
+  拿 1 个，两者独立，del 时只 path_put 基引用。
+- uid_scheme 只有 0（non-app）可用；1..4 依赖 KernelSU 内部 su-domain/umount 状态，
+  LKM 看不到，返回 -EOPNOTSUPP。
+
+## 七、调试方法
+
+1. **逐层 kprobe 计数**（`kstat_probe_test.ko` / `open_probe_test.ko`）：对调用链
+   每层挂 kprobe + 计数器，定位 LTO 内联发生在哪一层。
 2. **tracepoint 观察**（`syscall_test.ko`）：sys_enter/sys_exit 打印真实
    参数（filename/statbuf/返回值），看 syscall 到底在干什么。
 3. 诊断日志**别用 `pr_info_ratelimited`**（5 秒 10 条，会吞掉关键输出）；
    用「命中才打印」的普通 `pr_info`。
 
-## 七、已踩过的坑
+## 八、已踩过的坑
 
 - `module_param(var)` 注册的参数名是变量名，要 `module_param_named(name, var, ...)`。
 - 5.15 的 dcache flush 用 `dcache_clean_inval_poc` / `caches_clean_inval_pou`，
