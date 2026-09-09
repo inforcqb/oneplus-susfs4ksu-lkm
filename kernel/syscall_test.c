@@ -54,10 +54,12 @@ static void syscall_test_exit(void *data, struct pt_regs *regs, long ret)
 
     state = this_cpu_ptr(&syscall_test_state);
     if (!ret && state->statbuf) {
-        copy_from_user(&ino, (void __user *)(state->statbuf + 8),
-                       sizeof(ino));
-        copy_from_user(&size, (void __user *)(state->statbuf + 40),
-                       sizeof(size));
+        if (copy_from_user(&ino, (void __user *)(state->statbuf + 8),
+                           sizeof(ino)))
+            ino = 0;
+        if (copy_from_user(&size, (void __user *)(state->statbuf + 40),
+                           sizeof(size)))
+            size = 0;
     }
 
     pr_info("syscall_test exit: comm=%s pid=%d ret=%ld statbuf=%px ino=%lu size=%lu\n",
