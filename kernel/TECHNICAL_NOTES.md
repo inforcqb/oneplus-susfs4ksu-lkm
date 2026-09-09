@@ -168,7 +168,34 @@ kprobe 挂上去 enter_count 恒 0。
   → priv_app）。su 域权限极高，日常几乎不产生 denied，hits=0 是正常的，不代表
   hook 没工作（用 enter 计数器确认 hook 命中即可）。
 
-## 八、已踩过的坑
+## 九、supercall ABI（reboot(2) 协议）
+
+`ksu_susfs` 工具（和 SukiSU ksud）通过一个 reboot syscall 与内核通信：
+```
+syscall(SYS_reboot, 0xDEADBEEF, 0xFAFAFAFA, cmd_id, &mut payload)
+```
+内核写回 `payload.err`（0=成功，否则 errno 风格）。原版 SUSFS patch 了
+`kernel/reboot.c` 的 SYSCALL_DEFINE4 分支进 `ksu_handle_sys_reboot()`；LKM 改 kprobe
+`__arm64_sys_reboot` 自己匹配 magic。
+
+关键约束：
+- **arm64 syscall-wrapper quirk**：`__arm64_sys_reboot` 的 kprobe 里 `regs->regs[0]`
+  是 `struct pt_regs *`（wrapper 的 `__regs` 参数），真实用户参数在
+  `real_regs->regs[0..3]`（= SukiSU `PT_REAL_REGS()`）。
+- **pre_handler 原子上下文不能 copy_from_user**，用 `task_work_add(TWA_RESUME)`
+  延迟到进程上下文（SukiSU 同款）。
+- handler 签名统一为上游 `void xxx(void __user **arg)`，`*arg` 是用户态 payload
+  指针；handler 里 copy_from_user 读、copy_to_user 写 err 字段。
+- SukiSU 内核已 hook reboot 但只处理 magic2=0xCAFEBABE（KSU 自己的），我们的
+  0xFAFAFAFA 互不干扰，两个 kprobe 可共存。
+
+验证方式：设备上 `ksud susfs version/status/features` 直接探测（返回 v2.3.0 /
+true / 8 个 feature），功能命令用 no-libc 的 C 程序 `test_sc` 发 reboot syscall。
+
+**A/B 陷阱**：上游 SUSFS_VERSION 是 "v2.3.0"、SUSFS_VARIANT 是 "GKI"（大写），
+别照搬 sidex15 模块 README 里的 "1.5.2"（那是另一套 SUSFS 版本体系）。
+
+## 十、已踩过的坑
 
 - `module_param(var)` 注册的参数名是变量名，要 `module_param_named(name, var, ...)`。
 - 5.15 的 dcache flush 用 `dcache_clean_inval_poc` / `caches_clean_inval_pou`，
