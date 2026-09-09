@@ -146,6 +146,28 @@ kprobe 挂上去 enter_count 恒 0。
 3. 诊断日志**别用 `pr_info_ratelimited`**（5 秒 10 条，会吞掉关键输出）；
    用「命中才打印」的普通 `pr_info`。
 
+## 七、avc spoofing（slow_avc_audit kprobe）
+
+原版 hook `avc_audit_post_callback`（avc 日志里 target 是 su 域时把 tcontext 伪装
+成 priv_app）。但实测该符号 kprobe enter 恒 0——它是 static，且 `common_lsm_audit`
+（非导出）被 LTO 内联进 `slow_avc_audit`（noinline），函数指针常量传播后
+`avc_audit_post_callback` 的调用点也被内联，kallsyms 里的 t 符号是残留。
+
+**方案**：hook `slow_avc_audit(state, ssid, tsid, tclass, ...)`——它是 `noinline`
+标记的 T 符号，必有 out-of-line 副本。tsid 是第 3 个参数（regs->regs[2]），直接
+`regs->regs[2] = priv_app_sid` 即可，比改 sad 结构更简单，pre_handler 纯内存写。
+
+**验证**：`su -c id` 显示当前 su 域是 `u:r:ksu:s0`（SukiSU），不是 KernelSU 官方的
+`u:r:su:s0`——module_param `avc_su_ctx` 要按实际环境覆盖。sid 用 EXPORT_SYMBOL 的
+`security_secctx_to_secid()` 在 init 时解析（进程上下文）。
+
+**关键认知**：
+- Android 的 avc denied **走 logcat（auditd），不进 dmesg**。验证 avc 功能要看
+  `logcat -b all | grep avc`，不是 dmesg。
+- avc spoofing 语义：隐藏 su 域**作为 target** 被访问的痕迹（`tcontext=u:r:ksu:s0`
+  → priv_app）。su 域权限极高，日常几乎不产生 denied，hits=0 是正常的，不代表
+  hook 没工作（用 enter 计数器确认 hook 命中即可）。
+
 ## 八、已踩过的坑
 
 - `module_param(var)` 注册的参数名是变量名，要 `module_param_named(name, var, ...)`。
