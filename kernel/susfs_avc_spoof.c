@@ -25,7 +25,6 @@
 #include <linux/module.h>
 #include <linux/kprobes.h>
 #include <linux/security.h>
-#include <linux/lsm_audit.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
@@ -43,45 +42,30 @@ static u32 avc_priv_app_sid;
 static bool avc_spoof_enabled;
 static bool avc_registered;
 
-/* local definition matching security/selinux/include/avc.h (avoids the
- * private header; only the layout up to tsid matters, which is stable) */
-struct selinux_state;
-struct selinux_audit_data {
-	u32 ssid;
-	u32 tsid;
-	u16 tclass;
-	u32 requested;
-	u32 audited;
-	u32 denied;
-	int result;
-	struct selinux_state *state;
-};
-
-/* avc_audit_post_callback(ab, a): ab=regs[0], a=regs[1] */
+/* slow_avc_audit(state, ssid, tsid, tclass, requested, audited, denied,
+ * result, a): tsid is arg #3 (regs->regs[2]), a u32 in the low bits.
+ *
+ * avc_audit_post_callback is static and its call site is LTO-inlined into
+ * slow_avc_audit (noinline), so its kallsyms symbol is a leftover.  But
+ * slow_avc_audit itself is noinline and has a real out-of-line copy; its
+ * tsid parameter is even simpler to rewrite than the sad struct. */
 static atomic_t avc_hit_count = ATOMIC_INIT(0);
 static atomic_t avc_enter_count = ATOMIC_INIT(0);
 
 static int avc_audit_post_pre(struct kprobe *kp, struct pt_regs *regs)
 {
-	struct common_audit_data *ad = (struct common_audit_data *)regs->regs[1];
-	struct selinux_audit_data *sad;
+	u32 tsid = (u32)regs->regs[2];
 
 	atomic_inc(&avc_enter_count);
-	if (!ad)
-		return 0;
-	sad = ad->selinux_audit_data;
-	if (!sad)
-		return 0;
-
-	if (sad->tsid == avc_su_sid) {
+	if (tsid == avc_su_sid) {
 		atomic_inc(&avc_hit_count);
-		sad->tsid = avc_priv_app_sid;
+		regs->regs[2] = avc_priv_app_sid;
 	}
 	return 0;
 }
 
 static struct kprobe kp_avc = {
-	.symbol_name = "avc_audit_post_callback",
+	.symbol_name = "slow_avc_audit",
 	.pre_handler = avc_audit_post_pre,
 };
 
@@ -95,7 +79,7 @@ static int avc_register(void)
 	if (rc)
 		return rc;
 	avc_registered = true;
-	pr_info("susfs_avc_spoof: hook installed (avc_audit_post_callback)\n");
+	pr_info("susfs_avc_spoof: hook installed (slow_avc_audit)\n");
 	return 0;
 }
 
