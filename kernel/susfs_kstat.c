@@ -16,6 +16,9 @@
 #include <linux/path.h>
 #include <linux/stat.h>
 #include <linux/uaccess.h>
+#include <linux/tracepoint.h>
+#include <trace/events/syscalls.h>
+#include <asm/syscall.h>
 #include "susfs_log.h"
 
 #define KSTAT_SPOOF_INO      (1 << 0)
@@ -268,4 +271,42 @@ void susfs_kstat_syscall_diag_exit(void)
     unregister_kprobe(&kp_fstatat64);
     unregister_kprobe(&kp_newfstatat);
     unregister_kprobe(&kp_statx);
+}
+
+/* ---- syscall tracepoint diagnosis ---- */
+static void tp_sys_enter(void *data, struct pt_regs *regs, long id)
+{
+    unsigned long args[6];
+    const char __user *filename;
+    char buf[64];
+    long n;
+
+    if (id != __NR_newfstatat)
+        return;
+    syscall_get_arguments(current, regs, args);
+    filename = (const char __user *)args[1];
+    n = strncpy_from_user(buf, filename, sizeof(buf));
+    pr_info("TP enter newfstatat: comm=%s filename=%.*s\n",
+            current->comm, (int)(n > 0 ? n : 0), n > 0 ? buf : "");
+}
+
+static void tp_sys_exit(void *data, struct pt_regs *regs, long ret)
+{
+    if (syscall_get_nr(current, regs) != __NR_newfstatat)
+        return;
+    pr_info("TP exit newfstatat: comm=%s ret=%ld\n", current->comm, ret);
+}
+
+int susfs_kstat_tp_diag_init(void)
+{
+    register_trace_sys_enter(tp_sys_enter, NULL);
+    register_trace_sys_exit(tp_sys_exit, NULL);
+    pr_info("kstat: syscall tracepoint diag armed\n");
+    return 0;
+}
+
+void susfs_kstat_tp_diag_exit(void)
+{
+    unregister_trace_sys_exit(tp_sys_exit, NULL);
+    unregister_trace_sys_enter(tp_sys_enter, NULL);
 }

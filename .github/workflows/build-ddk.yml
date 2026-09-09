@@ -32,7 +32,9 @@ jobs:
                ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
                modules -j$(nproc) 2>&1 | tail -50
           ls -la kernel/susfs.ko
+          ls -la kernel/syscall_test.ko
           file kernel/susfs.ko
+          file kernel/syscall_test.ko
 
       - name: Verify sections (__versions / .BTF / cfi)
         run: |
@@ -40,10 +42,16 @@ jobs:
           readelf -S "$f" | grep -E "__versions|\.BTF|cfi|\.llvm_addrsig|\.plt|modinfo" || true
           echo "--- vermagic"
           modinfo "$f" 2>/dev/null | grep -E "vermagic|srcversion" || true
+          f=kernel/syscall_test.ko
+          readelf -S "$f" | grep -E "__versions|\.BTF|cfi|\.llvm_addrsig|\.plt|modinfo" || true
+          echo "--- syscall_test vermagic"
+          modinfo "$f" 2>/dev/null | grep -E "vermagic|srcversion" || true
 
       - name: Upload .ko
         uses: actions/upload-artifact@v4
         with:
           name: susfs.ko-ddk
-          path: kernel/susfs.ko
+          path: |
+            kernel/susfs.ko
+            kernel/syscall_test.ko
           if-no-files-found: error
