@@ -31,4 +31,7 @@ bool susfs_log_enabled(void);
 int susfs_avc_spoof_init(void);
 void susfs_avc_spoof_exit(void);
 
+int susfs_supercall_init(void);
+void susfs_supercall_exit(void);
+
 #endif
