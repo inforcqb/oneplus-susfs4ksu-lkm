@@ -21,8 +21,8 @@
 
 #define SUSFS_UNAME_LEN (__NEW_UTS_LEN + 1)
 
-static char fake_release[SUSFS_UNAME_LEN] = "5.15.180-susfs";
-static char fake_version[SUSFS_UNAME_LEN] = "#1 SMP PREEMPT susfs";
+static char fake_release[SUSFS_UNAME_LEN] = "5.15.180-android13-8-o-01176-g6333b0dbc8ed";
+static char fake_version[SUSFS_UNAME_LEN] = "#1 SMP PREEMPT Fri Dec 12 11:37:03 UTC 2025";
 static bool uname_spoof_enabled = true;
 
 module_param_string(release, fake_release, sizeof(fake_release), 0644);
