@@ -46,7 +46,7 @@
 #include "susfs_log.h"
 
 #define SUS_OR_MAX 64
-#define SUSFS_MAX_LEN_PATHNAME 128
+#define OR_PATH_MAX 128
 
 enum uid_scheme {
 	UID_NON_APP_PROC = 0,
@@ -57,8 +57,8 @@ enum uid_scheme {
 };
 
 struct sus_or_entry {
-	char target_pathname[SUSFS_MAX_LEN_PATHNAME];
-	char redirected_pathname[SUSFS_MAX_LEN_PATHNAME];
+	char target_pathname[OR_PATH_MAX];
+	char redirected_pathname[OR_PATH_MAX];
 	unsigned long target_ino;
 	dev_t target_dev;
 	/* cached redirected path, resolved at add time (base ref) */
@@ -278,14 +278,14 @@ static int or_add(const char *target, const char *redirected, int scheme)
 			return -ENOSPC;
 		}
 		e = &or_entries[nor];
-		strscpy(e->target_pathname, target, SUSFS_MAX_LEN_PATHNAME);
+		strscpy(e->target_pathname, target, OR_PATH_MAX);
 		nor++;
 	} else {
 		/* replacing an existing rule: drop its old cached path */
 		path_put(&e->redirected_path);
 	}
 
-	strscpy(e->redirected_pathname, redirected, SUSFS_MAX_LEN_PATHNAME);
+	strscpy(e->redirected_pathname, redirected, OR_PATH_MAX);
 	e->target_ino = ti->i_ino;
 	e->target_dev = ti->i_sb->s_dev;
 	e->redirected_path = rp;   /* transfer the cached reference */

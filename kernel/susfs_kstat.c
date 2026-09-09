@@ -75,10 +75,10 @@
 	KSTAT_SPOOF_NLINK | KSTAT_SPOOF_SIZE)
 
 #define SUS_KSTAT_MAX 32
-#define SUSFS_MAX_LEN_PATHNAME 128
+#define KSTAT_PATH_MAX 128
 
 struct sus_kstat_entry {
-	char target_pathname[SUSFS_MAX_LEN_PATHNAME];
+	char target_pathname[KSTAT_PATH_MAX];
 	unsigned long target_ino;
 	/* dev stored ENCODED (new_encode_dev) so it matches the user statbuf
 	 * st_dev field 1:1 on the tracepoint hot path. */
@@ -482,7 +482,7 @@ static int susfs_kstat_add(const char *path)
 		if (nkstat >= SUS_KSTAT_MAX)
 			return -ENOSPC;
 		e = &kstat_entries[nkstat];
-		strscpy(e->target_pathname, path, SUSFS_MAX_LEN_PATHNAME);
+		strscpy(e->target_pathname, path, KSTAT_PATH_MAX);
 		nkstat++;
 	}
 
@@ -557,7 +557,7 @@ static int susfs_kstat_add_statically(char **argv, int argc)
 		if (nkstat >= SUS_KSTAT_MAX)
 			return -ENOSPC;
 		e = &kstat_entries[nkstat];
-		strscpy(e->target_pathname, path, SUSFS_MAX_LEN_PATHNAME);
+		strscpy(e->target_pathname, path, KSTAT_PATH_MAX);
 		nkstat++;
 	}
 
@@ -605,7 +605,7 @@ static int susfs_kstat_add_statically_abi(struct st_susfs_sus_kstat *info)
 			return -ENOSPC;
 		e = &kstat_entries[nkstat];
 		strscpy(e->target_pathname, info->target_pathname,
-			SUSFS_MAX_LEN_PATHNAME);
+			KSTAT_PATH_MAX);
 		nkstat++;
 	}
 
