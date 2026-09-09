@@ -48,11 +48,18 @@ static void syscall_test_exit(void *data, struct pt_regs *regs, long ret)
     struct syscall_test_state *state;
     unsigned long ino = 0;
     unsigned long size = 0;
+    unsigned long args[6];
+    unsigned long exit_statbuf = 0;
 
     if (syscall_get_nr(current, regs) != __NR_newfstatat)
         return;
 
     state = this_cpu_ptr(&syscall_test_state);
+
+    /* can we read the original args from the exit regs? */
+    syscall_get_arguments(current, regs, args);
+    exit_statbuf = args[2];
+
     if (!ret && state->statbuf) {
         if (copy_from_user(&ino, (void __user *)(state->statbuf + 8),
                            sizeof(ino)))
@@ -62,9 +69,9 @@ static void syscall_test_exit(void *data, struct pt_regs *regs, long ret)
             size = 0;
     }
 
-    pr_info("syscall_test exit: comm=%s pid=%d ret=%ld statbuf=%px ino=%lu size=%lu\n",
-            current->comm, task_pid_nr(current), ret,
-            (void *)state->statbuf, ino, size);
+    pr_info("syscall_test exit: comm=%s ret=%ld saved_statbuf=%px exit_arg_statbuf=%px MATCH=%d ino=%lu size=%lu\n",
+            current->comm, ret, (void *)state->statbuf, (void *)exit_statbuf,
+            state->statbuf == exit_statbuf, ino, size);
 }
 
 static int __init syscall_test_init(void)
