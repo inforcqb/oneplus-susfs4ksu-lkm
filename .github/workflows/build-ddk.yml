@@ -57,5 +57,4 @@ jobs:
             kernel/susfs.ko
             kernel/syscall_test.ko
             kernel/kstat_probe_test.ko
-            kernel/syscall_spoof.ko
           if-no-files-found: error

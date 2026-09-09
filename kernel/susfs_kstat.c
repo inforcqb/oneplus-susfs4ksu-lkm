@@ -2,23 +2,19 @@
 /*
  * susfs_kstat.c - spoof kstat fields (SUSFS SUS_KSTAT feature), LKM port.
  *
- * Upstream SUSFS patches the tail of generic_fillattr() (fs/stat.c) to rewrite
- * the kstat.  The LKM equivalent hooks generic_fillattr with a kretprobe and
- * rewrites the stat fields after the function filled them.  The spoof lookup
- * is pure in-memory work (no sleeping), safe in a kretprobe handler.
+ * On this GKI kernel LTO inlines the whole newfstatat chain
+ * (vfs_fstatat -> vfs_statx -> vfs_getattr -> cp_new_stat) into the syscall
+ * entry, so VFS-layer kprobes miss.  The reliable hook is the return of
+ * __arm64_sys_newfstatat, where the user statbuf is fully written.  Rewrite
+ * the requested fields there via copy_to_user (the pages were just written by
+ * cp_new_stat, so this cannot fault).
  *
- * Matching is by inode number (optionally + device).  Rules are added at load
- * time via module params; a full add/update/delete interface comes later.
+ * Field offsets are arm64 asm-generic struct stat (see include/uapi/asm-generic/stat.h).
  */
 #include <linux/module.h>
 #include <linux/kprobes.h>
-#include <linux/fs.h>
-#include <linux/path.h>
-#include <linux/stat.h>
 #include <linux/uaccess.h>
-#include <linux/tracepoint.h>
-#include <trace/events/syscalls.h>
-#include <asm/syscall.h>
+#include <linux/syscalls.h>
 #include "susfs_log.h"
 
 #define KSTAT_SPOOF_INO      (1 << 0)
@@ -30,11 +26,18 @@
 
 #define SUS_KSTAT_MAX 32
 
+/* arm64 asm-generic struct stat offsets */
+#define ST_DEV_OFF      0
+#define ST_INO_OFF      8
+#define ST_NLINK_OFF    20
+#define ST_SIZE_OFF     48
+#define ST_BLKSIZE_OFF  56
+#define ST_BLOCKS_OFF   64
+
 struct sus_kstat_entry {
     unsigned long target_ino;
-    dev_t target_dev;
     unsigned long spoofed_ino;
-    dev_t spoofed_dev;
+    unsigned long spoofed_dev;
     unsigned int spoofed_nlink;
     long long spoofed_size;
     long long spoofed_blocks;
@@ -62,102 +65,93 @@ static void susfs_kstat_add_ino(unsigned long target_ino, unsigned long spoofed_
     nkstat++;
 }
 
-static void susfs_kstat_spoof(struct inode *inode, struct kstat *stat)
+static struct sus_kstat_entry *susfs_kstat_lookup(unsigned long ino)
 {
     int i;
-    unsigned long ino;
-    dev_t dev;
 
-    if (!inode || !stat)
+    for (i = 0; i < nkstat; i++)
+        if (kstat_entries[i].target_ino == ino)
+            return &kstat_entries[i];
+    return NULL;
+}
+
+/* rewrite the requested fields of the user statbuf */
+static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
+{
+    struct sus_kstat_entry *e;
+    unsigned long ino = 0;
+    unsigned long v;
+    unsigned int v32;
+    long long v64;
+
+    if (copy_from_user(&ino, (void __user *)(statbuf + ST_INO_OFF), sizeof(ino)))
         return;
-    ino = inode->i_ino;
-    dev = inode->i_sb->s_dev;
 
-    for (i = 0; i < nkstat; i++) {
-        struct sus_kstat_entry *e = &kstat_entries[i];
-        if (e->target_ino != ino && e->target_ino != stat->ino)
-            continue;
-        if (e->target_dev && e->target_dev != dev)
-            continue;
-        if (e->flags & KSTAT_SPOOF_INO)
-            stat->ino = e->spoofed_ino;
-        if (e->flags & KSTAT_SPOOF_DEV)
-            stat->dev = e->spoofed_dev;
-        if (e->flags & KSTAT_SPOOF_NLINK)
-            stat->nlink = e->spoofed_nlink;
-        if (e->flags & KSTAT_SPOOF_SIZE)
-            stat->size = e->spoofed_size;
-        if (e->flags & KSTAT_SPOOF_BLKSIZE)
-            stat->blksize = e->spoofed_blksize;
-        if (e->flags & KSTAT_SPOOF_BLOCKS)
-            stat->blocks = e->spoofed_blocks;
-        break;
+    e = susfs_kstat_lookup(ino);
+    if (!e)
+        return;
+
+    if (e->flags & KSTAT_SPOOF_INO) {
+        v = e->spoofed_ino;
+        copy_to_user((void __user *)(statbuf + ST_INO_OFF), &v, sizeof(v));
+    }
+    if (e->flags & KSTAT_SPOOF_DEV) {
+        v = e->spoofed_dev;
+        copy_to_user((void __user *)(statbuf + ST_DEV_OFF), &v, sizeof(v));
+    }
+    if (e->flags & KSTAT_SPOOF_NLINK) {
+        v32 = e->spoofed_nlink;
+        copy_to_user((void __user *)(statbuf + ST_NLINK_OFF), &v32, sizeof(v32));
+    }
+    if (e->flags & KSTAT_SPOOF_SIZE) {
+        v64 = e->spoofed_size;
+        copy_to_user((void __user *)(statbuf + ST_SIZE_OFF), &v64, sizeof(v64));
+    }
+    if (e->flags & KSTAT_SPOOF_BLKSIZE) {
+        v32 = (unsigned int)e->spoofed_blksize;
+        copy_to_user((void __user *)(statbuf + ST_BLKSIZE_OFF), &v32, sizeof(v32));
+    }
+    if (e->flags & KSTAT_SPOOF_BLOCKS) {
+        v64 = e->spoofed_blocks;
+        copy_to_user((void __user *)(statbuf + ST_BLOCKS_OFF), &v64, sizeof(v64));
     }
 }
 
-struct kstat_args {
-    const struct path *path;
-    struct kstat *stat;
+struct stat_args {
+    unsigned long statbuf;
 };
 
-static int kr_vfs_getattr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+static int kr_newfstatat_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    struct kstat_args *a = (struct kstat_args *)ri->data;
-    struct dentry *d;
+    struct stat_args *a = (struct stat_args *)ri->data;
+    struct pt_regs *user = (struct pt_regs *)regs->regs[0];
 
-    /* vfs_getattr(path, stat, request_mask, query_flags): direct args */
-    a->path = (const struct path *)regs->regs[0];
-    a->stat = (struct kstat *)regs->regs[1];
-
-    d = (a->path) ? a->path->dentry : NULL;
-    if (d && d->d_inode && d->d_inode->i_ino == 461584)
-        pr_info("GETATTR TARGET 461584: name=%.*s comm=%s\n",
-                (int)d->d_name.len, d->d_name.name, current->comm);
+    /* syscall wrapper does NOT auto-adjust regs on this GKI kernel:
+     * regs->regs[0] is the struct pt_regs* argument; user args live in
+     * user->regs[0..3] = dfd, filename, statbuf, flag. */
+    a->statbuf = user->regs[2];
     return 0;
 }
 
-static int kr_vfs_getattr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+static int kr_newfstatat_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    struct kstat_args *a = (struct kstat_args *)ri->data;
-    struct inode *inode;
-    bool matched;
+    struct stat_args *a = (struct stat_args *)ri->data;
 
-    if (!a->path || !a->path->dentry || !a->stat)
+    if (regs_return_value(regs) != 0)
         return 0;
-    inode = a->path->dentry->d_inode;
-    pr_info_ratelimited("KSTAT TRACE getattr: inode=%lu stat=%lu ret=%ld comm=%s\n",
-                        inode ? inode->i_ino : 0, a->stat->ino,
-                        regs_return_value(regs), current->comm);
-    matched = inode && (inode->i_ino == param_target_ino ||
-                        a->stat->ino == param_target_ino);
-    if (matched)
-        pr_info("KSTAT HIT before: inode->i_ino=%lu stat->ino=%lu target=%lu spoof=%lu\n",
-            inode->i_ino, a->stat->ino, param_target_ino, param_spoofed_ino);
-    susfs_kstat_spoof(inode, a->stat);
-    if (matched)
-        pr_info("KSTAT HIT after: inode->i_ino=%lu stat->ino=%lu\n",
-                inode->i_ino, a->stat->ino);
+    if (!a->statbuf)
+        return 0;
+    susfs_kstat_spoof_statbuf(a->statbuf);
     return 0;
 }
 
 static struct kretprobe krp = {
-    .kp.symbol_name = "vfs_getattr",
-    .entry_handler = kr_vfs_getattr_entry,
-    .handler = kr_vfs_getattr_ret,
-    .data_size = sizeof(struct kstat_args),
+    .kp.symbol_name = "__arm64_sys_newfstatat",
+    .entry_handler = kr_newfstatat_entry,
+    .handler = kr_newfstatat_ret,
+    .data_size = sizeof(struct stat_args),
     .maxactive = 64,
 };
-
-static struct kretprobe krp_nosec = {
-    .kp.symbol_name = "vfs_getattr_nosec",
-    .entry_handler = kr_vfs_getattr_entry,
-    .handler = kr_vfs_getattr_ret,
-    .data_size = sizeof(struct kstat_args),
-    .maxactive = 64,
-};
-
-int susfs_kstat_syscall_diag_init(void);
-void susfs_kstat_syscall_diag_exit(void);
 
 int susfs_kstat_init(void)
 {
@@ -171,142 +165,14 @@ int susfs_kstat_init(void)
 
     rc = register_kretprobe(&krp);
     if (rc)
-        pr_warn("register_kretprobe(vfs_getattr) failed %d\n", rc);
-    else {
-        rc = register_kretprobe(&krp_nosec);
-        if (rc) {
-            pr_warn("register_kretprobe(vfs_getattr_nosec) failed %d\n", rc);
-            unregister_kretprobe(&krp);
-        } else {
-            pr_info("kstat spoof armed: %d rules\n", nkstat);
-        }
-    }
-    susfs_kstat_syscall_diag_init();
+        pr_warn("register_kretprobe(newfstatat) failed %d\n", rc);
+    else
+        pr_info("kstat spoof armed: %d rules\n", nkstat);
     return 0;
 }
 
 void susfs_kstat_exit(void)
 {
-    susfs_kstat_syscall_diag_exit();
-    unregister_kretprobe(&krp_nosec);
     unregister_kretprobe(&krp);
     nkstat = 0;
-}
-
-/* ---- temporary syscall diagnosis ---- */
-static int kp_statx_pre(struct kprobe *kp, struct pt_regs *regs)
-{
-    pr_info("SYSCALL statx: comm=%s\n", current->comm);
-    return 0;
-}
-
-static int kp_newfstatat_pre(struct kprobe *kp, struct pt_regs *regs)
-{
-    pr_info("SYSCALL newfstatat: comm=%s\n", current->comm);
-    return 0;
-}
-
-static int kp_fstatat64_pre(struct kprobe *kp, struct pt_regs *regs)
-{
-    pr_info("SYSCALL fstatat64: comm=%s\n", current->comm);
-    return 0;
-}
-
-static int kp_fstat_pre(struct kprobe *kp, struct pt_regs *regs)
-{
-    pr_info("SYSCALL fstat: comm=%s\n", current->comm);
-    return 0;
-}
-
-static int kp_vfs_statx_pre(struct kprobe *kp, struct pt_regs *regs)
-{
-    char buf[64];
-    const char __user *filename = (const char __user *)regs->regs[1];
-    long n = strncpy_from_user_nofault(buf, filename, sizeof(buf));
-    pr_info("VFS_STATX: comm=%s dfd=%ld filename=%.*s\n",
-            current->comm, regs->regs[0],
-            (int)(n > 0 ? n : 0), n > 0 ? buf : "");
-    return 0;
-}
-
-static struct kprobe kp_statx = {
-    .symbol_name = "__arm64_sys_statx",
-    .pre_handler = kp_statx_pre,
-};
-
-static struct kprobe kp_newfstatat = {
-    .symbol_name = "__arm64_sys_newfstatat",
-    .pre_handler = kp_newfstatat_pre,
-};
-
-static struct kprobe kp_fstatat64 = {
-    .symbol_name = "__arm64_sys_fstatat64",
-    .pre_handler = kp_fstatat64_pre,
-};
-
-static struct kprobe kp_fstat = {
-    .symbol_name = "__arm64_sys_fstat",
-    .pre_handler = kp_fstat_pre,
-};
-
-static struct kprobe kp_vfs_statx = {
-    .symbol_name = "vfs_statx",
-    .pre_handler = kp_vfs_statx_pre,
-};
-
-int susfs_kstat_syscall_diag_init(void)
-{
-    register_kprobe(&kp_statx);
-    register_kprobe(&kp_newfstatat);
-    register_kprobe(&kp_fstatat64);
-    register_kprobe(&kp_fstat);
-    register_kprobe(&kp_vfs_statx);
-    return 0;
-}
-
-void susfs_kstat_syscall_diag_exit(void)
-{
-    unregister_kprobe(&kp_vfs_statx);
-    unregister_kprobe(&kp_fstat);
-    unregister_kprobe(&kp_fstatat64);
-    unregister_kprobe(&kp_newfstatat);
-    unregister_kprobe(&kp_statx);
-}
-
-/* ---- syscall tracepoint diagnosis ---- */
-static void tp_sys_enter(void *data, struct pt_regs *regs, long id)
-{
-    unsigned long args[6];
-    const char __user *filename;
-    char buf[64];
-    long n;
-
-    if (id != __NR_newfstatat)
-        return;
-    syscall_get_arguments(current, regs, args);
-    filename = (const char __user *)args[1];
-    n = strncpy_from_user(buf, filename, sizeof(buf));
-    pr_info("TP enter newfstatat: comm=%s filename=%.*s\n",
-            current->comm, (int)(n > 0 ? n : 0), n > 0 ? buf : "");
-}
-
-static void tp_sys_exit(void *data, struct pt_regs *regs, long ret)
-{
-    if (syscall_get_nr(current, regs) != __NR_newfstatat)
-        return;
-    pr_info("TP exit newfstatat: comm=%s ret=%ld\n", current->comm, ret);
-}
-
-int susfs_kstat_tp_diag_init(void)
-{
-    register_trace_sys_enter(tp_sys_enter, NULL);
-    register_trace_sys_exit(tp_sys_exit, NULL);
-    pr_info("kstat: syscall tracepoint diag armed\n");
-    return 0;
-}
-
-void susfs_kstat_tp_diag_exit(void)
-{
-    unregister_trace_sys_exit(tp_sys_exit, NULL);
-    unregister_trace_sys_enter(tp_sys_enter, NULL);
 }
