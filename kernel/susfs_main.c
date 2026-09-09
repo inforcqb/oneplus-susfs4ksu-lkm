@@ -15,7 +15,7 @@
 #include "lsm_hook.h"
 #include "susfs.h"
 
-#define SUSFS_LKM_VERSION "0.6.0-dev"
+#define SUSFS_LKM_VERSION "0.7.0-dev"
 
 static int __init susfs_init(void)
 {
@@ -27,11 +27,13 @@ static int __init susfs_init(void)
     susfs_sus_map_init();
     sus_path_init();
     susfs_sus_mount_init();
+    susfs_spoof_cmdline_init();
     return 0;
 }
 
 static void __exit susfs_exit(void)
 {
+    susfs_spoof_cmdline_exit();
     susfs_sus_mount_exit();
     sus_path_exit();
     susfs_sus_map_exit();

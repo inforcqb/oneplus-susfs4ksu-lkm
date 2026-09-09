@@ -18,4 +18,7 @@ void sus_path_exit(void);
 int susfs_sus_mount_init(void);
 void susfs_sus_mount_exit(void);
 
+int susfs_spoof_cmdline_init(void);
+void susfs_spoof_cmdline_exit(void);
+
 #endif
