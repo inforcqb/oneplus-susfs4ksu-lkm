@@ -28,4 +28,7 @@ int susfs_enable_log_init(void);
 void susfs_enable_log_exit(void);
 bool susfs_log_enabled(void);
 
+int susfs_avc_spoof_init(void);
+void susfs_avc_spoof_exit(void);
+
 #endif

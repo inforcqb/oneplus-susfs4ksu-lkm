@@ -30,11 +30,13 @@ static int __init susfs_init(void)
     susfs_spoof_cmdline_init();
     susfs_open_redirect_init();
     susfs_enable_log_init();
+    susfs_avc_spoof_init();
     return 0;
 }
 
 static void __exit susfs_exit(void)
 {
+    susfs_avc_spoof_exit();
     susfs_enable_log_exit();
     susfs_open_redirect_exit();
     susfs_spoof_cmdline_exit();
