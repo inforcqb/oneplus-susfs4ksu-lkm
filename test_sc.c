@@ -90,9 +90,9 @@ void _start(void)
     puthex((unsigned int)ver.err);
     putstr("\n");
 
-    putstr("set_uname: ");
-    // copy strings into uname
-    { const char *r = "5.15.180-test"; const char *vv = "#1 test";
+    putstr("set_uname(default): ");
+    // pass "default" -> kernel copies the device's current utsname at runtime
+    { const char *r = "default"; const char *vv = "default";
       int i; for (i = 0; r[i]; i++) uname.release[i] = r[i];
       for (i = 0; vv[i]; i++) uname.version[i] = vv[i]; }
     sc_reboot(KSU_MAGIC1, SUSFS_MAGIC, CMD_SET_UNAME, &uname);
