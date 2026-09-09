@@ -15,6 +15,7 @@
 #include <linux/kprobes.h>
 #include <linux/uaccess.h>
 #include <linux/syscalls.h>
+#include <linux/stat.h>
 #include "susfs_log.h"
 
 #define KSTAT_SPOOF_INO      (1 << 0)
@@ -153,6 +154,65 @@ static struct kretprobe krp = {
     .maxactive = 64,
 };
 
+/* fallback: some paths (vfs_fstat, statx, direct callers) still reach the
+ * exported vfs_getattr copy; rewrite the kernel kstat there too. */
+struct vfs_getattr_args {
+    const struct path *path;
+    struct kstat *stat;
+};
+
+static int kr_vfs_getattr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct vfs_getattr_args *a = (struct vfs_getattr_args *)ri->data;
+
+    a->path = (const struct path *)regs->regs[0];
+    a->stat = (struct kstat *)regs->regs[1];
+    return 0;
+}
+
+static void susfs_kstat_spoof_kstat(struct inode *inode, struct kstat *stat)
+{
+    struct sus_kstat_entry *e;
+
+    if (!inode || !stat)
+        return;
+    e = susfs_kstat_lookup(inode->i_ino);
+    if (!e)
+        return;
+    if (e->flags & KSTAT_SPOOF_INO)
+        stat->ino = e->spoofed_ino;
+    if (e->flags & KSTAT_SPOOF_DEV)
+        stat->dev = e->spoofed_dev;
+    if (e->flags & KSTAT_SPOOF_NLINK)
+        stat->nlink = e->spoofed_nlink;
+    if (e->flags & KSTAT_SPOOF_SIZE)
+        stat->size = e->spoofed_size;
+    if (e->flags & KSTAT_SPOOF_BLKSIZE)
+        stat->blksize = e->spoofed_blksize;
+    if (e->flags & KSTAT_SPOOF_BLOCKS)
+        stat->blocks = e->spoofed_blocks;
+}
+
+static int kr_vfs_getattr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct vfs_getattr_args *a = (struct vfs_getattr_args *)ri->data;
+
+    if (regs_return_value(regs) != 0)
+        return 0;
+    if (!a->path || !a->path->dentry || !a->stat)
+        return 0;
+    susfs_kstat_spoof_kstat(a->path->dentry->d_inode, a->stat);
+    return 0;
+}
+
+static struct kretprobe krp_vfs_getattr = {
+    .kp.symbol_name = "vfs_getattr",
+    .entry_handler = kr_vfs_getattr_entry,
+    .handler = kr_vfs_getattr_ret,
+    .data_size = sizeof(struct vfs_getattr_args),
+    .maxactive = 64,
+};
+
 int susfs_kstat_init(void)
 {
     int rc;
@@ -166,13 +226,18 @@ int susfs_kstat_init(void)
     rc = register_kretprobe(&krp);
     if (rc)
         pr_warn("register_kretprobe(newfstatat) failed %d\n", rc);
-    else
-        pr_info("kstat spoof armed: %d rules\n", nkstat);
+
+    rc = register_kretprobe(&krp_vfs_getattr);
+    if (rc)
+        pr_warn("register_kretprobe(vfs_getattr) failed %d\n", rc);
+
+    pr_info("kstat spoof armed: %d rules\n", nkstat);
     return 0;
 }
 
 void susfs_kstat_exit(void)
 {
+    unregister_kretprobe(&krp_vfs_getattr);
     unregister_kretprobe(&krp);
     nkstat = 0;
 }
