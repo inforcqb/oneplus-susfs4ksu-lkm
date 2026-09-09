@@ -720,6 +720,11 @@ static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
 	cmd[len] = 0;
 
 	argc = split_ws(cmd, argv, 16);
+
+	/* unconditional trace: confirm the write callback fires and what it got */
+	pr_info("kstat_proc_write: len=%zu argc=%d cmd='%s'\n", len, argc,
+		argc ? argv[0] : "");
+
 	if (argc == 0)
 		return len;
 
