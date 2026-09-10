@@ -1,10 +1,12 @@
 # SUSFS-LKM 审计发现（2026-09-10，逐函数级扫描）
 
-> **修复状态（commit `b9b0a2a`，真机验证通过）**
+> **修复状态（最新 commit `15b3ff4`，真机验证通过）**
 >
 > 已修：P0 全部 5 条（0600 控制节点 / 0400 `hide_list` + 去 `%px` /
 > 动态 `enabled_features` / supercall init 失败即拒绝加载 / 未识别命令）；
-> P2 两条最便宜的（`show_vfsmnt` 补挂、compat getdents64）；
+> P1 全部内存安全问题（`sus_map[-1]`、bootconfig 悬垂、open_redirect UAF、
+> **ABI 路径字段越界读**、**kstat 表读写竞争**）；
+> P2 三条（`show_vfsmnt` 补挂、compat getdents64、**`expose_proc` 误伤钩子**）；
 > P4 两处文档错误（`mnt_alloc_id`、ctime typo）。
 >
 > 真机验证：控制节点 `-rw-------`；`hide_list` `-r--------` 且无内核指针；
@@ -12,9 +14,17 @@
 > root 正常；临时把 `min_mnt_id` 设成 max(37270) 后 **mountinfo / mounts /
 > mountstats 三者同时 238→237**（证明 `show_vfsmnt` 生效），恢复后回到 238。
 >
-> **未修**（按优先级见 C 节）：P1 全部内存安全问题、P2 其余（sus_mount 域门控
-> 与阈值、sus_kstat 的 maps/门控、sus_map、open_redirect 反向伪装、
-> `_LOOP`）、P3 细节。
+> `15b3ff4` 真机验证（默认参数 `expose_proc=0`，全新加载）：
+> `kstat armed: 0 rules (tp=1 krp=1 proc=0)` —— 钩子确实 armed；
+> 仅用 supercall 静态伪装后 `stat` 得 `ino=11111 dev=22222 size=4242`（修复前
+> 该路径下钩子根本没注册，规则只入库不生效）；300 轮 add/update 与 383 次
+> `stat` 并发churn，`BUG:/WARNING:/Call trace` 计数 0，最终表项一致；
+> sus_path getdents 过滤对 app(uid 10123) 仍生效（`ls` 只剩可见项、`cat` ENOENT）、
+> root 不受影响；`rmmod rc=0`。
+>
+> **未修**（按优先级见 C 节）：P2 其余（sus_mount 域门控与阈值、sus_kstat 的
+> maps 覆盖与门控、sus_map 门控、open_redirect 反向伪装与 scheme 1-4、
+> `_LOOP` 语义）、P3 细节。
 
 对比基准：`susfs4ksu/kernel_patches/`（builtin，v2.3.0）
 被审计对象：`susfs4ksu-lkm/kernel/`

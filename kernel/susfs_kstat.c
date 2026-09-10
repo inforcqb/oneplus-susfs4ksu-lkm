@@ -49,6 +49,7 @@
 #include <linux/dcache.h>
 #include <linux/kdev_t.h>
 #include <linux/string.h>
+#include <linux/cred.h>
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc */
@@ -179,6 +180,25 @@ static void kstat_snapshot(const struct sus_kstat_entry *e,
  * Source: arch/arm64/include/asm/unistd32.h line 667: __NR_fstatat64 327 */
 #define COMPAT_FSTATAT64_NR 327
 
+/* ---- the read gate ----
+ *
+ * Upstream gates every sus_kstat read on susfs_is_current_proc_umounted_app(),
+ * which is exactly (TIF_PROC_UMOUNTED && current_uid().val >= 10000).  The flag
+ * is set by KernelSU's setuid_hook only when SUSFS integration is compiled into
+ * the kernel; this device's kernel has none (zero susfs symbols in kallsyms), so
+ * it never sets and uid >= 10000 is the available proxy - the same one sus_path
+ * already uses.
+ *
+ * Without this gate the spoofing is visible to every process including root,
+ * which is a wider behaviour than upstream and a fidelity gap.
+ *
+ * Writers (the supercall and /proc interface) are configuration and stay
+ * ungated. */
+static bool susfs_kstat_gate_ok(void)
+{
+	return current_uid().val >= 10000;
+}
+
 /* ---- table access ----
  *
  * The *_table_* helpers below are the ONLY places that modify kstat_entries or
@@ -301,6 +321,9 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
 	long long v64;
 	long sl;
 
+	if (!susfs_kstat_gate_ok())
+		return;
+
 	if (copy_from_user(&ino, (void __user *)(statbuf + ST_INO_OFF), sizeof(ino)))
 		return;
 	if (copy_from_user(&dev, (void __user *)(statbuf + ST_DEV_OFF), sizeof(dev)))
@@ -380,6 +403,9 @@ static void susfs_kstat_spoof_compat_statbuf(unsigned long statbuf)
 	unsigned int v32;
 	unsigned short v16;
 	int v;
+
+	if (!susfs_kstat_gate_ok())
+		return;
 
 	if (copy_from_user(&ino, (void __user *)(statbuf + COMPAT_ST_INO_OFF), sizeof(ino)))
 		return;
@@ -498,6 +524,8 @@ static void susfs_kstat_spoof_kstat(struct inode *inode, struct kstat *stat)
 	const struct sus_kstat_snapshot *e = &snap;
 
 	if (!inode || !stat)
+		return;
+	if (!susfs_kstat_gate_ok())
 		return;
 	if (!susfs_kstat_lookup(inode->i_ino, new_encode_dev(inode->i_sb->s_dev),
 				&snap))
