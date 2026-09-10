@@ -1,21 +1,36 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * sus_path.c - hide directory entries by inode identity (SUSFS SUS_PATH), LKM port.
+ * sus_path.c - SUSFS SUS_PATH for the LKM, in two independent layers.
  *
- * Upstream SUSFS sets AS_FLAGS_SUS_PATH on inode->i_mapping and then skips the
- * entry inside filldir64() (fs/readdir.c).  filldir64 is static and LTO-inlined
- * on this kernel, so this LKM instead records the (sb dev, inode number) of every
- * registered path in a list and rewrites the buffer returned by getdents64 on
- * sys_exit, dropping entries whose d_ino matches a registered inode.
+ * Upstream SUSFS sets AS_FLAGS_SUS_PATH on inode->i_mapping and then
+ *   (a) skips the entry inside filldir64() (fs/readdir.c), and
+ *   (b) hides it from path-based access by patching fs/namei.c
+ *       (link_path_walk returns -ENOENT; __lookup_slow/lookup_open redo the
+ *       lookup with the fake qstr "..5.u.S" so the filesystem itself reports it).
+ *
+ * This LKM cannot touch either: filldir64 is static and LTO-inlined, and namei.c
+ * is compiled into the kernel.  It reproduces both effects instead:
+ *
+ *   Layer 1 - directory entries
+ *     The (sb dev, inode number) of every registered path goes into a list, and
+ *     the buffer returned by getdents64 is rewritten on sys_exit, dropping
+ *     entries whose d_ino matches.
+ *
+ *   Layer 2 - path-based access (stat/open/exec/...)
+ *     Two LSM hooks are replaced (see the block below): inode_getattr covers
+ *     stat/fstatat/statx, inode_permission covers open/exec/chmod/truncate/...
+ *     Registered inodes are answered with -ENOENT, so the file appears not to
+ *     exist at all - the same outcome as upstream's namei patch.
  *
  * Matching semantics deliberately mirror upstream:
  *   - exact inode identity, not name substring matching;
  *   - an unbounded set of registered paths (upstream keeps one inode flag each);
- *   - a path registered anywhere hides that inode everywhere it is listed.
- *
- * Note: unlike upstream we do not gate on susfs_is_current_proc_umounted_app(),
- * so the entry is hidden from every process (including root) rather than from
- * app processes only.  That is intentional for this LKM's use case.
+ *   - a path registered anywhere hides that inode everywhere it is reached,
+ *     including via '..', '//', relative paths, symlinks, hard links and
+ *     /proc/self/root/...;
+ *   - the gate is the upstream one: app processes only, and never a file owned
+ *     by the caller (see sus_path_gate_ok; hide_from_apps=0 disables the gate
+ *     for testing from a root shell).
  */
 #include <linux/module.h>
 #include <linux/tracepoint.h>
@@ -30,8 +45,11 @@
 #include <linux/namei.h>
 #include <linux/fs.h>
 #include <linux/limits.h>
+#include <linux/cred.h>
+#include <linux/atomic.h>
 #include "susfs_abi.h"
 #include "susfs_log.h"
+#include "lsm_hook.h"
 
 #define DIRENT_BUF_SIZE 65536  /* getdents usually returns <= 32-64KB */
 #define SUS_PATH_MAX_ENTRIES 8192
@@ -49,18 +67,17 @@ struct linux_dirent64 {
 /*
  * One registered path.
  *
- * An entry is matched when both the dirent's d_ino and its d_name equal the
- * recorded inode number and name.  Requiring the name as well makes a collision
- * between unrelated filesystems (independent inode number spaces can hand out
- * the same small inode number) practically impossible.  The cost is that a
- * hard link to a registered inode under a different name stays visible; upstream
- * flags the inode itself and would hide it.
+ * Kept for two independent mechanisms:
+ *   - the getdents64 filter hides the directory entry (by dev+ino+name);
+ *   - the LSM hooks reject path-based access outright (by the ihold'ed inode
+ *     pointer, which is what upstream's AS_FLAGS_SUS_PATH inode flag achieves).
  *
  * dev is kept for diagnostics only: a sys_exit tracepoint cannot recover the
  * listing's fd or superblock (regs->regs[0] already holds the return value).
  */
 struct sus_path_entry {
     struct list_head list;
+    struct inode *inode;    /* ihold'ed; NULL only if kern_path failed */
     u64 dev;
     u64 ino;
     char name[NAME_MAX + 1];
@@ -94,6 +111,122 @@ static bool sus_path_is_hidden(u64 ino, const char *name)
         hidden = !strcmp(name, hide_name);
 
     return hidden;
+}
+
+/* ---------------------------------------------------------------------------
+ * LSM hooks - make path-based access report ENOENT.
+ *
+ * Upstream hides sus_path entries from path-based access by patching
+ * fs/namei.c (link_path_walk returns -ENOENT; __lookup_slow/lookup_open redo the
+ * lookup with the fake qstr "..5.u.S" so the filesystem itself reports it).  A
+ * loadable module cannot patch namei.c, but it can replace the two LSM hooks
+ * that every path-based operation has to pass:
+ *
+ *   inode_getattr     <- vfs_getattr() calls security_inode_getattr() before it
+ *                        ever looks at the inode: stat/fstatat/statx
+ *   inode_permission  <- open/exec/chmod/truncate/chdir/readdir/...
+ *
+ * Matching on the inode pointer means '//', './', relative paths, symlinks
+ * (followed), hard links, bind mounts and /proc/self/root/... are all covered -
+ * none of them can dodge inode identity.  (unlink/rename operate on the PARENT
+ * directory's inode, so they are not blocked here.)
+ * ------------------------------------------------------------------------- */
+
+static int sus_path_inode_getattr(const struct path *path);
+static int sus_path_inode_permission(struct inode *inode, int mask);
+
+/* The signatures MUST match the LSM hook types exactly, and must NOT be __nocfi:
+ * this kernel uses kCFI with cross-module checks, so the call site compares type
+ * hashes.  A mismatched signature panics, and __nocfi panics just as hard because
+ * the function then emits no hash at all.  These assertions turn any mistake into
+ * a build failure instead of a reboot.  NOTE: the address-of is required -
+ * typeof(fn) is the function type while the hook field is a function pointer. */
+#define LSM_HOOK_FN_TYPE(member) typeof(((union security_list_options *)0)->member)
+
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_getattr),
+					   typeof(&sus_path_inode_getattr)),
+	      "inode_getattr hook signature mismatch");
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_permission),
+					   typeof(&sus_path_inode_permission)),
+	      "inode_permission hook signature mismatch");
+
+static struct ksu_lsm_hook sus_path_getattr_hook = KSU_LSM_HOOK_INIT(
+	inode_getattr, "selinux_inode_getattr",
+	(void *)sus_path_inode_getattr, 0);
+
+static struct ksu_lsm_hook sus_path_perm_hook = KSU_LSM_HOOK_INIT(
+	inode_permission, "selinux_inode_permission",
+	(void *)sus_path_inode_permission, 0);
+
+/* Upstream gates on susfs_is_current_proc_umounted_app() &&
+ * is_i_uid_not_allowed(inode i_uid): only app processes, and never a file owned
+ * by the caller.  TIF_PROC_UMOUNTED is a SUSFS-specific thread flag this LKM does
+ * not have, so uid >= 10000 is the proxy.  Set hide_from_apps=0 to apply to every
+ * process including root - handy when testing from an adb shell. */
+static int hide_from_apps = 1;
+module_param(hide_from_apps, int, 0644);
+
+static atomic_t n_enoent_getattr = ATOMIC_INIT(0);
+static atomic_t n_enoent_perm = ATOMIC_INIT(0);
+
+static bool sus_path_inode_hidden(struct inode *inode)
+{
+    struct sus_path_entry *e;
+    bool hidden = false;
+
+    if (!inode || !READ_ONCE(sus_path_count))
+        return false;
+
+    spin_lock(&sus_path_lock);
+    list_for_each_entry(e, &sus_path_list, list) {
+        if (e->inode == inode) {
+            hidden = true;
+            break;
+        }
+    }
+    spin_unlock(&sus_path_lock);
+
+    return hidden;
+}
+
+static inline bool sus_path_gate_ok(struct inode *inode)
+{
+    uid_t uid;
+
+    if (!hide_from_apps)
+        return true;
+    uid = current_uid().val;
+    return uid >= 10000 && uid != inode->i_uid.val;
+}
+
+static int sus_path_inode_getattr(const struct path *path)
+{
+    int (*orig)(const struct path *) = (void *)sus_path_getattr_hook.original;
+    struct inode *inode;
+
+    if (path && path->dentry) {
+        inode = d_inode(path->dentry);
+        if (sus_path_inode_hidden(inode) && sus_path_gate_ok(inode)) {
+            atomic_inc(&n_enoent_getattr);
+            return -ENOENT;
+        }
+    }
+    if (!orig)
+        return 0;
+    return orig(path);
+}
+
+static int sus_path_inode_permission(struct inode *inode, int mask)
+{
+    int (*orig)(struct inode *, int) = (void *)sus_path_perm_hook.original;
+
+    if (sus_path_inode_hidden(inode) && sus_path_gate_ok(inode)) {
+        atomic_inc(&n_enoent_perm);
+        return -ENOENT;
+    }
+    if (!orig)
+        return 0;
+    return orig(inode, mask);
 }
 
 /* compact the dirent chain in-place; returns the new byte count */
@@ -175,14 +308,20 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
     struct sus_path_entry *e;
     int n = 0;
 
+    n += scnprintf(buf + n, PAGE_SIZE - n,
+                   "hide_from_apps=%d  enoent: getattr=%d perm=%d\n",
+                   hide_from_apps, atomic_read(&n_enoent_getattr),
+                   atomic_read(&n_enoent_perm));
+
     spin_lock(&sus_path_lock);
     list_for_each_entry(e, &sus_path_list, list)
-        n += scnprintf(buf + n, PAGE_SIZE - n, "dev=%llu ino=%llu name=%s\n",
-                       e->dev, e->ino, e->name);
+        n += scnprintf(buf + n, PAGE_SIZE - n,
+                       "inode=%px dev=%llu ino=%llu name=%s\n",
+                       e->inode, e->dev, e->ino, e->name);
     spin_unlock(&sus_path_lock);
 
-    if (!n)
-        n = scnprintf(buf, PAGE_SIZE, "(empty)\n");
+    if (!sus_path_count)
+        n += scnprintf(buf + n, PAGE_SIZE - n, "(no paths registered)\n");
     return n;
 }
 
@@ -208,14 +347,38 @@ int sus_path_init(void)
         pr_warn("register_trace_sys_exit(getdents64) failed %d\n", rc);
     else {
         path_registered = true;
-        pr_info("sus_path armed (inode-exact matching)\n");
+        pr_info("sus_path: getdents64 filter armed\n");
     }
+
+    /* LSM hooks: reject path-based access to registered inodes outright. */
+    rc = ksu_register_lsm_hook(&sus_path_getattr_hook);
+    if (rc)
+        pr_warn("sus_path: getattr hook failed %d\n", rc);
+    else
+        pr_info("sus_path: getattr hook armed, orig=%ps\n",
+                sus_path_getattr_hook.original);
+
+    rc = ksu_register_lsm_hook(&sus_path_perm_hook);
+    if (rc)
+        pr_warn("sus_path: perm hook failed %d\n", rc);
+    else
+        pr_info("sus_path: perm hook armed, orig=%ps\n",
+                sus_path_perm_hook.original);
+
     return 0;
 }
 
 void sus_path_exit(void)
 {
     struct sus_path_entry *e, *tmp;
+    LIST_HEAD(doomed);
+
+    /* Unregister the hooks FIRST: after this nothing can match, so the entries
+     * (and their inode references) can be torn down safely. */
+    if (sus_path_perm_hook.entry)
+        ksu_unregister_lsm_hook(&sus_path_perm_hook);
+    if (sus_path_getattr_hook.entry)
+        ksu_unregister_lsm_hook(&sus_path_getattr_hook);
 
     if (path_registered) {
         unregister_trace_sys_exit(sus_path_sys_exit, NULL);
@@ -226,12 +389,17 @@ void sus_path_exit(void)
     dirent_tmp = NULL;
 
     spin_lock(&sus_path_lock);
-    list_for_each_entry_safe(e, tmp, &sus_path_list, list) {
-        list_del(&e->list);
-        kfree(e);
-    }
+    list_splice_init(&sus_path_list, &doomed);
     sus_path_count = 0;
     spin_unlock(&sus_path_lock);
+
+    /* iput outside the lock: it can sleep and evict the inode. */
+    list_for_each_entry_safe(e, tmp, &doomed, list) {
+        list_del(&e->list);
+        if (e->inode)
+            iput(e->inode);
+        kfree(e);
+    }
 }
 
 /* supercall: CMD_SUSFS_ADD_SUS_PATH / CMD_SUSFS_ADD_SUS_PATH_LOOP
@@ -280,6 +448,11 @@ void sus_path_supercall(void __user **arg)
     }
     e->dev = (u64)inode->i_sb->s_dev;
     e->ino = (u64)inode->i_ino;
+    e->inode = inode;
+    /* Hold the inode: the LSM hooks match on this pointer, and the dentry is
+     * about to be released by path_put(), which would otherwise be free to
+     * evict it and let the address be reused. */
+    ihold(inode);
     strscpy(e->name, path.dentry->d_name.name, sizeof(e->name));
     INIT_LIST_HEAD(&e->list);
     path_put(&path);
@@ -293,6 +466,7 @@ void sus_path_supercall(void __user **arg)
     spin_lock(&sus_path_lock);
     if (sus_path_count >= SUS_PATH_MAX_ENTRIES) {
         spin_unlock(&sus_path_lock);
+        iput(e->inode);
         kfree(e);
         info.err = -ENOSPC;
         goto out;
@@ -300,8 +474,9 @@ void sus_path_supercall(void __user **arg)
     {
         struct sus_path_entry *cur;
         list_for_each_entry(cur, &sus_path_list, list) {
-            if (cur->ino == e->ino && !strcmp(cur->name, e->name)) {
+            if (cur->inode == inode) {
                 spin_unlock(&sus_path_lock);
+                iput(e->inode);
                 kfree(e);
                 info.err = 0;   /* already registered, upstream is idempotent */
                 goto out;
