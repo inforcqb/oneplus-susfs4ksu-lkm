@@ -644,7 +644,13 @@ void susfs_kstat_supercall(unsigned int cmd, void __user **arg)
 	mutex_unlock(&kstat_lock);
 	info.err = err;
 out:
-	if (copy_to_user((void __user *)*arg, &info, sizeof(info)))
+	/* Upstream (fs/susfs.c susfs_add_sus_kstat) writes back ONLY the err
+	 * field for this input-type command, never the whole struct.  Copying
+	 * the full struct back would overrun a caller whose own struct is
+	 * smaller/differently laid out (the prebuilt ksu_susfs tool), corrupting
+	 * its stack — match upstream exactly. */
+	if (copy_to_user(&((struct st_susfs_sus_kstat __user *)*arg)->err,
+			 &info.err, sizeof(info.err)))
 		pr_warn("kstat supercall copy_to_user failed\n");
 }
 

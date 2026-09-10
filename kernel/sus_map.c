@@ -159,6 +159,8 @@ void susfs_sus_map_supercall(void __user **arg)
     }
     info.err = 0;
 out:
-    if (copy_to_user((void __user *)*arg, &info, sizeof(info)))
+    /* upstream writes back only ->err for input-type commands */
+    if (copy_to_user(&((struct st_susfs_sus_map __user *)*arg)->err,
+                     &info.err, sizeof(info.err)))
         pr_warn("sus_map supercall copy_to_user failed\n");
 }

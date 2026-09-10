@@ -186,6 +186,8 @@ void sus_path_supercall(void __user **arg)
     info.err = 0;
     pr_info("sus_path: hide '%s' via supercall\n", hide_name);
 out:
-    if (copy_to_user((void __user *)*arg, &info, sizeof(info)))
+    /* upstream writes back only ->err for input-type commands */
+    if (copy_to_user(&((struct st_susfs_sus_path __user *)*arg)->err,
+                     &info.err, sizeof(info.err)))
         pr_warn("sus_path supercall copy_to_user failed\n");
 }

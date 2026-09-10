@@ -95,6 +95,8 @@ void susfs_enable_log_supercall(void __user **arg)
     pr_info("susfs: %s logging to kernel (supercall)\n",
             log_enabled ? "enable" : "disable");
 out:
-    if (copy_to_user((void __user *)*arg, &info, sizeof(info)))
+    /* upstream writes back only ->err for input-type commands */
+    if (copy_to_user(&((struct st_susfs_log __user *)*arg)->err,
+                     &info.err, sizeof(info.err)))
         pr_warn("enable_log supercall copy_to_user failed\n");
 }

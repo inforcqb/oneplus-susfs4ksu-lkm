@@ -85,7 +85,9 @@ void susfs_spoof_cmdline_supercall(void __user **arg)
 	info->err = 0;
 	pr_info("spoof_cmdline: set fake bootconfig (supercall)\n");
 out:
-	if (copy_to_user((void __user *)*arg, info, sizeof(*info)))
+	/* upstream writes back only ->err for input-type commands */
+	if (copy_to_user(&((struct st_susfs_spoof_cmdline_or_bootconfig __user *)*arg)->err,
+			 &info->err, sizeof(info->err)))
 		pr_warn("cmdline supercall copy_to_user failed\n");
 	kfree(info);
 }

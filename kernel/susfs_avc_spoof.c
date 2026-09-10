@@ -208,6 +208,8 @@ void susfs_avc_spoof_supercall(void __user **arg)
 	info.err = 0;
 	pr_info("avc_spoof: %s (supercall)\n", info.enabled ? "enabled" : "disabled");
 out:
-	if (copy_to_user((void __user *)*arg, &info, sizeof(info)))
+	/* upstream writes back only ->err for input-type commands */
+	if (copy_to_user(&((struct st_susfs_avc_log_spoofing __user *)*arg)->err,
+			 &info.err, sizeof(info.err)))
 		pr_warn("avc supercall copy_to_user failed\n");
 }

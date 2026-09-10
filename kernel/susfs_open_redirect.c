@@ -368,6 +368,8 @@ void susfs_open_redirect_supercall(void __user **arg)
 	mutex_unlock(&or_lock);
 	info.err = err;
 out:
-	if (copy_to_user((void __user *)*arg, &info, sizeof(info)))
+	/* upstream writes back only ->err for input-type commands */
+	if (copy_to_user(&((struct st_susfs_open_redirect __user *)*arg)->err,
+			 &info.err, sizeof(info.err)))
 		pr_warn("open_redirect supercall copy_to_user failed\n");
 }
