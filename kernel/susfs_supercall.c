@@ -73,17 +73,27 @@ out:
 		pr_warn("susfs show_variant copy_to_user failed\n");
 }
 
-/* list every feature this LKM implements, using upstream CONFIG macro names */
-static const char *const enabled_features[] = {
-	"CONFIG_KSU_SUSFS_SUS_PATH\n",
-	"CONFIG_KSU_SUSFS_SUS_MOUNT\n",
-	"CONFIG_KSU_SUSFS_SUS_KSTAT\n",
-	"CONFIG_KSU_SUSFS_SPOOF_UNAME\n",
-	"CONFIG_KSU_SUSFS_ENABLE_LOG\n",
-	"CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS\n",
-	"CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n",
-	"CONFIG_KSU_SUSFS_OPEN_REDIRECT\n",
-	"CONFIG_KSU_SUSFS_SUS_MAP\n",
+/* List every feature this LKM implements, using upstream CONFIG macro names.
+ *
+ * Entries with an `active` callback are only reported while the feature is
+ * really installed.  Advertising a feature whose registration failed produces
+ * the exact inconsistency a detector probes for, so failing ones are omitted
+ * (and logged by their init). */
+struct feature_entry {
+	const char *name;
+	bool (*active)(void);	/* NULL = always present */
+};
+
+static const struct feature_entry enabled_features[] = {
+	{ "CONFIG_KSU_SUSFS_SUS_PATH\n",	sus_path_lsm_active },
+	{ "CONFIG_KSU_SUSFS_SUS_MOUNT\n",	NULL },
+	{ "CONFIG_KSU_SUSFS_SUS_KSTAT\n",	NULL },
+	{ "CONFIG_KSU_SUSFS_SPOOF_UNAME\n",	NULL },
+	{ "CONFIG_KSU_SUSFS_ENABLE_LOG\n",	NULL },
+	{ "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS\n",	susfs_hide_syms_active },
+	{ "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n", NULL },
+	{ "CONFIG_KSU_SUSFS_OPEN_REDIRECT\n",	NULL },
+	{ "CONFIG_KSU_SUSFS_SUS_MAP\n",		NULL },
 };
 
 static void susfs_show_enabled_features(void __user **arg)
@@ -97,11 +107,14 @@ static void susfs_show_enabled_features(void __user **arg)
 		return;
 
 	for (i = 0; i < ARRAY_SIZE(enabled_features); i++) {
-		size_t len = strlen(enabled_features[i]);
+		const char *name = enabled_features[i].name;
+		size_t len = strlen(name);
 
+		if (enabled_features[i].active && !enabled_features[i].active())
+			continue;
 		if (off + len >= SUSFS_ENABLED_FEATURES_SIZE)
 			break;
-		memcpy(info->enabled_features + off, enabled_features[i], len);
+		memcpy(info->enabled_features + off, name, len);
 		off += len;
 	}
 	info->err = 0;

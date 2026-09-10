@@ -23,12 +23,17 @@
 
 #define DEFAULT_KSU_MNT_ID 2000000000ULL
 
-/* NOTE: upstream SUSFS makes KSU mounts get mnt_id >= DEFAULT_KSU_MNT_ID by
- * patching mnt_alloc_id() to call ida_alloc_min(&mnt_id_ida, DEFAULT_KSU_MNT_ID)
- * for the ksu domain.  This LKM does NOT patch that, so on a stock KernelSU
- * device KSU mounts keep normal (small) mnt_ids.  min_mnt_id is therefore a
- * tunable: set it to the actual KSU mount id range, or adapt the match to a
- * mountpoint/device name list instead of a numeric threshold. */
+/* NOTE: upstream SUSFS gets KSU mounts an mnt_id >= DEFAULT_KSU_MNT_ID by
+ * ADDING its own allocator (susfs_alloc_non_unshare_ksu_vfsmnt(), which calls
+ * ida_alloc_min(&mnt_id_ida, DEFAULT_KSU_MNT_ID)) and SWAPPING THE CALL SITES in
+ * vfs_create_mount()/clone_mnt().  mnt_alloc_id() itself is never patched.
+ * (An earlier note here claimed it was - that was wrong.)
+ *
+ * This LKM does not reimplement that allocator, so the stock allocator (plain
+ * ida_alloc, smallest free id) keeps handing out small ids.  Measured on device:
+ * mnt_id stayed in 91..37270, so a 2e9 threshold can never match and this
+ * feature is effectively OFF on a stock KernelSU device.  min_mnt_id stays a
+ * tunable until the allocator side exists. */
 static unsigned long param_min_mnt_id = DEFAULT_KSU_MNT_ID;
 module_param_named(min_mnt_id, param_min_mnt_id, ulong, 0644);
 
@@ -42,6 +47,11 @@ static int sus_mount_show_pre(struct kprobe *kp, struct pt_regs *regs)
     r = real_mount(mnt);
     if ((unsigned int)r->mnt_id >= param_min_mnt_id) {
         regs->pc = regs->regs[30];   /* skip this mount line */
+        /* These show_* callbacks return int and x0 still holds seq_file*.
+         * seq_read() treats a negative return as a hard error, so a stray high
+         * bit here would break the whole read; upstream's equivalent site
+         * explicitly returns 0. */
+        regs->regs[0] = 0;
         return 1;
     }
     return 0;
@@ -54,6 +64,15 @@ static struct kprobe kp_vfsstat = {
 
 static struct kprobe kp_mountinfo = {
     .symbol_name = "show_mountinfo",
+    .pre_handler = sus_mount_show_pre,
+};
+
+/* /proc/mounts and /proc/<pid>/mounts go through show_vfsmnt - a DIFFERENT
+ * function from show_vfsstat (which serves mountstats).  Missing this hook left
+ * /proc/mounts completely unhidden while mountinfo was filtered, which the
+ * header comment here claimed was covered.  Verified on device. */
+static struct kprobe kp_vfsmnt = {
+    .symbol_name = "show_vfsmnt",
     .pre_handler = sus_mount_show_pre,
 };
 
@@ -73,6 +92,7 @@ void susfs_sus_mount_exit(void)
     if (mount_registered) {
         unregister_kprobe(&kp_mountinfo);
         unregister_kprobe(&kp_vfsstat);
+        unregister_kprobe(&kp_vfsmnt);
         mount_registered = false;
     }
 }
@@ -88,6 +108,12 @@ static int sus_mount_register(void)
         return rc;
     rc = register_kprobe(&kp_mountinfo);
     if (rc) {
+        unregister_kprobe(&kp_vfsstat);
+        return rc;
+    }
+    rc = register_kprobe(&kp_vfsmnt);
+    if (rc) {
+        unregister_kprobe(&kp_mountinfo);
         unregister_kprobe(&kp_vfsstat);
         return rc;
     }
@@ -115,6 +141,7 @@ void susfs_sus_mount_supercall(void __user **arg)
     } else if (mount_registered) {
         unregister_kprobe(&kp_mountinfo);
         unregister_kprobe(&kp_vfsstat);
+        unregister_kprobe(&kp_vfsmnt);
         mount_registered = false;
     }
     info.err = 0;

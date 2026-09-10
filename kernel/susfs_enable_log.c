@@ -64,7 +64,8 @@ static struct proc_dir_entry *log_proc_entry;
 
 int susfs_enable_log_init(void)
 {
-	log_proc_entry = proc_create("susfs_enable_log", 0666, NULL, &log_proc_ops);
+	/* 0600: an app must not be able to turn logging on/off. */
+	log_proc_entry = proc_create("susfs_enable_log", 0600, NULL, &log_proc_ops);
 	if (!log_proc_entry)
 		pr_warn("proc_create(susfs_enable_log) failed\n");
 	else

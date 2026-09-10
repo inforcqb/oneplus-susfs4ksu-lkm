@@ -54,6 +54,10 @@
 #define DIRENT_BUF_SIZE 65536  /* getdents usually returns <= 32-64KB */
 #define SUS_PATH_MAX_ENTRIES 8192
 
+/* arm64 compat (32-bit) getdents64.  Not reachable through asm/unistd.h in this
+ * build, so spelled out per arch/arm64/include/asm/unistd32.h. */
+#define __NR_compat_getdents64 217
+
 struct linux_dirent64 {
     u64 d_ino;
     s64 d_off;
@@ -299,11 +303,20 @@ static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret)
     unsigned long args[6];
     unsigned long dirent_buf;
     long new_count;
+    int nr;
 
-    if (is_compat_task())
+    /* 32-bit tasks reach getdents64 through the compat table with a different
+     * syscall number, but the dirent64 buffer layout is identical (v5.15 has no
+     * compat_filldir64).  The old code returned early for compat tasks, which
+     * left 32-bit apps able to list hidden entries for no reason. */
+    nr = syscall_get_nr(current, regs);
+    if (is_compat_task()) {
+        if (nr != __NR_compat_getdents64)
+            return;
+    } else if (nr != __NR_getdents64) {
         return;
-    if (syscall_get_nr(current, regs) != __NR_getdents64)
-        return;
+    }
+
     if (ret <= 0)
         return;
     if (!READ_ONCE(sus_path_count) && !hide_name[0])
@@ -336,8 +349,8 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
     spin_lock(&sus_path_lock);
     list_for_each_entry(e, &sus_path_list, list)
         n += scnprintf(buf + n, PAGE_SIZE - n,
-                       "inode=%px dev=%llu ino=%llu name=%s\n",
-                       e->inode, e->dev, e->ino, e->name);
+                       "dev=%llu ino=%llu name=%s\n",
+                       e->dev, e->ino, e->name);
     spin_unlock(&sus_path_lock);
 
     if (!sus_path_count)
@@ -348,9 +361,19 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
 static const struct kernel_param_ops sus_path_list_ops = {
     .get = sus_path_show_list,
 };
-module_param_cb(hide_list, &sus_path_list_ops, NULL, 0444);
+/* 0400, not 0444: this listing names every hidden path.  It must not be
+ * readable by an app - that would hand the detector the exact answer it is
+ * looking for.  (A raw inode pointer used to be printed here too; removed.) */
+module_param_cb(hide_list, &sus_path_list_ops, NULL, 0400);
 
 static bool path_registered;
+
+/* Whether the path-based layer actually installed.  Both hooks must be patched:
+ * with only one, stat and open would disagree with each other. */
+bool sus_path_lsm_active(void)
+{
+	return sus_path_getattr_hook.entry && sus_path_perm_hook.entry;
+}
 
 int sus_path_init(void)
 {

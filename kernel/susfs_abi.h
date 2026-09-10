@@ -83,11 +83,22 @@ struct st_susfs_sus_map {
 /* KSTAT_SPOOF_* bits of struct st_susfs_sus_kstat's `flags` field (upstream
  * declares these in susfs.h right above that struct).
  *
- * Intentional deviation from upstream: upstream has a typo
- *   SUSFS:  #define KSTAT_SPOOF_CTIME_TV_SEC (1 < 8)   <- evaluates to 0
- * while the userspace side (ksu_susfs, and ksud types.rs KSTAT_AUTO_SPOOF)
- * uses the intended (1 << 8).  Keep the corrected value here so bit 8 really
- * spoofs ctime.tv_sec; do NOT "resync" this to the upstream typo. */
+ * Intentional deviation from upstream, and the correction of an earlier note
+ * here that got this wrong:
+ *
+ *   upstream KERNEL   susfs.h:71                    #define ..._CTIME_TV_SEC (1 < 8)  -> 1
+ *   upstream USERSPACE ksu_susfs/jni/.../sus_kstat.c:25  #define ..._CTIME_TV_SEC (1 < 8)  -> 1
+ *   SukiSU ksud (Rust) consts.rs                    uses the intended (1 << 8) = 256
+ *
+ * i.e. the typo lives on BOTH upstream sides - the C tool has it too, so bit 8
+ * is really "an alias of bit 0 (INO)" there, and upstream's ctime spoof never
+ * fires from either side.  We keep the corrected value so bit 8 genuinely spoofs
+ * ctime.tv_sec, which also matches what ksud sends.
+ *
+ * Consequence to be aware of: for a caller that follows the typo, "set ctime"
+ * actually sets bit 0, so both sides simply spoof ino - consistent.  A caller
+ * that sends bit 8 (ksud) gets a real ctime spoof from us and nothing from
+ * upstream.  If upstream ever fixes the typo, the two converge. */
 #define KSTAT_SPOOF_INO           (1 << 0)
 #define KSTAT_SPOOF_DEV           (1 << 1)
 #define KSTAT_SPOOF_NLINK         (1 << 2)
@@ -96,7 +107,7 @@ struct st_susfs_sus_map {
 #define KSTAT_SPOOF_ATIME_TV_NSEC (1 << 5)
 #define KSTAT_SPOOF_MTIME_TV_SEC  (1 << 6)
 #define KSTAT_SPOOF_MTIME_TV_NSEC (1 << 7)
-#define KSTAT_SPOOF_CTIME_TV_SEC  (1 << 8)	/* upstream typo: (1 < 8) */
+#define KSTAT_SPOOF_CTIME_TV_SEC  (1 << 8)	/* upstream (both sides): (1 < 8) */
 #define KSTAT_SPOOF_CTIME_TV_NSEC (1 << 9)
 #define KSTAT_SPOOF_BLOCKS        (1 << 10)
 #define KSTAT_SPOOF_BLKSIZE       (1 << 11)

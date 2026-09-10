@@ -677,7 +677,9 @@ int susfs_kstat_init(void)
 {
 	int rc;
 
-	kstat_proc_entry = proc_create("susfs_kstat", 0666, NULL, &kstat_proc_ops);
+	/* 0600, not 0666: the listing exposes configured rules and the switch
+	 * turns spoofing off - it must not be readable or writable by an app. */
+	kstat_proc_entry = proc_create("susfs_kstat", 0600, NULL, &kstat_proc_ops);
 	if (!kstat_proc_entry)
 		pr_warn("proc_create(susfs_kstat) failed\n");
 

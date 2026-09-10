@@ -48,4 +48,10 @@ void susfs_sus_mount_supercall(void __user **arg);
 int susfs_hide_syms_init(void);
 void susfs_hide_syms_exit(void);
 
+/* Actual install state.  enabled_features must not advertise a feature whose
+ * registration failed - hide_syms used to fail silently and still be reported
+ * as active, which is exactly the kind of inconsistency a detector looks for. */
+bool susfs_hide_syms_active(void);
+bool sus_path_lsm_active(void);
+
 #endif

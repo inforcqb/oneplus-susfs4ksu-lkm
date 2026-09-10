@@ -108,6 +108,11 @@ int susfs_hide_syms_init(void)
 	return 0;
 }
 
+bool susfs_hide_syms_active(void)
+{
+	return hide_registered;
+}
+
 void susfs_hide_syms_exit(void)
 {
 	if (hide_registered) {

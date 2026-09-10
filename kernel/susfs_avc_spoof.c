@@ -163,7 +163,8 @@ int susfs_avc_spoof_init(void)
 	pr_info("avc_spoof: su_sid=%u (%s), priv_app_sid=%u (%s)\n",
 		avc_su_sid, avc_su_ctx, avc_priv_app_sid, avc_priv_app_ctx);
 
-	avc_proc_entry = proc_create("susfs_avc_spoof", 0666, NULL, &avc_proc_ops);
+	/* 0600: the listing exposes the configured su/priv_app SIDs. */
+	avc_proc_entry = proc_create("susfs_avc_spoof", 0600, NULL, &avc_proc_ops);
 	if (!avc_proc_entry)
 		pr_warn("proc_create(susfs_avc_spoof) failed\n");
 	else

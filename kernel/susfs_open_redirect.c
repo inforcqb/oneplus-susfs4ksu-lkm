@@ -170,7 +170,8 @@ static struct proc_dir_entry *or_proc_entry;
 
 int susfs_open_redirect_init(void)
 {
-	or_proc_entry = proc_create("susfs_open_redirect", 0666, NULL, &or_proc_ops);
+	/* 0600: the listing exposes both paths of every redirect rule. */
+	or_proc_entry = proc_create("susfs_open_redirect", 0600, NULL, &or_proc_ops);
 	if (!or_proc_entry)
 		pr_warn("proc_create(susfs_open_redirect) failed\n");
 

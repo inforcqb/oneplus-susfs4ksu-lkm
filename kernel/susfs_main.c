@@ -19,6 +19,8 @@
 
 static int __init susfs_init(void)
 {
+    int ret;
+
     pr_info("susfs_guard_lkm: init v%s\n", SUSFS_LKM_VERSION);
     ksu_init_symbol_resolver();
     ksu_lsm_hook_init();
@@ -30,9 +32,25 @@ static int __init susfs_init(void)
     susfs_spoof_cmdline_init();
     susfs_open_redirect_init();
     susfs_enable_log_init();
+
+    /* Optional: logs its own failure and degrades to "off". */
     susfs_avc_spoof_init();
-    susfs_supercall_init();
-    susfs_hide_syms_init();
+
+    /* The supercall kprobe IS the command channel.  With it unregistered no
+     * CMD ever reaches the module, so refusing the load is far better than
+     * coming up "healthy" and silently ignoring every command. */
+    ret = susfs_supercall_init();
+    if (ret) {
+        pr_err("susfs_guard_lkm: supercall init failed %d, refusing to load\n",
+               ret);
+        return ret;
+    }
+
+    /* Best effort, but a failure must be visible: enabled_features stops
+     * advertising HIDE_KSU_SUSFS_SYMBOLS when this fails. */
+    if (susfs_hide_syms_init())
+        pr_err("susfs_guard_lkm: hide_syms init FAILED - kallsyms NOT hidden\n");
+
     return 0;
 }
 
