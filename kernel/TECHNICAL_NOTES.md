@@ -358,10 +358,28 @@ app: cat  /proc/susfs_kstat  -> Permission denied            （inode_permission
 - `0600` 的文件 → **无效**，app 得到 EACCES —— 而 `EACCES` 本身就是信号：
   它告诉检测方"这个文件存在，只是我没权限"。
 
-**实践结论**：要隐藏的东西，**宁可不存在**，也不要"存在但不可读"。
-本 LKM 的 4 个 `/proc/susfs_*` 控制节点因此**默认不创建**（`expose_proc=0`），
-而不是创建后靠 0600 + sus_path 去挡。需要手工配置时用 `expose_proc=1` 打开，
-此时它们会同时注册进 sus_path（仍能挡住 DAC 允许的那部分调用者）。
+**实践结论**：要隐藏的东西，**要么让它不存在，要么让它通过 DAC**。
+
+两个可行解，按场景选：
+
+1. **不创建**（默认）：`expose_proc=0`，节点根本不存在 —— 对 root 和 app 都返回
+   ENOENT，零依赖、绝对安全。
+2. **`0777` + 完全依赖 LSM**（`expose_proc=1` 时采用）：`0777` 让 DAC 放行，
+   `security_inode_permission()` 才轮到执行，于是 app 得到 ENOENT。实测：
+
+   ```
+   节点权限 -rwxrwxrwx
+   root: ls/cat 正常
+   app : ls  -> No such file or directory
+         cat -> No such file or directory
+         写   -> No such file or directory     （写也被拦）
+   计数器: getattr=4  perm=8                     （perm 终于命中）
+   ```
+
+   **代价**：保护 100% 押在 LSM 层上，而 0777 是可写的 —— 一旦 LSM 失效，
+   节点就是全开（app 能读配置、能关掉伪装）。所以每个功能在创建节点前都检查
+   `sus_path_lsm_active()`，为假就**拒绝创建**并 `pr_err`。这也是
+   `sus_path_init()` 被提到 init 顺序最前面的原因（否则那个检查永远是假）。
 
 自隐藏由 `susfs_self_hide_nodes()`（`susfs_main.c`）在**所有功能 init 之后**执行 ——
 节点必须先存在才能 `kern_path()` 解析到；内核侧的入库接口是
