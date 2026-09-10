@@ -138,14 +138,6 @@ static void susfs_tw_func(struct callback_head *cb)
 	case CMD_SUSFS_UPDATE_SUS_KSTAT:
 	case CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY:
 		susfs_kstat_supercall(tw->cmd, &arg);
-		{
-			/* EXPERIMENT: overwrite err@372 with a sentinel. If the caller
-			 * reads err from offset 372 its behaviour must change. */
-			int sentinel = 0x11223344;
-
-			copy_to_user((char __user *)arg + 372, &sentinel, 4);
-			pr_info("DIAG wrote sentinel 0x11223344 to err@372\n");
-		}
 		break;
 	case CMD_SUSFS_SET_UNAME:
 		susfs_uname_supercall(&arg);
