@@ -22,9 +22,23 @@
 > sus_path getdents 过滤对 app(uid 10123) 仍生效（`ls` 只剩可见项、`cat` ENOENT）、
 > root 不受影响；`rmmod rc=0`。
 >
-> **未修**（按优先级见 C 节）：P2 其余（sus_mount 域门控与阈值、sus_kstat 的
-> maps 覆盖与门控、sus_map 门控、open_redirect 反向伪装与 scheme 1-4、
-> `_LOOP` 语义）、P3 细节。
+> `543b369` 追加（kstat 门控 + maps 覆盖），真机验证：
+> root 视角 `stat` 得真值（`ino=931980`）而 app(10123) 得伪装值
+> （`ino=11111 dev=22222 size=4242`）—— 门控按上游 `umounted_app` 的
+> `uid>=10000` 代理生效；对 `libc.so` 设 ino 伪装后，app 的
+> `/proc/self/maps` 里 `libc.so` 行数 4 → **0**（总行数仍 87，证明是丢行不是读不到），
+> root 仍为 4，`rmmod` 后 app 恢复 4 行。
+>
+> **未修**（按优先级见 C 节）：P2 其余（sus_mount 域门控与阈值、sus_map 门控、
+> open_redirect 反向伪装与 scheme 1-4、`_LOOP` 语义）、P3 细节。
+>
+> **已确认无法在 LKM 内复刻**：`TIF_PROC_UMOUNTED`。上游由 KernelSU 的
+> setuid hook 设置（`kernel_umount.c:75-109`：`ksu_module_mounted` &&
+> `ksu_kernel_umount_enabled` && `is_appuid` && `ksu_uid_should_umount` &&
+> `is_zygote(current_cred())`），本机内核无 SUSFS 集成、且 `dmesg` 中没有任何
+> `handle umount for uid` 记录（即 `ksu_uid_should_umount()` 对所有 app 都是
+> false），照搬会让伪装对所有进程失效。SELinux 域（`is_zygote` 用的 sid）
+> 只是该链条的最后一个必要条件，代替不了它。故门控继续用 `uid>=10000` 代理。
 
 对比基准：`susfs4ksu/kernel_patches/`（builtin，v2.3.0）
 被审计对象：`susfs4ksu-lkm/kernel/`
