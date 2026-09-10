@@ -307,6 +307,79 @@ static void kstat_table_clear(void)
 	spin_unlock_irqrestore(&kstat_table_lock, flags);
 }
 
+/* ---- /proc/<pid>/maps coverage ----
+ *
+ * Upstream's susfs_sus_kstat_spoof_show_map_vma() rewrites the dev/ino on the
+ * line from inside show_map_vma(), where dev and ino are still local variables.
+ * An LKM cannot reach those locals.  Re-printing the line ourselves would mean
+ * reproducing the kernel's column padding exactly (show_vma_header_prefix uses
+ * seq_setwidth()/seq_pad(), neither exported, and m->pad_until is private
+ * state); a line that is padded differently from its neighbours is itself a
+ * tell.  So the line is dropped instead.
+ *
+ * That still closes the detection this exists for: a stat() that reports one
+ * ino while /proc/<pid>/maps reports the real one is a direct contradiction,
+ * and it is the cheapest cross-check there is.  A mapped file that must stay
+ * listed is what sus_map is for.
+ *
+ * Armed on the first rule that spoofs ino or dev, not before. */
+static int kstat_show_map_vma_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	struct vm_area_struct *vma = (struct vm_area_struct *)regs->regs[1];
+	struct sus_kstat_snapshot snap;
+	struct inode *inode;
+
+	if (!vma || !vma->vm_file)
+		return 0;
+	inode = file_inode(vma->vm_file);
+	if (!inode)
+		return 0;
+	if (!susfs_kstat_gate_ok())
+		return 0;
+	if (!susfs_kstat_lookup(inode->i_ino,
+				new_encode_dev(inode->i_sb->s_dev), &snap))
+		return 0;
+	if (!(snap.flags & (KSTAT_SPOOF_INO | KSTAT_SPOOF_DEV)))
+		return 0;
+
+	/* Skip the line by returning straight to the caller (x0 is irrelevant:
+	 * show_map_vma returns void). */
+	regs->pc = regs->regs[30];
+	return 1;
+}
+
+static struct kprobe kp_kstat_map_vma = {
+	.symbol_name = "show_map_vma",
+	.pre_handler = kstat_show_map_vma_pre,
+};
+
+static bool kstat_maps_registered;
+
+/* Registering sleeps, so this runs from the rule-management paths (kstat_lock
+ * held, process context), never from the hot paths. */
+static void kstat_maps_arm(void)
+{
+	int rc;
+
+	if (kstat_maps_registered)
+		return;
+	rc = register_kprobe(&kp_kstat_map_vma);
+	if (rc)
+		pr_warn("susfs_kstat: register_kprobe(show_map_vma) failed %d\n", rc);
+	else {
+		kstat_maps_registered = true;
+		pr_info("susfs_kstat: maps hook armed (show_map_vma)\n");
+	}
+}
+
+static void kstat_maps_disarm(void)
+{
+	if (!kstat_maps_registered)
+		return;
+	unregister_kprobe(&kp_kstat_map_vma);
+	kstat_maps_registered = false;
+}
+
 /* rewrite the requested fields of the native user statbuf */
 static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
 {
@@ -845,6 +918,10 @@ void susfs_kstat_supercall(unsigned int cmd, void __user **arg)
 	}
 	mutex_unlock(&kstat_lock);
 	info.err = err;
+	/* Armed outside the lock and only after a rule actually landed: a hook
+	 * that can never fire is worse than no hook. */
+	if (!err)
+		kstat_maps_arm();
 out:
 	/* Upstream (fs/susfs.c susfs_add_sus_kstat) writes back ONLY the err
 	 * field for this input-type command, never the whole struct.  Copying
@@ -923,6 +1000,7 @@ int susfs_kstat_init(void)
 
 void susfs_kstat_exit(void)
 {
+	kstat_maps_disarm();
 	if (kstat_krp_registered) {
 		unregister_kretprobe(&krp_vfs_getattr);
 		kstat_krp_registered = false;
@@ -1030,6 +1108,9 @@ static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
 	}
 
 	mutex_unlock(&kstat_lock);
+
+	if (!err)
+		kstat_maps_arm();
 
 	if (err)
 		pr_warn("kstat proc write '%s' -> err %d\n", argv[0], err);
