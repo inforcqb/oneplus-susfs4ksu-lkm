@@ -230,7 +230,45 @@ nsec 三连排，且 blksize 在 blocks 之前），因此它对 kstat/open_redi
 `SUSFS operation not supported`。**这是工具版本问题，不是 LKM 的问题**：用与 v2.3.0
 布局一致的调用方（SukiSU ksud，或本仓库的 `test_sc`）实测全部命令 err=0。
 
-## 十一、已踩过的坑
+## 十一、sus_path 的匹配语义（2026-09-10 重写）
+
+早期实现用一个 `hide_name` 字符串 + `strstr` 子串匹配，实测有三个严重缺陷（均已在设备上
+复现）：
+
+| 缺陷 | 现象 |
+|---|---|
+| 单条覆盖 | `add_sus_path A` 再 `add_sus_path B`，A 重新可见（B 覆盖了 A） |
+| 子串误伤 | 添加 basename 为 `ksu` 的路径，连 `ksu_susfs`、`ksud-test` 一起被隐藏 |
+| 全局同名误伤 | 添加 `/data/local/tmp/x`，全系统所有目录下名为 `x` 的条目都被隐藏 |
+
+这三条合起来就是"我在路径隐藏里加了 `/data/local/tmp/susfs.ko`，但还能列出来"的直接原因：
+路径管理器是按顺序逐条下发 `add_sus_path` 的，最后一条覆盖了 `susfs.ko`，于是它又可见了。
+
+现在改为上游语义：
+
+- `add_sus_path` 用 `kern_path(LOOKUP_FOLLOW)` 解析出 `inode`，记录
+  `(i_sb->s_dev, i_ino, d_name)` 到一个**无上限链表**（去重、上限 8192 条）；
+- getdents64 sys_exit 里用 `fdget(fd)` 取被列出目录所在 sb 的 `s_dev`，然后
+  **按 `d_ino` 精确匹配 inode**，不再做子串匹配；
+- 只对 `d_ino == 0` 的文件系统（罕见）退化为文件名精确 `strcmp` 兜底。
+
+`CMD_SUSFS_ADD_SUS_PATH_LOOP` 直接走同一路径：上游 `_LOOP` 只是"zygote 起 app 后重新
+打一次 inode flag"，本 LKM 的链表常驻、匹配无条件，两者天然等价。
+
+与上游的唯一行为差异：上游 `susfs_is_inode_sus_path()` 有
+`susfs_is_current_proc_umounted_app()` 门控，即**只有 app 进程**看不到该条目（root /
+adb shell 仍看得到）。本 LKM 无条件隐藏，root 也看不到——对本 LKM 的使用场景更符合
+直觉（用户就是要在自己的 root shell 里确认隐藏生效）。若将来需要严格对齐，把门控加回
+`sus_path_is_hidden()` 入口即可。
+
+调试用只读参数 `hide_list` 可打印当前所有已注册条目（`dev/ino/name`）。
+
+**注意 sus_path 的能力边界**：它只影响 `getdents64` 返回的目录项，无法阻止
+**按已知路径** `stat`/`open`。所以把 root 工具放在 `/data/local/tmp`
+（`shell_data_file`，appdomain 被允许 `file read`）永远是不安全的——正确做法是放
+`/data/adb`（`adb_data_file`，appdomain 完全无权访问）。
+
+## 十二、已踩过的坑
 
 - `module_param(var)` 注册的参数名是变量名，要 `module_param_named(name, var, ...)`。
 - 5.15 的 dcache flush 用 `dcache_clean_inval_poc` / `caches_clean_inval_pou`，
