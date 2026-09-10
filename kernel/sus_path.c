@@ -189,14 +189,23 @@ static bool sus_path_inode_hidden(struct inode *inode)
     return hidden;
 }
 
-static inline bool sus_path_gate_ok(struct inode *inode)
+/* UID half of the upstream gate.  Separate because the getdents64 tracepoint
+ * only has an inode NUMBER, not an inode, so it cannot apply the ownership
+ * check below. */
+static inline bool sus_path_gate_uid_ok(void)
 {
-    uid_t uid;
-
     if (!hide_from_apps)
         return true;
-    uid = current_uid().val;
-    return uid >= 10000 && uid != inode->i_uid.val;
+    return current_uid().val >= 10000;
+}
+
+/* Full upstream gate for the LSM layer: an app process, and the file is not
+ * owned by the caller (upstream is_i_uid_not_allowed()). */
+static inline bool sus_path_gate_ok(struct inode *inode)
+{
+    if (!sus_path_gate_uid_ok())
+        return false;
+    return current_uid().val != inode->i_uid.val;
 }
 
 static int sus_path_inode_getattr(const struct path *path)
@@ -259,6 +268,10 @@ static long sus_path_filter(unsigned long buf, long count)
         name[nlen] = 0;
 
         hide = sus_path_is_hidden((u64)d.d_ino, name);
+        /* Same gate as the LSM layer, otherwise listing and open would disagree
+         * (upstream's filldir64 also goes through susfs_is_inode_sus_path). */
+        if (hide && !sus_path_gate_uid_ok())
+            hide = false;
 
         if (!hide) {
             if (copy_from_user(dirent_tmp + out, (void __user *)(buf + offset), reclen))
