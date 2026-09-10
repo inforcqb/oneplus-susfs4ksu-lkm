@@ -200,10 +200,17 @@ static inline bool sus_path_gate_uid_ok(void)
 }
 
 /* Full upstream gate for the LSM layer: an app process, and the file is not
- * owned by the caller (upstream is_i_uid_not_allowed()). */
+ * owned by the caller (upstream is_i_uid_not_allowed()).
+ *
+ * hide_from_apps=0 must bypass the WHOLE gate, ownership check included -
+ * otherwise a root-owned file would still be skipped for root (0 != 0 is false)
+ * and disabling the gate would silently do nothing for exactly the case it is
+ * meant for. */
 static inline bool sus_path_gate_ok(struct inode *inode)
 {
-    if (!sus_path_gate_uid_ok())
+    if (!hide_from_apps)
+        return true;
+    if (current_uid().val < 10000)
         return false;
     return current_uid().val != inode->i_uid.val;
 }
