@@ -344,6 +344,17 @@ static int or_add(const char *target, const char *redirected, int scheme)
 		return rc;
 	}
 
+	/* Register the hook BEFORE touching any entry: a rule that is listed but
+	 * cannot fire (because the hook is missing) silently does nothing while
+	 * looking configured - worse than no rule at all. */
+	rc = or_register();
+	if (rc) {
+		path_put(&rp);
+		path_put(&tp);
+		pr_warn("open_redirect: hook registration failed %d\n", rc);
+		return rc;
+	}
+
 	e = or_find_by_path(target);
 	if (e) {
 		/* Rewriting a live entry: mark it dead and retire its old path.
@@ -382,10 +393,6 @@ static int or_add(const char *target, const char *redirected, int scheme)
 	WRITE_ONCE(e->dead, false);	/* publish last: readers key off this */
 
 	path_put(&tp);
-
-	rc = or_register();
-	if (rc)
-		return rc;
 	return 0;
 }
 
@@ -410,18 +417,11 @@ static void or_del(const char *target)
 	e->redirected_pathname[0] = '\0';
 }
 
-/* Slots are never compacted (that array move was itself part of the race), so
- * "how many slots are used" and "how many rules are live" are now different
- * questions.  Callers hold or_lock. */
-static bool or_any_live(void)
-{
-	int i;
-
-	for (i = 0; i < nor; i++)
-		if (!READ_ONCE(or_entries[i].dead))
-			return true;
-	return false;
-}
+/* Slots are never compacted (that array move was itself part of the race).
+ * The kprobe stays registered for the module's whole lifetime: repeatedly
+ * unregistering and re-registering it was observed to leave the hook silently
+ * gone after a burst of add/del cycles, while an empty rule table already makes
+ * or_find_by_inode() miss - so staying registered costs nothing. */
 
 static ssize_t or_proc_write(struct file *file, const char __user *buf,
 			     size_t len, loff_t *off)
@@ -451,8 +451,6 @@ static ssize_t or_proc_write(struct file *file, const char __user *buf,
 			err = or_add(argv[1], argv[2], (int)scheme);
 	} else if (!strcmp(argv[0], "del") && argc == 2) {
 		or_del(argv[1]);
-		if (!or_any_live())
-			or_unregister();
 		err = 0;
 	} else if (!strcmp(argv[0], "clear")) {
 		int i;
@@ -462,8 +460,6 @@ static ssize_t or_proc_write(struct file *file, const char __user *buf,
 				continue;
 			or_del(or_entries[i].target_pathname);
 		}
-		if (!or_any_live())
-			or_unregister();
 		err = 0;
 	}
 
