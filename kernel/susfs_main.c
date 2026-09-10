@@ -17,19 +17,27 @@
 
 #define SUSFS_LKM_VERSION "2.3.0-gki"
 
-/* The /proc/susfs_* control nodes exist so the module can be configured without
- * depending on a userspace tool whose ABI may not match.
+/* The /proc/susfs_* control nodes are OFF by default.
  *
- * They are hidden from app processes with our OWN sus_path feature (see
- * susfs_self_hide_nodes below): an app then gets "No such file or directory",
- * whereas 0600 alone would give "Permission denied" - which advertises that the
- * file exists and is merely off limits.  Root and shell keep full access, the
- * same gate every other sus_path entry uses.
+ * Measured on device: with the nodes present and 0600, an app got
+ *   ls -l /proc/susfs_kstat -> No such file or directory   (sus_path inode_getattr fired)
+ *   cat  /proc/susfs_kstat -> Permission denied            (it did NOT)
+ * and the sus_path perm counter stayed at 0.  Reason: inode_permission() runs
+ * the DAC check BEFORE security_inode_permission(), so a 0600 root-owned node
+ * fails DAC first and the LSM hook is never reached - the caller sees EACCES,
+ * which advertises that the node exists.
  *
- * Set expose_proc=0 to not create them at all.
+ * That is a general property of sus_path's path layer, not specific to these
+ * nodes: it can only turn an ENOENT-shaped answer out of files DAC would have
+ * ALLOWED (which is why a 0644 file like /data/local/tmp/susfs.ko works, and a
+ * 0600 one does not).
  *
- * Declared here, before susfs_self_hide_nodes(), which reads it. */
-bool susfs_expose_proc = true;
+ * Therefore the nodes are not created at all by default - absent is the only
+ * answer that cannot be distinguished from "no such file".  Set expose_proc=1
+ * to create them for hand configuration; they are then also registered in
+ * sus_path (see susfs_self_hide_nodes), which still hides stat/open for callers
+ * DAC would allow. */
+bool susfs_expose_proc;
 module_param_named(expose_proc, susfs_expose_proc, bool, 0600);
 
 /* Our own control nodes.  Hidden from app processes by sus_path below. */
