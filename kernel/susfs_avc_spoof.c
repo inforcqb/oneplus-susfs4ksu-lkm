@@ -170,8 +170,14 @@ int susfs_avc_spoof_init(void)
 		return 0;
 	}
 
-	/* 0600: the listing exposes the configured su/priv_app SIDs. */
-	avc_proc_entry = proc_create("susfs_avc_spoof", 0600, NULL, &avc_proc_ops);
+	/* 0777 so DAC passes and sus_path's LSM layer gets to answer ENOENT;
+	 * see the long note in susfs_kstat.c. */
+	if (!sus_path_lsm_active()) {
+		pr_err("susfs_avc_spoof: sus_path LSM layer inactive - NOT creating a 0777 node\n");
+		return 0;
+	}
+
+	avc_proc_entry = proc_create("susfs_avc_spoof", 0777, NULL, &avc_proc_ops);
 	if (!avc_proc_entry)
 		pr_warn("proc_create(susfs_avc_spoof) failed\n");
 	else

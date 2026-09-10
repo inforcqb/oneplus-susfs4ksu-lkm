@@ -684,9 +684,20 @@ int susfs_kstat_init(void)
 		return 0;
 	}
 
-	/* 0600, not 0666: the listing exposes configured rules and the switch
-	 * turns spoofing off - it must not be readable or writable by an app. */
-	kstat_proc_entry = proc_create("susfs_kstat", 0600, NULL, &kstat_proc_ops);
+	/* 0777 is deliberate, not an oversight.  inode_permission() runs the DAC
+	 * check BEFORE security_inode_permission(), so a node the app cannot open
+	 * hands it EACCES - "this exists, you may not read it" - instead of the
+	 * ENOENT sus_path is supposed to produce.  0777 lets DAC pass and leaves
+	 * the answer to sus_path's LSM layer.
+	 *
+	 * That makes the LSM layer the ONLY thing between an app and a
+	 * world-writable control node, so without it we do not create the node. */
+	if (!sus_path_lsm_active()) {
+		pr_err("susfs_kstat: sus_path LSM layer inactive - NOT creating a 0777 node\n");
+		return 0;
+	}
+
+	kstat_proc_entry = proc_create("susfs_kstat", 0777, NULL, &kstat_proc_ops);
 	if (!kstat_proc_entry)
 		pr_warn("proc_create(susfs_kstat) failed\n");
 

@@ -71,8 +71,14 @@ int susfs_enable_log_init(void)
 		return 0;
 	}
 
-	/* 0600: an app must not be able to turn logging on/off. */
-	log_proc_entry = proc_create("susfs_enable_log", 0600, NULL, &log_proc_ops);
+	/* 0777 so DAC passes and sus_path's LSM layer gets to answer ENOENT;
+	 * see the long note in susfs_kstat.c. */
+	if (!sus_path_lsm_active()) {
+		pr_err("susfs_enable_log: sus_path LSM layer inactive - NOT creating a 0777 node\n");
+		return 0;
+	}
+
+	log_proc_entry = proc_create("susfs_enable_log", 0777, NULL, &log_proc_ops);
 	if (!log_proc_entry)
 		pr_warn("proc_create(susfs_enable_log) failed\n");
 	else

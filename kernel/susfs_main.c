@@ -80,10 +80,15 @@ static int __init susfs_init(void)
     pr_info("susfs_guard_lkm: init v%s\n", SUSFS_LKM_VERSION);
     ksu_init_symbol_resolver();
     ksu_lsm_hook_init();
+
+    /* sus_path FIRST: it installs the LSM layer whose state every later feature
+     * consults before creating a world-accessible control node (see
+     * susfs_expose_proc).  It has no other dependency. */
+    sus_path_init();
+
     susfs_uname_init();
     susfs_kstat_init();
     susfs_sus_map_init();
-    sus_path_init();
     susfs_sus_mount_init();
     susfs_spoof_cmdline_init();
     susfs_open_redirect_init();

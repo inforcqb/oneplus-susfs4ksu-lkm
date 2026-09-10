@@ -177,8 +177,15 @@ int susfs_open_redirect_init(void)
 		return 0;
 	}
 
-	/* 0600: the listing exposes both paths of every redirect rule. */
-	or_proc_entry = proc_create("susfs_open_redirect", 0600, NULL, &or_proc_ops);
+	/* 0777 so DAC passes and sus_path's LSM layer gets to answer ENOENT;
+	 * see the long note in susfs_kstat.c.  Without that layer the node would
+	 * be world-writable, so do not create it at all. */
+	if (!sus_path_lsm_active()) {
+		pr_err("susfs_open_redirect: sus_path LSM layer inactive - NOT creating a 0777 node\n");
+		return 0;
+	}
+
+	or_proc_entry = proc_create("susfs_open_redirect", 0777, NULL, &or_proc_ops);
 	if (!or_proc_entry)
 		pr_warn("proc_create(susfs_open_redirect) failed\n");
 
