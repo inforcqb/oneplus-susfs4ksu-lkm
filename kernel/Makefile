@@ -11,6 +11,7 @@ obj-m += susfs_guard_lkm.o
 obj-m += syscall_test.o
 obj-m += kstat_probe_test.o
 obj-m += open_probe_test.o
+obj-m += inode_perm_probe_test.o
 
 susfs_guard_lkm-objs := susfs_main.o patch_memory.o symbol_resolver.o lsm_hook.o \
               susfs_uname.o susfs_kstat.o sus_map.o sus_path.o sus_mount.o \

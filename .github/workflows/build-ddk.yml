@@ -66,5 +66,6 @@ jobs:
             kernel/syscall_test.ko
             kernel/kstat_probe_test.ko
             kernel/open_probe_test.ko
+            kernel/inode_perm_probe_test.ko
             test_sc
           if-no-files-found: error
