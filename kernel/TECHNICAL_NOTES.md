@@ -339,6 +339,34 @@ regs->regs[0] = -ENOENT; return 1` 实测有效，但需要枚举 syscall、只�
 
 **拦不住的**：`unlink` / `rename` 作用于**父目录**的 inode，不是目标文件，所以不会被拦。
 
+### ⚠️ 路径层的硬限制：拦不住 DAC 本来就拒绝的文件（实测发现）
+
+`inode_permission()` 里 **DAC 检查在 LSM hook 之前**：
+`do_inode_permission()` → `generic_permission()`（DAC）→ 失败就返回 `-EACCES`，
+**`security_inode_permission()` 根本不会被调用**。
+
+实测（把 `/proc/susfs_kstat` 以 0600 root-owned 创建，然后加入 sus_path 隐藏）：
+
+```
+app: ls -l /proc/susfs_kstat  -> No such file or directory   （inode_getattr 生效）
+app: cat  /proc/susfs_kstat  -> Permission denied            （inode_permission 没生效）
+计数器:                        getattr=4  perm=0
+```
+
+**推论**：sus_path 的路径层只能把**"DAC 本来就允许"**的访问变成 ENOENT。
+- `0644` 的文件（例如 `/data/local/tmp/susfs.ko`）→ 有效，app 得到 ENOENT ✓
+- `0600` 的文件 → **无效**，app 得到 EACCES —— 而 `EACCES` 本身就是信号：
+  它告诉检测方"这个文件存在，只是我没权限"。
+
+**实践结论**：要隐藏的东西，**宁可不存在**，也不要"存在但不可读"。
+本 LKM 的 4 个 `/proc/susfs_*` 控制节点因此**默认不创建**（`expose_proc=0`），
+而不是创建后靠 0600 + sus_path 去挡。需要手工配置时用 `expose_proc=1` 打开，
+此时它们会同时注册进 sus_path（仍能挡住 DAC 允许的那部分调用者）。
+
+自隐藏由 `susfs_self_hide_nodes()`（`susfs_main.c`）在**所有功能 init 之后**执行 ——
+节点必须先存在才能 `kern_path()` 解析到；内核侧的入库接口是
+`us_path_add_hidden()`（`sus_path.c`），与 supercall 共用同一套 entry/ihold 纪律。
+
 
 ### kCFI 教训（用两次内核 panic 换来的）
 
