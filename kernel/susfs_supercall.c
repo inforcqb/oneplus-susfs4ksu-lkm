@@ -137,27 +137,6 @@ static void susfs_tw_func(struct callback_head *cb)
 	case CMD_SUSFS_ADD_SUS_KSTAT:
 	case CMD_SUSFS_UPDATE_SUS_KSTAT:
 	case CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY:
-	{
-		/* DIAG: full 512-byte dump, split in two printk lines, so we can
-		 * locate the caller's `err` field (126 = 7e) and the real struct
-		 * size. */
-		unsigned char dbg[512];
-		int i, n;
-		char hex[300];
-
-		if (!copy_from_user(dbg, arg, sizeof(dbg))) {
-			n = 0;
-			for (i = 0; i < 256; i++)
-				n += snprintf(hex + n, sizeof(hex) - n, "%02x", dbg[i]);
-			pr_info("DIAG cmd=0x%x [0..255]=%s\n", tw->cmd, hex);
-			n = 0;
-			for (i = 256; i < 512; i++)
-				n += snprintf(hex + n, sizeof(hex) - n, "%02x", dbg[i]);
-			pr_info("DIAG cmd=0x%x [256..511]=%s\n", tw->cmd, hex);
-		} else {
-			pr_info("DIAG cmd=0x%x copy_from_user(512) FAILED\n", tw->cmd);
-		}
-	}
 		susfs_kstat_supercall(tw->cmd, &arg);
 		break;
 	case CMD_SUSFS_SET_UNAME:
