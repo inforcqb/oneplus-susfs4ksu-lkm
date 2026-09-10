@@ -117,6 +117,10 @@ static void susfs_tw_func(struct callback_head *cb)
 	struct susfs_tw *tw = container_of(cb, struct susfs_tw, cb);
 	void __user *arg = tw->payload;
 
+	/* DIAG: log every supercall the caller issues, to see the full
+	 * sequence (e.g. whether a command is sent more than once). */
+	pr_info("DIAG supercall cmd=0x%x payload=%px\n", tw->cmd, arg);
+
 	switch (tw->cmd) {
 	case CMD_SUSFS_SHOW_VERSION:
 		susfs_show_version(&arg);
@@ -137,37 +141,8 @@ static void susfs_tw_func(struct callback_head *cb)
 	case CMD_SUSFS_ADD_SUS_KSTAT:
 	case CMD_SUSFS_UPDATE_SUS_KSTAT:
 	case CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY:
-	{
-		/* DIAG: (1) scan the payload for the value 126 (the caller's
-		 * ERR_CMD_NOT_SUPPORTED sentinel) so we learn where the caller
-		 * actually keeps `err`; (2) prove our writeback works by writing a
-		 * marker to offset 372 and reading it back. */
-		int i;
-
 		susfs_kstat_supercall(tw->cmd, &arg);
-
-		for (i = 0; i < 1024; i += 4) {
-			unsigned int v = 0;
-
-			if (copy_from_user(&v, (char __user *)arg + i, 4))
-				break;
-			if (v == 126 || v == 0xFFFFFF82u /* -126 */)
-				pr_info("DIAG cmd=0x%x found 126 at offset %d\n",
-					tw->cmd, i);
-		}
-		{
-			unsigned int marker = 0x11223344, back = 0;
-
-			if (copy_to_user((char __user *)arg + 372, &marker, 4))
-				pr_info("DIAG cmd=0x%x marker write FAILED\n", tw->cmd);
-			else if (copy_from_user(&back, (char __user *)arg + 372, 4))
-				pr_info("DIAG cmd=0x%x marker readback FAILED\n", tw->cmd);
-			else
-				pr_info("DIAG cmd=0x%x marker@372 wrote 0x11223344 read 0x%x\n",
-					tw->cmd, back);
-		}
 		break;
-	}
 	case CMD_SUSFS_SET_UNAME:
 		susfs_uname_supercall(&arg);
 		break;
