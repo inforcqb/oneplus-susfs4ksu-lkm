@@ -293,7 +293,87 @@ adb shell 仍看得到）。本 LKM 无条件隐藏，root 也看不到——对
 （`shell_data_file`，appdomain 被允许 `file read`）在**本 LKM** 下永远不安全——正确做法是
 放 `/data/adb`（`adb_data_file`，appdomain 完全无权访问）。
 
-## 十二、已踩过的坑
+## 十二、LSM hook 让路径访问返回 ENOENT（已实测可用）
+
+上面那条 LKM 能力差距**已经补上了**，方案不是枚举 syscall，而是替换两个 LSM hook。
+实测（`kernel/selinux_hide_probe_main.c`，本内核 android13-5.15）：
+
+| hook | 替换目标 | 覆盖 |
+|---|---|---|
+| `inode_getattr` | `selinux_inode_getattr` | `stat` / `fstatat` / `statx` |
+| `inode_permission` | `selinux_inode_permission` | `open` / `exec` / `unlink` / `chmod` / 列目录 … |
+
+`vfs_getattr()` 在碰 inode 之前就先调 `security_inode_getattr()`，所以 stat 必过此路；
+而 `inode_permission` 是所有路径操作的门。**无需枚举任何 syscall。**
+
+匹配用 **inode 指针**，因此下列绕过**全部实测失效（都返回 ENOENT）**：
+直接路径、`//`、`./`、相对路径、符号链接（`stat -L`）、**硬链接**（同 inode）、
+`/proc/self/root/...`。对照组文件与目录列表完全正常。
+
+实测能力：`ls -l` / `cat` / `>> 追加写` / `chmod` / `test -e` 全部 ENOENT；
+`disarm` 后立即恢复；性能零影响（`ls /system/bin` 0.02s）。
+
+### kCFI 教训（用两次内核 panic 换来的）
+
+**replacement 函数的签名必须与 hook 类型逐字匹配，而且绝对不能加 `__nocfi`。**
+
+本内核用 **kCFI 做跨模块检查**：调用点比对被调函数的类型哈希。
+
+- 签名不匹配 → `CFI failure (target: ...cfi_jt)` → **panic**
+- 加 `__nocfi` → 函数根本不生成类型哈希 → `__cfi_check_fail` → **同样 panic**
+
+panic 现场形如：
+
+```
+Kernel panic - not syncing: CFI failure
+  (target: susfs_test_inode_permission.cfi_jt+0x0/0x8 [selinux_hide_probe])
+__cfi_check_fail+0x54/0x58 [selinux_hide_probe]
+__cfi_slowpath_diag+0x110/0x4d0
+cfi_module_add+0x0/0x2c
+```
+
+`lsm_hook.c` 注释里 "an __nocfi replacement" 的说法照搬自 KernelSU，**在本内核不成立**。
+`inode_getattr` 一开始就能用，恰恰是因为它**没加** `__nocfi` 且签名正好匹配。
+
+### 用编译期断言代替猜签名
+
+内核自己暴露了权威类型，不要靠打印或推断：
+
+```c
+#define LSM_HOOK_FN_TYPE(member) typeof(((union security_list_options *)0)->member)
+
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_permission),
+                                           typeof(&susfs_test_inode_permission)),
+              "inode_permission hook signature mismatch");
+```
+
+两个坑：
+
+1. 必须取地址 `typeof(&fn)`。hook 字段是**函数指针**类型，而 `typeof(函数名)` 是
+   函数类型，`__builtin_types_compatible_p` 判定二者**永不相等**——写错时会打印出
+   两个**完全相同**的类型却报 mismatch，极具迷惑性。
+2. 5.15 的真实类型是 `int (*)(const struct path *)` 与
+   `int (*)(struct inode *, int)`——`mnt_userns` 参数是 **6.3** 才进 LSM hook 的，
+   别按新内核写。
+
+这样签名错误会变成**编译失败**，而不是又一次重启。
+
+## 十三、测试工具链陷阱（这里浪费了最多轮次）
+
+1. **`adb shell` 的 stdout 是管道，全缓冲**。脚本被中断时，已打印的内容**全部丢失**，
+   看起来像"卡在第一步"，实际早已跑完。→ 测试脚本一律
+   `exec > /data/local/tmp/out.txt 2>&1`，再单独 `cat` 该文件。
+2. **PowerShell 包 `adb` 的长命令会"假死"**：adb 客户端超时断开后，设备端 shell 变成
+   **ppid=1 的 R 状态孤儿**，卡在写已经没人读的 stdout 上。**命令其实已经执行了**
+   （dmesg / 模块状态可证）。→ 判断是否真的执行要看 dmesg 和模块状态，
+   **不要只看 stdout**。
+3. 这些孤儿进程持有 `/proc/<模块>` 文件的引用，会让后续 `rmmod` 卡在
+   `proc_remove()` 上**永远等下去**。→ **rmmod 前先 kill 它们**（`ps -A -o pid,args`
+   找 `sh -c ...` 的孤儿）。
+4. 写 `/proc` 的 `single_open` 开关时，`echo x > /proc/...` 与后续命令放同一条
+   `su -c '...'` 里更容易触发上面第 2 条的假死。→ 分步、独立执行。
+
+## 十四、已踩过的坑
 
 - `module_param(var)` 注册的参数名是变量名，要 `module_param_named(name, var, ...)`。
 - 5.15 的 dcache flush 用 `dcache_clean_inval_poc` / `caches_clean_inval_pou`，
@@ -313,3 +393,9 @@ adb shell 仍看得到）。本 LKM 无条件隐藏，root 也看不到——对
 - **`gh run download` 参数错误会静默失败**，stderr 只弹 usage/Flags，且 `--dir`
   指向的旧文件仍在，于是把旧 `.ko` 推到设备反复测试「没生效」。下载后务必比对
   `.ko` 大小/字符串（新 commit 的格式化字符串是否在里面）再推送。
+- **sys_exit tracepoint 里 `regs->regs[0]` 已经是返回值**，不是第一个参数。想拿
+  原始参数只能用 `args[1]` 及之后（`sus_path` 的 getdents 过滤依赖这一点）。
+- `module_param_custom(name, ops, perm)` 在 DDK 头文件里不可用（clang 报
+  `expected identifier`），换 `module_param_cb(name, &ops, NULL, perm)`。
+- 给同一模块重复 `arm` 时，`kern_path` 拿到的 inode 要 `ihold` 住，否则 dentry 释放后
+  inode 可能被回收导致指针悬空。
