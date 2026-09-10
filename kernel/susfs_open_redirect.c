@@ -285,6 +285,7 @@ static int or_proc_show(struct seq_file *m, void *v)
 				   or_entries[i].uid_scheme,
 				   or_entries[i].target_ino,
 				   (unsigned long)or_entries[i].target_dev);
+		}
 	}
 	mutex_unlock(&or_lock);
 	return 0;
