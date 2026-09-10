@@ -28,7 +28,6 @@
 #include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/namei.h>
-#include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/limits.h>
 #include "susfs_abi.h"
@@ -48,8 +47,17 @@ struct linux_dirent64 {
 #define D_NAME_OFF offsetof(struct linux_dirent64, d_name)
 
 /*
- * One registered path.  dev+ino identify the inode exactly; name is only a
- * fallback for the (rare) filesystems that report d_ino == 0 in readdir.
+ * One registered path.
+ *
+ * An entry is matched when both the dirent's d_ino and its d_name equal the
+ * recorded inode number and name.  Requiring the name as well makes a collision
+ * between unrelated filesystems (independent inode number spaces can hand out
+ * the same small inode number) practically impossible.  The cost is that a
+ * hard link to a registered inode under a different name stays visible; upstream
+ * flags the inode itself and would hide it.
+ *
+ * dev is kept for diagnostics only: a sys_exit tracepoint cannot recover the
+ * listing's fd or superblock (regs->regs[0] already holds the return value).
  */
 struct sus_path_entry {
     struct list_head list;
@@ -68,19 +76,14 @@ module_param_string(hide_name, hide_name, sizeof(hide_name), 0644);
 
 static char *dirent_tmp;
 
-static bool sus_path_is_hidden(u64 dev, u64 ino, const char *name)
+static bool sus_path_is_hidden(u64 ino, const char *name)
 {
     struct sus_path_entry *e;
     bool hidden = false;
 
     spin_lock(&sus_path_lock);
     list_for_each_entry(e, &sus_path_list, list) {
-        if (e->ino) {
-            if (e->dev == dev && e->ino == ino) {
-                hidden = true;
-                break;
-            }
-        } else if (!strcmp(e->name, name)) {
+        if (e->ino == ino && !strcmp(e->name, name)) {
             hidden = true;
             break;
         }
@@ -94,7 +97,7 @@ static bool sus_path_is_hidden(u64 dev, u64 ino, const char *name)
 }
 
 /* compact the dirent chain in-place; returns the new byte count */
-static long sus_path_filter(unsigned long buf, long count, u64 dev)
+static long sus_path_filter(unsigned long buf, long count)
 {
     long offset = 0;
     long out = 0;
@@ -122,7 +125,7 @@ static long sus_path_filter(unsigned long buf, long count, u64 dev)
             break;
         name[nlen] = 0;
 
-        hide = sus_path_is_hidden(dev, d.d_ino, name);
+        hide = sus_path_is_hidden((u64)d.d_ino, name);
 
         if (!hide) {
             if (copy_from_user(dirent_tmp + out, (void __user *)(buf + offset), reclen))
@@ -142,9 +145,7 @@ static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret)
 {
     unsigned long args[6];
     unsigned long dirent_buf;
-    struct fd f;
     long new_count;
-    u64 dev;
 
     if (is_compat_task())
         return;
@@ -155,18 +156,14 @@ static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret)
     if (!READ_ONCE(sus_path_count) && !hide_name[0])
         return;
 
+    /* NOTE: in a sys_exit probe regs->regs[0] already holds the return value,
+     * so only args[1] (the buffer) and args[2] (the byte count) are usable. */
     syscall_get_arguments(current, regs, args);
     dirent_buf = args[1];
     if (!dirent_buf)
         return;
 
-    f = fdget((int)args[0]);
-    if (!f.file)
-        return;
-    dev = (u64)file_inode(f.file)->i_sb->s_dev;
-
-    new_count = sus_path_filter(dirent_buf, ret, dev);
-    fdput(f);
+    new_count = sus_path_filter(dirent_buf, ret);
 
     if (new_count != ret)
         regs->regs[0] = new_count;   /* shrink the returned byte count */
@@ -303,7 +300,7 @@ void sus_path_supercall(void __user **arg)
     {
         struct sus_path_entry *cur;
         list_for_each_entry(cur, &sus_path_list, list) {
-            if (cur->ino && cur->dev == e->dev && cur->ino == e->ino) {
+            if (cur->ino == e->ino && !strcmp(cur->name, e->name)) {
                 spin_unlock(&sus_path_lock);
                 kfree(e);
                 info.err = 0;   /* already registered, upstream is idempotent */
