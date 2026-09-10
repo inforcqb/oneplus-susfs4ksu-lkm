@@ -21,3 +21,6 @@ kmsg.dat.gz
 
 # temporary device test scripts (hardcode /data/local/tmp paths)
 test_*.sh
+
+# local ABI-layout verification scaffolding (uses stub <linux/*> shims)
+abi_layout_check/

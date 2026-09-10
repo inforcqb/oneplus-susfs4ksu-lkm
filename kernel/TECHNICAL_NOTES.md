@@ -195,7 +195,42 @@ true / 8 个 feature），功能命令用 no-libc 的 C 程序 `test_sc` 发 reb
 **A/B 陷阱**：上游 SUSFS_VERSION 是 "v2.3.0"、SUSFS_VARIANT 是 "GKI"（大写），
 别照搬 sidex15 模块 README 里的 "1.5.2"（那是另一套 SUSFS 版本体系）。
 
-## 十、已踩过的坑
+## 十、ABI 对齐上游 builtin 的要点（含两项行为对齐）
+
+ABI 必须与上游（susfs4ksu kernel_patches，即编译进内核的 builtin 版）逐字段一致，
+否则用户态工具会读到错位数据。已对齐并通过三种独立方法验证（真实编译器逐字段
+offset/size 断言、LP64 模型、Python packing 引擎）：
+
+- **magic / CMD / 长度宏**全部一致；上游标记 deprecated 的 8 个 CMD 也已定义（不接
+  handler）。
+- **12 个 payload 结构体**字段序列完全一致。`sizeof`：sus_path 260、sus_map 260、
+  sus_kstat 376（err@372）、uname 136（err@132）、log / avc / hide_sus_mnts 各 8、
+  open_redirect 520（err@516）、cmdline 8196、version / variant 各 20、
+  enabled_features 8196。
+- 结构体名要与上游一致（`st_susfs_hide_sus_mnts_for_non_su_procs`）。
+- uname 用 `__NEW_UTS_LEN+1`，不要硬编码 65。
+- `KSTAT_SPOOF_CTIME_TV_SEC` 保持修正值 `(1 << 8)`；上游是 typo `(1 < 8)`，不要
+  "同步"回去（用户态 ksu_susfs / ksud 用的都是正确的 bit 8）。
+
+**行为**也要对齐，不只是布局：
+
+1. **输入型命令只回写 `->err`**，不要 `copy_to_user` 整个结构体。上游 `fs/susfs.c`
+   的 add/set 类 handler 只写 err 字段；回写整个结构体会越界写调用方的栈（调用方
+   结构体可能更小或布局不同）。`show_*` 类命令才回写整个结构体（要返回字符串）。
+2. **处理成功后 reboot(2) 应返回 0**。上游 patch 了 `kernel/reboot.c`：
+   `ret = ksu_handle_sys_reboot(...); if (ret) goto orig_flow; return ret;`。
+   LKM 不能 patch reboot.c，于是在 kprobe 里镜像：
+   `regs->pc = regs->regs[30]; regs->regs[0] = 0; return 1;`（否则 reboot 会因为
+   magic 非法而返回 -EINVAL）。
+
+**验证工具说明**：sidex15 模块里预编译的 `ksu_susfs` 是很好的 ABI 消费者（能探测
+`show version/variant/enabled_features` 并驱动各命令），但它对应 **SUSFS 1.5.x**
+时代的 ABI——其 `st_susfs_sus_kstat` 字段顺序与 v2.3.0 不同（时间是 sec 三连排、
+nsec 三连排，且 blksize 在 blocks 之前），因此它对 kstat/open_redirect 会报
+`SUSFS operation not supported`。**这是工具版本问题，不是 LKM 的问题**：用与 v2.3.0
+布局一致的调用方（SukiSU ksud，或本仓库的 `test_sc`）实测全部命令 err=0。
+
+## 十一、已踩过的坑
 
 - `module_param(var)` 注册的参数名是变量名，要 `module_param_named(name, var, ...)`。
 - 5.15 的 dcache flush 用 `dcache_clean_inval_poc` / `caches_clean_inval_pou`，
