@@ -117,10 +117,6 @@ static void susfs_tw_func(struct callback_head *cb)
 	struct susfs_tw *tw = container_of(cb, struct susfs_tw, cb);
 	void __user *arg = tw->payload;
 
-	/* DIAG: log every supercall the caller issues, to see the full
-	 * sequence (e.g. whether a command is sent more than once). */
-	pr_info("DIAG supercall cmd=0x%x payload=%px\n", tw->cmd, arg);
-
 	switch (tw->cmd) {
 	case CMD_SUSFS_SHOW_VERSION:
 		susfs_show_version(&arg);
@@ -194,8 +190,24 @@ static int reboot_pre(struct kprobe *kp, struct pt_regs *regs)
 	if (task_work_add(current, &tw->cb, TWA_RESUME)) {
 		kfree(tw);
 		pr_warn("susfs supercall: task_work_add failed\n");
+		return 0;
 	}
-	return 0;
+
+	/* Upstream SUSFS patches kernel/reboot.c so that a handled supercall does
+	 * `return ret` (0) instead of falling through to the real reboot path:
+	 *
+	 *     ret = ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+	 *     if (ret) goto orig_flow;
+	 *     return ret;            <- syscall returns 0 on success
+	 *
+	 * We cannot patch reboot.c, so mirror it from the kprobe: skip the rest of
+	 * __arm64_sys_reboot and return 0.  Callers (the prebuilt ksu_susfs tool)
+	 * check the syscall result, and with the magic values being invalid
+	 * otherwise reboot would return -EINVAL.  The command itself still runs
+	 * from task_work before we return to userspace. */
+	regs->pc = regs->regs[30];
+	regs->regs[0] = 0;
+	return 1;
 }
 
 static struct kprobe reboot_kp = {
