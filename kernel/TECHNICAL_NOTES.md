@@ -263,10 +263,35 @@ adb shell 仍看得到）。本 LKM 无条件隐藏，root 也看不到——对
 
 调试用只读参数 `hide_list` 可打印当前所有已注册条目（`dev/ino/name`）。
 
-**注意 sus_path 的能力边界**：它只影响 `getdents64` 返回的目录项，无法阻止
-**按已知路径** `stat`/`open`。所以把 root 工具放在 `/data/local/tmp`
-（`shell_data_file`，appdomain 被允许 `file read`）永远是不安全的——正确做法是放
-`/data/adb`（`adb_data_file`，appdomain 完全无权访问）。
+### 与上游的能力鸿沟：上游会返回 -ENOENT，LKM 不会
+
+**上游 `sus_path` 是双层的**，patch 了 `fs/namei.c` 三处（见
+`kernel_patches/50_add_susfs_in_gki-android13-5.15.patch`）：
+
+1. `link_path_walk()`：路径中间组件命中 sus_path 时
+   `return -ENOENT;`（注释原文 "walking the sub path of sus path"）；
+2. `__lookup_slow()` / `lookup_open()`：命中时不返回已找到的 dentry，而是
+   `d_alloc_parallel(dir, &susfs_fake_qstr_name, &wq)` 重走一次查找，让文件系统
+   因为 `..5.u.S` 不存在而**自然**返回 ENOENT（这就是 `susfs_fake_qstr_name` 的用途）；
+3. 门控：`susfs_is_inode_sus_path()` 首行即 `susfs_is_current_proc_umounted_app()`，
+   外加 `is_i_uid_not_allowed()` —— 只对 app 进程生效，root 仍可访问。
+
+所以上游的效果是：**列目录看不到 + `stat`/`open`/`exec` 全部 ENOENT**。
+
+**本 LKM 做不到这一点**：`fs/namei.c` 已编译进内核，无法 patch。我们只在
+`getdents64` 出口过滤 dirent，因此**按已知路径的 `stat`/`open` 仍然成功**。
+这是 builtin 版与 LKM 版最本质的能力差距，不要误以为"上游设计如此"。
+
+要在 LKM 里补上，可行的替代是给路径类 syscall 的 wrapper 挂 kprobe，命中时短路：
+`regs->pc = regs->regs[30]; regs->regs[0] = -ENOENT; return 1;`
+（与本仓库 supercall 让 reboot 返回 0 用的是同一招，已在本内核验证可行）。
+设备上 `__arm64_sys_newfstatat` / `_statx` / `_openat` / `_faccessat` /
+`_readlinkat` / `_execve` / `_openat2` 符号均存在，具备实现条件。局限：只能拦绝对路径
+（pre_handler 里拿不到 dfd），且只能做字符串比较，不解析 `..` 与符号链接。
+
+**推论（安全建议不变）**：把 root 工具放在 `/data/local/tmp`
+（`shell_data_file`，appdomain 被允许 `file read`）在**本 LKM** 下永远不安全——正确做法是
+放 `/data/adb`（`adb_data_file`，appdomain 完全无权访问）。
 
 ## 十二、已踩过的坑
 
