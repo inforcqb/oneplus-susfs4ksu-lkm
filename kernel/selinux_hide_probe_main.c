@@ -2,7 +2,7 @@
 /*
  * selinux_hide_probe_main.c - make ALL path-based access report ENOENT, via LSM.
  *
- * Background (all measured on this device, see TECHNICAL_NOTES.md):
+ * Background (all measured on this device):
  *
  *   - inode_permission() survives LTO but cannot hide a file from stat: Linux
  *     only checks execute permission on the directories along a path, never on
@@ -25,10 +25,8 @@
  * symlinks (followed), hard links, bind mounts and /proc/self/root/... are all
  * covered.
  *
- * Neither hook dereferences the inode it is handed, so an unexpected argument
- * layout degrades to "never matches" instead of crashing.  Both always forward
- * to the original SELinux implementation when not hiding, so enforcement is
- * untouched.
+ * CFI: both hooks MUST be __nocfi, and the permission hook forwards its
+ * arguments generically.  Details on the declarations below.
  *
  *   echo 'arm /path/to/hide' > /proc/susfs_hide_probe
  *   cat  /proc/susfs_hide_probe
@@ -47,13 +45,23 @@
 #include <linux/string.h>
 #include <linux/sched.h>
 #include <linux/atomic.h>
-#include <linux/user_namespace.h>
 
 #include "lsm_hook.h"
 
-static int susfs_test_inode_getattr(const struct path *path);
-static int susfs_test_inode_permission(struct user_namespace *mnt_userns,
-				       struct inode *inode, int mask);
+/* __nocfi is MANDATORY.  The LSM hook slot is invoked through a function pointer
+ * under CFI, and we invoke the original through a function pointer as well.
+ * Without it the kernel panics hard:
+ *   "Kernel panic - not syncing: CFI failure
+ *      (target: susfs_test_inode_permission.cfi_jt+0x0/0x8 [selinux_hide_probe])"
+ * lsm_hook.c documents exactly the same requirement: "an __nocfi replacement".
+ *
+ * The permission hook takes generic pointers and forwards them to the original
+ * in the SAME register order, so the exact LSM hook type does not matter - be it
+ * int(inode, mask) or int(mnt_userns, inode, mask), no argument is reordered or
+ * reinterpreted.  Only pointer identity is compared, which cannot fault no
+ * matter what the arguments really are. */
+static int __nocfi susfs_test_inode_getattr(const struct path *path);
+static int __nocfi susfs_test_inode_permission(void *a0, void *a1, void *a2, void *a3);
 
 static struct ksu_lsm_hook getattr_hook = KSU_LSM_HOOK_INIT(
 	inode_getattr, "selinux_inode_getattr",
@@ -74,26 +82,22 @@ static atomic_t n_hidden_getattr = ATOMIC_INIT(0);
 static atomic_t n_hidden_perm = ATOMIC_INIT(0);
 static atomic_t n_orig_missing = ATOMIC_INIT(0);
 
-/* Pointer comparison only - never dereference, so a wrong argument layout is
- * harmless. */
-static inline bool is_hidden(struct inode *inode)
+static inline bool gated(void)
 {
-	if (!READ_ONCE(armed) || inode != READ_ONCE(target_inode))
-		return false;
-	if (gate_apps_only && current_uid().val < 10000)
-		return false;
-	return true;
+	return gate_apps_only && current_uid().val < 10000;
 }
 
-static int susfs_test_inode_getattr(const struct path *path)
+static int __nocfi susfs_test_inode_getattr(const struct path *path)
 {
 	int (*orig)(const struct path *path) = (void *)getattr_hook.original;
 	struct inode *inode;
 
-	inode = (path && path->dentry) ? d_inode(path->dentry) : NULL;
-	if (is_hidden(inode)) {
-		atomic_inc(&n_hidden_getattr);
-		return -ENOENT;
+	if (READ_ONCE(armed)) {
+		inode = (path && path->dentry) ? d_inode(path->dentry) : NULL;
+		if (inode && inode == READ_ONCE(target_inode) && !gated()) {
+			atomic_inc(&n_hidden_getattr);
+			return -ENOENT;
+		}
 	}
 	if (!orig) {
 		atomic_inc(&n_orig_missing);
@@ -102,21 +106,24 @@ static int susfs_test_inode_getattr(const struct path *path)
 	return orig(path);
 }
 
-static int susfs_test_inode_permission(struct user_namespace *mnt_userns,
-				       struct inode *inode, int mask)
+static int __nocfi susfs_test_inode_permission(void *a0, void *a1, void *a2, void *a3)
 {
-	int (*orig)(struct user_namespace *, struct inode *, int) =
-		(void *)perm_hook.original;
+	int (*orig)(void *, void *, void *, void *) = (void *)perm_hook.original;
 
-	if (is_hidden(inode)) {
-		atomic_inc(&n_hidden_perm);
-		return -ENOENT;
+	if (READ_ONCE(armed)) {
+		void *t = READ_ONCE(target_inode);
+
+		if ((a0 == t || a1 == t || a2 == t || a3 == t) && !gated()) {
+			atomic_inc(&n_hidden_perm);
+			return -ENOENT;
+		}
 	}
 	if (!orig) {
 		atomic_inc(&n_orig_missing);
 		return 0;
 	}
-	return orig(mnt_userns, inode, mask);
+	/* forward in the original register order - signature agnostic */
+	return orig(a0, a1, a2, a3);
 }
 
 static int probe_show(struct seq_file *m, void *v)
