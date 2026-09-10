@@ -60,11 +60,48 @@ struct sus_or_entry {
 	/* cached redirected path, resolved at add time (base ref) */
 	struct path redirected_path;
 	int uid_scheme;
+	/* Set while the slot is being rewritten or has been deleted.  The reader
+	 * checks this with READ_ONCE and the writer clears it LAST, so a false
+	 * value means the rest of the entry is complete. */
+	bool dead;
 };
 
 static struct sus_or_entry or_entries[SUS_OR_MAX];
 static int nor;
 static DEFINE_MUTEX(or_lock);
+
+/* Cached paths that have been replaced or deleted.
+ *
+ * or_vfs_open_pre() runs in interrupt context with no lock and hands
+ * &e->redirected_path straight to vfs_open, which path_get()s it.  Freeing the
+ * old path on replace/delete therefore raced a concurrent open into a
+ * use-after-free.  (Upstream avoids this with SRCU plus a re-walk, so it never
+ * holds a cached path at all.)  Retiring keeps the reference alive until
+ * unload; the price is one pinned dentry/mount per rule update, and updates are
+ * rare, configuration-time operations. */
+struct or_retired_path {
+	struct list_head list;
+	struct path path;
+};
+
+static LIST_HEAD(or_retired_paths);
+
+static void or_retire_path(struct path *p)
+{
+	struct or_retired_path *r;
+
+	if (!p->dentry)
+		return;
+	r = kmalloc(sizeof(*r), GFP_KERNEL);
+	if (!r) {
+		/* Cannot record it: leaking the reference is strictly safer than
+		 * dropping it while an open may still be using it. */
+		pr_warn("open_redirect: cannot retire path, leaking reference\n");
+		return;
+	}
+	r->path = *p;
+	list_add_tail(&r->list, &or_retired_paths);
+}
 
 static bool or_uid_matches(int scheme)
 {
@@ -81,9 +118,12 @@ static struct sus_or_entry *or_find_by_path(const char *target)
 {
 	int i;
 
-	for (i = 0; i < nor; i++)
+	for (i = 0; i < nor; i++) {
+		if (READ_ONCE(or_entries[i].dead))
+			continue;
 		if (!strcmp(or_entries[i].target_pathname, target))
 			return &or_entries[i];
+	}
 	return NULL;
 }
 
@@ -91,10 +131,16 @@ static struct sus_or_entry *or_find_by_inode(unsigned long ino, dev_t dev)
 {
 	int i;
 
-	for (i = 0; i < nor; i++)
+	for (i = 0; i < nor; i++) {
+		/* dead is cleared LAST by the writer, so skipping dead entries also
+		 * skips any entry whose fields are still being written. */
+		if (READ_ONCE(or_entries[i].dead))
+			continue;
+		smp_rmb();
 		if (or_entries[i].target_ino == ino &&
 		    or_entries[i].target_dev == dev)
 			return &or_entries[i];
+	}
 	return NULL;
 }
 
@@ -195,6 +241,7 @@ int susfs_open_redirect_init(void)
 
 void susfs_open_redirect_exit(void)
 {
+	struct or_retired_path *r, *tmp;
 	int i;
 
 	or_unregister();
@@ -202,9 +249,23 @@ void susfs_open_redirect_exit(void)
 		proc_remove(or_proc_entry);
 		or_proc_entry = NULL;
 	}
-	for (i = 0; i < nor; i++)
+
+	/* Nothing can reach these any more: the kprobe is already gone.
+	 * path_put() tolerates the NULLs left by or_del(). */
+	for (i = 0; i < nor; i++) {
 		path_put(&or_entries[i].redirected_path);
+		or_entries[i].redirected_path.dentry = NULL;
+		or_entries[i].redirected_path.mnt = NULL;
+		or_entries[i].dead = true;
+	}
 	nor = 0;
+
+	/* And only now the retired ones. */
+	list_for_each_entry_safe(r, tmp, &or_retired_paths, list) {
+		list_del(&r->list);
+		path_put(&r->path);
+		kfree(r);
+	}
 }
 
 static int or_proc_show(struct seq_file *m, void *v)
@@ -215,7 +276,9 @@ static int or_proc_show(struct seq_file *m, void *v)
 	if (nor == 0) {
 		seq_puts(m, "(empty)\n");
 	} else {
-		for (i = 0; i < nor; i++)
+		for (i = 0; i < nor; i++) {
+			if (READ_ONCE(or_entries[i].dead))
+				continue;
 			seq_printf(m, "%s -> %s uid=%d (ino=%lu dev=%lu)\n",
 				   or_entries[i].target_pathname,
 				   or_entries[i].redirected_pathname,
@@ -281,18 +344,32 @@ static int or_add(const char *target, const char *redirected, int scheme)
 	}
 
 	e = or_find_by_path(target);
-	if (!e) {
-		if (nor >= SUS_OR_MAX) {
-			path_put(&rp);
-			path_put(&tp);
-			return -ENOSPC;
-		}
-		e = &or_entries[nor];
-		strscpy(e->target_pathname, target, OR_PATH_MAX);
-		nor++;
+	if (e) {
+		/* Rewriting a live entry: mark it dead and retire its old path.
+		 * Freeing it here would race a concurrent vfs_open holding it. */
+		WRITE_ONCE(e->dead, true);
+		smp_wmb();
+		or_retire_path(&e->redirected_path);
 	} else {
-		/* replacing an existing rule: drop its old cached path */
-		path_put(&e->redirected_path);
+		int i;
+
+		/* Reuse a retired slot before growing the array. */
+		for (i = 0; i < nor; i++) {
+			if (READ_ONCE(or_entries[i].dead)) {
+				e = &or_entries[i];
+				break;
+			}
+		}
+		if (!e) {
+			if (nor >= SUS_OR_MAX) {
+				path_put(&rp);
+				path_put(&tp);
+				return -ENOSPC;
+			}
+			e = &or_entries[nor];
+			nor++;
+		}
+		strscpy(e->target_pathname, target, OR_PATH_MAX);
 	}
 
 	strscpy(e->redirected_pathname, redirected, OR_PATH_MAX);
@@ -300,6 +377,8 @@ static int or_add(const char *target, const char *redirected, int scheme)
 	e->target_dev = ti->i_sb->s_dev;
 	e->redirected_path = rp;   /* transfer the cached reference */
 	e->uid_scheme = scheme;
+	smp_wmb();
+	WRITE_ONCE(e->dead, false);	/* publish last: readers key off this */
 
 	path_put(&tp);
 
@@ -312,16 +391,35 @@ static int or_add(const char *target, const char *redirected, int scheme)
 static void or_del(const char *target)
 {
 	struct sus_or_entry *e;
-	int i;
 
 	e = or_find_by_path(target);
 	if (!e)
 		return;
-	path_put(&e->redirected_path);
-	i = (int)(e - or_entries);
-	or_entries[i] = or_entries[--nor];
-	if (nor == 0)
-		or_unregister();
+
+	/* Retire, never free: an in-flight vfs_open may still hold this path.
+	 * The slot stays in the array (marked dead) and is reused by or_add. */
+	WRITE_ONCE(e->dead, true);
+	smp_wmb();
+	or_retire_path(&e->redirected_path);
+	e->redirected_path.dentry = NULL;
+	e->redirected_path.mnt = NULL;
+	e->target_ino = 0;
+	e->target_dev = 0;
+	e->target_pathname[0] = '\0';
+	e->redirected_pathname[0] = '\0';
+}
+
+/* Slots are never compacted (that array move was itself part of the race), so
+ * "how many slots are used" and "how many rules are live" are now different
+ * questions.  Callers hold or_lock. */
+static bool or_any_live(void)
+{
+	int i;
+
+	for (i = 0; i < nor; i++)
+		if (!READ_ONCE(or_entries[i].dead))
+			return true;
+	return false;
 }
 
 static ssize_t or_proc_write(struct file *file, const char __user *buf,
@@ -352,10 +450,19 @@ static ssize_t or_proc_write(struct file *file, const char __user *buf,
 			err = or_add(argv[1], argv[2], (int)scheme);
 	} else if (!strcmp(argv[0], "del") && argc == 2) {
 		or_del(argv[1]);
+		if (!or_any_live())
+			or_unregister();
 		err = 0;
 	} else if (!strcmp(argv[0], "clear")) {
-		while (nor > 0)
-			or_del(or_entries[0].target_pathname);
+		int i;
+
+		for (i = 0; i < nor; i++) {
+			if (READ_ONCE(or_entries[i].dead))
+				continue;
+			or_del(or_entries[i].target_pathname);
+		}
+		if (!or_any_live())
+			or_unregister();
 		err = 0;
 	}
 

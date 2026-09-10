@@ -26,44 +26,91 @@ static char param_bootconfig[256];
 module_param_string(bootconfig, param_bootconfig, sizeof(param_bootconfig), 0644);
 
 static char *orig_boot_config;
-static char *fake_boot_config;   /* heap-allocated */
+static char *fake_boot_config;   /* heap-allocated, currently published */
 static bool spoof_active;
 
-static void spoof_set(const char *fake)
+/* Strings that saved_boot_config used to point at.
+ *
+ * A published string must NEVER be freed while saved_boot_config might reach
+ * it: /proc/bootconfig is read via seq_puts with no lock of ours, so freeing
+ * the old buffer before republishing let a reader touch freed memory.  The old
+ * code also returned early when kstrdup failed, leaving saved_boot_config
+ * dangling at the buffer it had just freed - and the next set() would free it
+ * again.  Retiring instead costs one 8 KB string per update. */
+struct retired_str {
+	struct list_head list;
+	char *s;
+};
+
+static LIST_HEAD(retired_strs);
+
+static void spoof_retire(char *s)
+{
+	struct retired_str *r;
+
+	if (!s)
+		return;
+	r = kmalloc(sizeof(*r), GFP_KERNEL);
+	if (!r)
+		return;		/* leak rather than free: never free a published string */
+	r->s = s;
+	list_add_tail(&r->list, &retired_strs);
+}
+
+/* Allocate first, publish second.  Returns 0 or a negative errno. */
+static int spoof_set(const char *fake)
 {
 	char *dup;
 
-	if (spoof_active)
-		kfree(fake_boot_config);
-	else
-		orig_boot_config = saved_boot_config;
-
 	dup = kstrdup(fake, GFP_KERNEL);
 	if (!dup)
-		return;
+		return -ENOMEM;
+
+	if (!spoof_active)
+		orig_boot_config = saved_boot_config;
+	else
+		spoof_retire(fake_boot_config);
+
 	fake_boot_config = dup;
 	saved_boot_config = dup;
 	spoof_active = true;
+	return 0;
 }
 
 int susfs_spoof_cmdline_init(void)
 {
+	int rc;
+
 	if (!param_bootconfig[0]) {
 		pr_info("spoof_cmdline: no fake bootconfig, not armed\n");
 		return 0;
 	}
-	spoof_set(param_bootconfig);
+	rc = spoof_set(param_bootconfig);
+	if (rc) {
+		pr_err("spoof_cmdline: set failed %d, not armed\n", rc);
+		return rc;
+	}
 	pr_info("spoof_cmdline armed: %s\n", param_bootconfig);
 	return 0;
 }
 
 void susfs_spoof_cmdline_exit(void)
 {
+	struct retired_str *r, *tmp;
+
+	/* Unpublish before freeing anything. */
 	if (spoof_active) {
 		saved_boot_config = orig_boot_config;
-		kfree(fake_boot_config);
-		fake_boot_config = NULL;
 		spoof_active = false;
+		orig_boot_config = NULL;
+	}
+	kfree(fake_boot_config);
+	fake_boot_config = NULL;
+
+	list_for_each_entry_safe(r, tmp, &retired_strs, list) {
+		list_del(&r->list);
+		kfree(r->s);
+		kfree(r);
 	}
 }
 
@@ -81,9 +128,16 @@ void susfs_spoof_cmdline_supercall(void __user **arg)
 		goto out;
 	}
 
-	spoof_set(info->fake_cmdline_or_bootconfig);
-	info->err = 0;
-	pr_info("spoof_cmdline: set fake bootconfig (supercall)\n");
+	/* Empty string is rejected upstream (-EINVAL); report the real result of
+	 * the update instead of always claiming success. */
+	if (!info->fake_cmdline_or_bootconfig[0]) {
+		info->err = -EINVAL;
+		goto out;
+	}
+
+	info->err = spoof_set(info->fake_cmdline_or_bootconfig);
+	if (!info->err)
+		pr_info("spoof_cmdline: set fake bootconfig (supercall)\n");
 out:
 	/* upstream writes back only ->err for input-type commands */
 	if (copy_to_user(&((struct st_susfs_spoof_cmdline_or_bootconfig __user *)*arg)->err,

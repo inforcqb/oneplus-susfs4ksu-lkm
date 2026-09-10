@@ -35,12 +35,23 @@ static int nmap;
 static unsigned long param_map_ino;
 module_param_named(map_ino, param_map_ino, ulong, 0644);
 
+/* dev==0 means "any filesystem" (only reachable through the map_ino parameter,
+ * which cannot know the device). */
+static int sus_map_add_full(unsigned long ino, dev_t dev)
+{
+    if (!ino)
+        return -EINVAL;
+    if (nmap >= SUS_MAP_MAX)
+        return -ENOSPC;
+    map_entries[nmap].target_ino = ino;
+    map_entries[nmap].target_dev = dev;
+    nmap++;
+    return 0;
+}
+
 static void sus_map_add(unsigned long ino)
 {
-    if (nmap >= SUS_MAP_MAX || !ino)
-        return;
-    map_entries[nmap].target_ino = ino;
-    nmap++;
+    sus_map_add_full(ino, 0);
 }
 
 static bool sus_map_lookup(unsigned long ino, dev_t dev)
@@ -141,8 +152,16 @@ void susfs_sus_map_supercall(void __user **arg)
         info.err = -ENOSPC;
         goto out;
     }
-    sus_map_add(inode->i_ino);
-    map_entries[nmap - 1].target_dev = inode->i_sb->s_dev;
+    /* One call fills both fields.  The old two-step form called sus_map_add(),
+     * which returns early when ino==0, and then wrote map_entries[nmap-1]
+     * unconditionally - indexing -1 at worst, or corrupting the previous rule's
+     * device at best. */
+    rc = sus_map_add_full(inode->i_ino, inode->i_sb->s_dev);
+    if (rc) {
+        path_put(&p);
+        info.err = rc;
+        goto out;
+    }
     pr_info("sus_map: added %s (ino=%lu) via supercall\n",
             info.target_pathname, inode->i_ino);
     path_put(&p);
