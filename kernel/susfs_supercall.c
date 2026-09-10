@@ -138,29 +138,24 @@ static void susfs_tw_func(struct callback_head *cb)
 	case CMD_SUSFS_UPDATE_SUS_KSTAT:
 	case CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY:
 	{
-		/* DIAG (heap buffer, no stack overflow): dump 512 bytes so we can
-		 * locate the caller's `err` field (126 = 7e) and learn the real
-		 * struct size/layout. */
-		unsigned char *dbg = kmalloc(512, GFP_KERNEL);
-		char *hex = kmalloc(1025, GFP_KERNEL);
+		/* DIAG: read the err word at offset 372 BEFORE and AFTER our
+		 * handler, to prove whether our writeback lands where the caller
+		 * looks. 372 = our struct's err offset (sizeof 376). */
+		unsigned int before = 0, after = 0;
 
-		if (dbg && hex) {
-			int i;
+		if (!copy_from_user(&before, (char __user *)arg + 372, 4))
+			pr_info("DIAG cmd=0x%x err@372 BEFORE=%u\n", tw->cmd, before);
+		else
+			pr_info("DIAG cmd=0x%x read before FAILED\n", tw->cmd);
 
-			if (!copy_from_user(dbg, arg, 512)) {
-				for (i = 0; i < 512; i++)
-					sprintf(hex + i * 2, "%02x", dbg[i]);
-				hex[1024] = '\0';
-				pr_info("DIAG cmd=0x%x [0..511]=%s\n", tw->cmd, hex);
-			} else {
-				pr_info("DIAG cmd=0x%x copy_from_user(512) FAILED\n", tw->cmd);
-			}
-		}
-		kfree(dbg);
-		kfree(hex);
-	}
 		susfs_kstat_supercall(tw->cmd, &arg);
+
+		if (!copy_from_user(&after, (char __user *)arg + 372, 4))
+			pr_info("DIAG cmd=0x%x err@372 AFTER=%u\n", tw->cmd, after);
+		else
+			pr_info("DIAG cmd=0x%x read after FAILED\n", tw->cmd);
 		break;
+	}
 	case CMD_SUSFS_SET_UNAME:
 		susfs_uname_supercall(&arg);
 		break;
