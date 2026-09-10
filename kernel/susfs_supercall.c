@@ -138,22 +138,34 @@ static void susfs_tw_func(struct callback_head *cb)
 	case CMD_SUSFS_UPDATE_SUS_KSTAT:
 	case CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY:
 	{
-		/* DIAG: read the err word at offset 372 BEFORE and AFTER our
-		 * handler, to prove whether our writeback lands where the caller
-		 * looks. 372 = our struct's err offset (sizeof 376). */
-		unsigned int before = 0, after = 0;
-
-		if (!copy_from_user(&before, (char __user *)arg + 372, 4))
-			pr_info("DIAG cmd=0x%x err@372 BEFORE=%u\n", tw->cmd, before);
-		else
-			pr_info("DIAG cmd=0x%x read before FAILED\n", tw->cmd);
+		/* DIAG: (1) scan the payload for the value 126 (the caller's
+		 * ERR_CMD_NOT_SUPPORTED sentinel) so we learn where the caller
+		 * actually keeps `err`; (2) prove our writeback works by writing a
+		 * marker to offset 372 and reading it back. */
+		int i;
 
 		susfs_kstat_supercall(tw->cmd, &arg);
 
-		if (!copy_from_user(&after, (char __user *)arg + 372, 4))
-			pr_info("DIAG cmd=0x%x err@372 AFTER=%u\n", tw->cmd, after);
-		else
-			pr_info("DIAG cmd=0x%x read after FAILED\n", tw->cmd);
+		for (i = 0; i < 1024; i += 4) {
+			unsigned int v = 0;
+
+			if (copy_from_user(&v, (char __user *)arg + i, 4))
+				break;
+			if (v == 126 || v == 0xFFFFFF82u /* -126 */)
+				pr_info("DIAG cmd=0x%x found 126 at offset %d\n",
+					tw->cmd, i);
+		}
+		{
+			unsigned int marker = 0x11223344, back = 0;
+
+			if (copy_to_user((char __user *)arg + 372, &marker, 4))
+				pr_info("DIAG cmd=0x%x marker write FAILED\n", tw->cmd);
+			else if (copy_from_user(&back, (char __user *)arg + 372, 4))
+				pr_info("DIAG cmd=0x%x marker readback FAILED\n", tw->cmd);
+			else
+				pr_info("DIAG cmd=0x%x marker@372 wrote 0x11223344 read 0x%x\n",
+					tw->cmd, back);
+		}
 		break;
 	}
 	case CMD_SUSFS_SET_UNAME:
