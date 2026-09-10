@@ -137,6 +137,21 @@ static void susfs_tw_func(struct callback_head *cb)
 	case CMD_SUSFS_ADD_SUS_KSTAT:
 	case CMD_SUSFS_UPDATE_SUS_KSTAT:
 	case CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY:
+	{
+		/* DIAG: dump the caller's payload so we can infer the expected
+		 * struct layout (some ksu_susfs builds fail to see our err). */
+		unsigned char dbg[96];
+		int i, n = 0;
+		char hex[200];
+
+		if (!copy_from_user(dbg, arg, sizeof(dbg))) {
+			for (i = 0; i < (int)sizeof(dbg); i++)
+				n += snprintf(hex + n, sizeof(hex) - n, "%02x", dbg[i]);
+			pr_info("DIAG kstat cmd=0x%x payload[0..95]=%s\n", tw->cmd, hex);
+		} else {
+			pr_info("DIAG kstat cmd=0x%x copy_from_user(96) FAILED\n", tw->cmd);
+		}
+	}
 		susfs_kstat_supercall(tw->cmd, &arg);
 		break;
 	case CMD_SUSFS_SET_UNAME:
