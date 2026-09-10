@@ -189,7 +189,7 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
 static const struct kernel_param_ops sus_path_list_ops = {
     .get = sus_path_show_list,
 };
-module_param_custom(hide_list, sus_path_list_ops, 0444);
+module_param_cb(hide_list, &sus_path_list_ops, NULL, 0444);
 
 static bool path_registered;
 
