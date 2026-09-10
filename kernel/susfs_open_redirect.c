@@ -47,7 +47,9 @@
 #include "susfs.h"	/* susfs_expose_proc */
 
 #define SUS_OR_MAX 64
-#define OR_PATH_MAX 128
+/* The ABI fields are char[256]; matching them stops a legal long path from
+ * being silently truncated into a rule for a different path. */
+#define OR_PATH_MAX 256
 
 /* UID_SCHEME (uid_scheme values) now lives in susfs_abi.h, mirroring upstream
  * susfs.h where the enum sits next to the ABI structs. */
@@ -217,25 +219,24 @@ static struct proc_dir_entry *or_proc_entry;
 
 int susfs_open_redirect_init(void)
 {
-	/* Not created unless asked for: see susfs_expose_proc. */
-	if (!susfs_expose_proc) {
-		pr_info("susfs_open_redirect: /proc node disabled (expose_proc=0)\n");
-		return 0;
+	/* Only the /proc node is optional.  The vfs_open hook is registered by
+	 * or_add() - i.e. by the supercall as well - so this gate must never
+	 * return early and skip other work.  See susfs_control_node_allowed():
+	 * 0777 so DAC passes and sus_path's LSM layer gets to answer ENOENT, and
+	 * without that layer the node would be world-writable, so it is not
+	 * created at all. */
+	if (susfs_control_node_allowed()) {
+		or_proc_entry = proc_create("susfs_open_redirect", 0777, NULL,
+					    &or_proc_ops);
+		if (!or_proc_entry)
+			pr_warn("proc_create(susfs_open_redirect) failed\n");
+	} else {
+		pr_info("susfs_open_redirect: /proc node not created (expose_proc=%d lsm=%d)\n",
+			(int)susfs_expose_proc, (int)sus_path_lsm_active());
 	}
 
-	/* 0777 so DAC passes and sus_path's LSM layer gets to answer ENOENT;
-	 * see the long note in susfs_kstat.c.  Without that layer the node would
-	 * be world-writable, so do not create it at all. */
-	if (!sus_path_lsm_active()) {
-		pr_err("susfs_open_redirect: sus_path LSM layer inactive - NOT creating a 0777 node\n");
-		return 0;
-	}
-
-	or_proc_entry = proc_create("susfs_open_redirect", 0777, NULL, &or_proc_ops);
-	if (!or_proc_entry)
-		pr_warn("proc_create(susfs_open_redirect) failed\n");
-
-	pr_info("susfs_open_redirect: %d rules (proc: /proc/susfs_open_redirect)\n", nor);
+	pr_info("susfs_open_redirect: %d rules (hook %s, proc %d)\n", nor,
+		or_registered ? "armed" : "lazy", or_proc_entry != NULL);
 	return 0;
 }
 
@@ -326,6 +327,14 @@ static int or_add(const char *target, const char *redirected, int scheme)
 		return -EINVAL;
 	if (scheme != UID_NON_APP_PROC)
 		return -EOPNOTSUPP;
+
+	/* Both come from char[256] ABI fields (supercall) or a NUL-terminated
+	 * command buffer (proc write); reject the unterminated case instead of
+	 * letting strcmp()/kern_path() read past the struct or truncate a path
+	 * into a rule for some other file. */
+	if (!susfs_abi_path_ok(target, OR_PATH_MAX) ||
+	    !susfs_abi_path_ok(redirected, OR_PATH_MAX))
+		return -ENAMETOOLONG;
 
 	/* resolve target for ino/dev (released immediately) */
 	rc = kern_path(target, LOOKUP_FOLLOW, &tp);

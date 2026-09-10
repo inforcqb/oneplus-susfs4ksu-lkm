@@ -2,6 +2,20 @@
 #ifndef __SUSFS_H
 #define __SUSFS_H
 
+#include <linux/string.h>
+
+/* Bind a fixed-size ABI pathname field to a C string safely.
+ *
+ * The st_susfs_* structs carry char[N] pathname fields that a caller need not
+ * NUL-terminate.  Handing such a field to strlen()/strcmp()/kern_path() walks
+ * off the end of the struct - and the struct lives on OUR kernel stack, so it
+ * reads (and then resolves) whatever follows it.  Every consumer of an ABI
+ * pathname must pass it through this check first. */
+static inline bool susfs_abi_path_ok(const char *field, size_t size)
+{
+	return strnlen(field, size) < size;
+}
+
 /* Add a path to sus_path's hidden set from kernel code (no supercall needed).
  * Used to self-hide the /proc control nodes.  Returns 0 or a negative errno. */
 int sus_path_add_hidden(const char *path);
@@ -62,5 +76,21 @@ void susfs_hide_syms_exit(void);
  * as active, which is exactly the kind of inconsistency a detector looks for. */
 bool susfs_hide_syms_active(void);
 bool sus_path_lsm_active(void);
+
+/* Whether a 0777 /proc/susfs_* control node may be created.
+ *
+ * Two independent conditions, neither optional:
+ *   - susfs_expose_proc: the operator opted in to having the nodes at all;
+ *   - sus_path_lsm_active(): with 0777 DAC lets every caller through, so the
+ *     LSM layer is the only thing that can still answer ENOENT for an app.
+ *
+ * This gates node CREATION ONLY.  It must never gate hook registration: an
+ * earlier revision returned early from the feature inits on !susfs_expose_proc,
+ * which silently disabled sus_kstat's tracepoint and kretprobe entirely (rules
+ * were still accepted over the supercall and never applied). */
+static inline bool susfs_control_node_allowed(void)
+{
+	return susfs_expose_proc && sus_path_lsm_active();
+}
 
 #endif

@@ -49,6 +49,7 @@
 #include <linux/atomic.h>
 #include "susfs_abi.h"
 #include "susfs_log.h"
+#include "susfs.h"	/* susfs_abi_path_ok */
 #include "lsm_hook.h"
 
 #define DIRENT_BUF_SIZE 65536  /* getdents usually returns <= 32-64KB */
@@ -96,6 +97,13 @@ static char hide_name[NAME_MAX + 1];
 module_param_string(hide_name, hide_name, sizeof(hide_name), 0644);
 
 static char *dirent_tmp;
+
+/* Guards dirent_tmp.  It is a single global scratch buffer shared by every
+ * getdents64 exit, and the tracepoint can fire concurrently on several CPUs:
+ * without this, two listings compact into the same buffer and one process can
+ * get another directory's entries.  sus_path_lock cannot be reused - it is taken
+ * inside the traversal by sus_path_is_hidden(). */
+static DEFINE_SPINLOCK(sus_path_buf_lock);
 
 static bool sus_path_is_hidden(u64 ino, const char *name)
 {
@@ -254,6 +262,16 @@ static long sus_path_filter(unsigned long buf, long count)
 {
     long offset = 0;
     long out = 0;
+    char *tmp;
+    bool complete = true;
+
+    spin_lock(&sus_path_buf_lock);
+
+    tmp = dirent_tmp;
+    if (!tmp) {
+        spin_unlock(&sus_path_buf_lock);
+        return count;
+    }
 
     while (offset < count) {
         struct linux_dirent64 d;
@@ -262,20 +280,36 @@ static long sus_path_filter(unsigned long buf, long count)
         long nlen;
         bool hide;
 
-        if (copy_from_user(&d, (void __user *)(buf + offset), sizeof(d)))
+        if (copy_from_user(&d, (void __user *)(buf + offset), sizeof(d))) {
+            complete = false;
             break;
+        }
         reclen = d.d_reclen;
+        /* d_reclen is filesystem-supplied: bound it before it is used as a
+         * copy length, as a step, and before out+reclen can leave the buffer. */
         if (reclen < D_NAME_OFF + 1 ||
             offset + reclen > count ||
-            reclen > DIRENT_BUF_SIZE - out)
+            reclen > DIRENT_BUF_SIZE - out) {
+            complete = false;
             break;
+        }
 
         nlen = strnlen_user((void __user *)(buf + offset + D_NAME_OFF),
                             sizeof(name) - 1);
-        if (nlen == 0 || nlen >= sizeof(name))
-            nlen = sizeof(name) - 1;
-        if (copy_from_user(name, (void __user *)(buf + offset + D_NAME_OFF), nlen))
+        if (nlen == 0) {            /* no readable NUL in the name field */
+            complete = false;
             break;
+        }
+        if (nlen >= sizeof(name))   /* longer than NAME_MAX: cannot match */
+            nlen = sizeof(name) - 1;
+        if (nlen > reclen - D_NAME_OFF) {
+            complete = false;
+            break;
+        }
+        if (copy_from_user(name, (void __user *)(buf + offset + D_NAME_OFF), nlen)) {
+            complete = false;
+            break;
+        }
         name[nlen] = 0;
 
         hide = sus_path_is_hidden((u64)d.d_ino, name);
@@ -285,16 +319,28 @@ static long sus_path_filter(unsigned long buf, long count)
             hide = false;
 
         if (!hide) {
-            if (copy_from_user(dirent_tmp + out, (void __user *)(buf + offset), reclen))
+            if (copy_from_user(tmp + out, (void __user *)(buf + offset), reclen)) {
+                complete = false;
                 break;
+            }
             out += reclen;
         }
         offset += reclen;
     }
 
-    if (out > 0 && out != count)
-        if (copy_to_user((void __user *)buf, dirent_tmp, out))
-            return count;   /* failed to write back: leave untouched */
+    /* A partial compaction would silently drop every record after the failure
+     * point (the old code returned the partial count), so on any failure hand
+     * the listing back exactly as the kernel wrote it and filter nothing. */
+    if (!complete) {
+        spin_unlock(&sus_path_buf_lock);
+        return count;
+    }
+
+    if (out != count)   /* out == count means nothing was hidden */
+        if (copy_to_user((void __user *)buf, tmp, out))
+            out = count;   /* failed to write back: leave untouched */
+
+    spin_unlock(&sus_path_buf_lock);
     return out;
 }
 
@@ -530,6 +576,12 @@ void sus_path_supercall(void __user **arg)
 
     if (!info.target_pathname[0]) {
         info.err = -EINVAL;
+        goto out;
+    }
+    /* The field is char[256] and need not be NUL-terminated; kern_path() on an
+     * unterminated one reads off the end of our stack copy of the struct. */
+    if (!susfs_abi_path_ok(info.target_pathname, sizeof(info.target_pathname))) {
+        info.err = -ENAMETOOLONG;
         goto out;
     }
 

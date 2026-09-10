@@ -25,6 +25,7 @@
 #include <linux/version.h>
 #include "susfs_abi.h"
 #include "susfs_log.h"
+#include "susfs.h"	/* susfs_abi_path_ok */
 
 #define SUSFS_UNAME_LEN (__NEW_UTS_LEN + 1)
 
@@ -137,6 +138,13 @@ void susfs_uname_supercall(void __user **arg)
     }
     if (*info.release == '\0' || *info.version == '\0') {
         info.err = -EFAULT;
+        goto out;
+    }
+    /* char[65] ABI fields the caller need not terminate; strcmp() below and
+     * strscpy() after it would both run past the end if they are not. */
+    if (!susfs_abi_path_ok(info.release, sizeof(info.release)) ||
+        !susfs_abi_path_ok(info.version, sizeof(info.version))) {
+        info.err = -ENAMETOOLONG;
         goto out;
     }
 

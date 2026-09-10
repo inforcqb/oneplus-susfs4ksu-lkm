@@ -20,6 +20,7 @@
 #include <linux/uaccess.h>
 #include "susfs_abi.h"
 #include "susfs_log.h"
+#include "susfs.h"	/* susfs_abi_path_ok */
 
 #define SUS_MAP_MAX 64
 
@@ -132,6 +133,13 @@ void susfs_sus_map_supercall(void __user **arg)
 
     if (copy_from_user(&info, (void __user *)*arg, sizeof(info))) {
         info.err = -EFAULT;
+        goto out;
+    }
+
+    /* char[256] field that need not be NUL-terminated: reject it before
+     * kern_path() can read off the end of our stack copy of the struct. */
+    if (!susfs_abi_path_ok(info.target_pathname, sizeof(info.target_pathname))) {
+        info.err = -ENAMETOOLONG;
         goto out;
     }
 

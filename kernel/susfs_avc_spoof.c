@@ -164,24 +164,21 @@ int susfs_avc_spoof_init(void)
 	pr_info("avc_spoof: su_sid=%u (%s), priv_app_sid=%u (%s)\n",
 		avc_su_sid, avc_su_ctx, avc_priv_app_sid, avc_priv_app_ctx);
 
-	/* Not created unless asked for: see susfs_expose_proc. */
-	if (!susfs_expose_proc) {
-		pr_info("susfs_avc_spoof: /proc node disabled (expose_proc=0)\n");
-		return 0;
+	/* Only the /proc node is optional: the avc hook is installed by
+	 * avc_register() when the feature is switched on, supercall included.
+	 * See susfs_control_node_allowed(): 0777 so DAC passes and sus_path's LSM
+	 * layer gets to answer ENOENT. */
+	if (susfs_control_node_allowed()) {
+		avc_proc_entry = proc_create("susfs_avc_spoof", 0777, NULL,
+					     &avc_proc_ops);
+		if (!avc_proc_entry)
+			pr_warn("proc_create(susfs_avc_spoof) failed\n");
+		else
+			pr_info("susfs_avc_spoof: proc ready (/proc/susfs_avc_spoof)\n");
+	} else {
+		pr_info("susfs_avc_spoof: /proc node not created (expose_proc=%d lsm=%d)\n",
+			(int)susfs_expose_proc, (int)sus_path_lsm_active());
 	}
-
-	/* 0777 so DAC passes and sus_path's LSM layer gets to answer ENOENT;
-	 * see the long note in susfs_kstat.c. */
-	if (!sus_path_lsm_active()) {
-		pr_err("susfs_avc_spoof: sus_path LSM layer inactive - NOT creating a 0777 node\n");
-		return 0;
-	}
-
-	avc_proc_entry = proc_create("susfs_avc_spoof", 0777, NULL, &avc_proc_ops);
-	if (!avc_proc_entry)
-		pr_warn("proc_create(susfs_avc_spoof) failed\n");
-	else
-		pr_info("susfs_avc_spoof: proc ready (/proc/susfs_avc_spoof)\n");
 	return 0;
 }
 

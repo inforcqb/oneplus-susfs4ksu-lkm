@@ -18,6 +18,7 @@
 #include <linux/uaccess.h>
 #include "susfs_abi.h"
 #include "susfs_log.h"
+#include "susfs.h"	/* susfs_abi_path_ok */
 
 /* unexported static var; ksud insmod relocates it via kallsyms */
 extern char *saved_boot_config;
@@ -132,6 +133,13 @@ void susfs_spoof_cmdline_supercall(void __user **arg)
 	 * the update instead of always claiming success. */
 	if (!info->fake_cmdline_or_bootconfig[0]) {
 		info->err = -EINVAL;
+		goto out;
+	}
+	/* spoof_set() kstrdup()s this, i.e. strlen()s it: an unterminated
+	 * fixed-size ABI field would be read past the end of the allocation. */
+	if (!susfs_abi_path_ok(info->fake_cmdline_or_bootconfig,
+			       sizeof(info->fake_cmdline_or_bootconfig))) {
+		info->err = -ENAMETOOLONG;
 		goto out;
 	}
 

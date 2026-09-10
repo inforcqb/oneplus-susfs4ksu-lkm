@@ -48,6 +48,7 @@
 #include <linux/namei.h>
 #include <linux/dcache.h>
 #include <linux/kdev_t.h>
+#include <linux/string.h>
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc */
@@ -65,7 +66,9 @@
 	KSTAT_SPOOF_NLINK | KSTAT_SPOOF_SIZE)
 
 #define SUS_KSTAT_MAX 32
-#define KSTAT_PATH_MAX 128
+/* Upstream's st_susfs_sus_kstat.target_pathname is char[256]; match it, or a
+ * legal long path is either truncated (wrong rule) or rejected (fidelity gap). */
+#define KSTAT_PATH_MAX 256
 
 struct sus_kstat_entry {
 	char target_pathname[KSTAT_PATH_MAX];
@@ -91,6 +94,57 @@ struct sus_kstat_entry {
 static struct sus_kstat_entry kstat_entries[SUS_KSTAT_MAX];
 static int nkstat;
 static DEFINE_MUTEX(kstat_lock);
+
+/* Table locking, in two tiers.
+ *
+ * kstat_lock (mutex) serialises WRITERS and the /proc read, because writers
+ * resolve paths and that sleeps.
+ *
+ * kstat_table_lock (spinlock) guards the table itself for the READERS, which
+ * run on hot paths - the sys_exit tracepoint and the vfs_getattr kretprobe -
+ * where sleeping is impossible and kstat_lock therefore cannot be taken.  A
+ * reader holds it only long enough to copy the matching entry out; it must
+ * never copy_to_user under it.
+ *
+ * Rule: resolve first (sleeping, outside), then swap (non-sleeping, inside).
+ * Publishing a slot before it is fully filled is a bug - an empty slot used to
+ * be visible as soon as nkstat was bumped, before kern_path() had even run. */
+static DEFINE_SPINLOCK(kstat_table_lock);
+
+/* The part of an entry a reader needs, copied out under kstat_table_lock. */
+struct sus_kstat_snapshot {
+	unsigned long spoofed_ino;
+	unsigned long spoofed_dev;
+	unsigned int spoofed_nlink;
+	long long spoofed_size;
+	long spoofed_atime_tv_sec;
+	unsigned long spoofed_atime_tv_nsec;
+	long spoofed_mtime_tv_sec;
+	unsigned long spoofed_mtime_tv_nsec;
+	long spoofed_ctime_tv_sec;
+	unsigned long spoofed_ctime_tv_nsec;
+	long long spoofed_blocks;
+	long spoofed_blksize;
+	unsigned int flags;
+};
+
+static void kstat_snapshot(const struct sus_kstat_entry *e,
+			   struct sus_kstat_snapshot *s)
+{
+	s->spoofed_ino = e->spoofed_ino;
+	s->spoofed_dev = e->spoofed_dev;
+	s->spoofed_nlink = e->spoofed_nlink;
+	s->spoofed_size = e->spoofed_size;
+	s->spoofed_atime_tv_sec = e->spoofed_atime_tv_sec;
+	s->spoofed_atime_tv_nsec = e->spoofed_atime_tv_nsec;
+	s->spoofed_mtime_tv_sec = e->spoofed_mtime_tv_sec;
+	s->spoofed_mtime_tv_nsec = e->spoofed_mtime_tv_nsec;
+	s->spoofed_ctime_tv_sec = e->spoofed_ctime_tv_sec;
+	s->spoofed_ctime_tv_nsec = e->spoofed_ctime_tv_nsec;
+	s->spoofed_blocks = e->spoofed_blocks;
+	s->spoofed_blksize = e->spoofed_blksize;
+	s->flags = e->flags;
+}
 
 /* arm64 asm-generic struct stat offsets (native 64-bit) */
 #define ST_DEV_OFF          0
@@ -125,17 +179,37 @@ static DEFINE_MUTEX(kstat_lock);
  * Source: arch/arm64/include/asm/unistd32.h line 667: __NR_fstatat64 327 */
 #define COMPAT_FSTATAT64_NR 327
 
-static struct sus_kstat_entry *susfs_kstat_lookup(unsigned long ino, dev_t dev)
+/* ---- table access ----
+ *
+ * The *_table_* helpers below are the ONLY places that modify kstat_entries or
+ * nkstat, and each one does it under kstat_table_lock.  Their callers hold
+ * kstat_lock, which is what makes the index they pass in stable.
+ */
+
+/* Hot-path lookup: match on (ino, dev) and copy the entry out atomically with
+ * respect to the writers.  Returns true and fills *out on a match. */
+static bool susfs_kstat_lookup(unsigned long ino, dev_t dev,
+			       struct sus_kstat_snapshot *out)
 {
+	unsigned long flags;
+	bool found = false;
 	int i;
 
-	for (i = 0; i < nkstat; i++)
+	spin_lock_irqsave(&kstat_table_lock, flags);
+	for (i = 0; i < nkstat; i++) {
 		if (kstat_entries[i].target_ino == ino &&
-		    kstat_entries[i].target_dev == dev)
-			return &kstat_entries[i];
-	return NULL;
+		    kstat_entries[i].target_dev == dev) {
+			kstat_snapshot(&kstat_entries[i], out);
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&kstat_table_lock, flags);
+	return found;
 }
 
+/* Writer-side lookup by path.  Safe without the spinlock: every caller holds
+ * kstat_lock, and kstat_lock is what serialises all writers. */
 static struct sus_kstat_entry *susfs_kstat_find_by_path(const char *path)
 {
 	int i;
@@ -146,10 +220,81 @@ static struct sus_kstat_entry *susfs_kstat_find_by_path(const char *path)
 	return NULL;
 }
 
+/* Append a fully-prepared entry; -ENOSPC when the table is full. */
+static int kstat_table_append(const struct sus_kstat_entry *src)
+{
+	unsigned long flags;
+	int idx = -1;
+
+	spin_lock_irqsave(&kstat_table_lock, flags);
+	if (nkstat < SUS_KSTAT_MAX) {
+		idx = nkstat;
+		kstat_entries[idx] = *src;
+		nkstat = idx + 1;
+	}
+	spin_unlock_irqrestore(&kstat_table_lock, flags);
+	return idx;
+}
+
+/* Replace a live entry wholesale (update: the reader sees old or new, never a
+ * mix of the two). */
+static void kstat_table_put(int idx, const struct sus_kstat_entry *src)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&kstat_table_lock, flags);
+	if (idx >= 0 && idx < nkstat)
+		kstat_entries[idx] = *src;
+	spin_unlock_irqrestore(&kstat_table_lock, flags);
+}
+
+/* Re-target an entry, and optionally raise its flags. */
+static void kstat_table_retarget(int idx, unsigned long ino, dev_t dev,
+				 unsigned int add_flags)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&kstat_table_lock, flags);
+	if (idx >= 0 && idx < nkstat) {
+		kstat_entries[idx].target_ino = ino;
+		kstat_entries[idx].target_dev = dev;
+		kstat_entries[idx].flags |= add_flags;
+	}
+	spin_unlock_irqrestore(&kstat_table_lock, flags);
+}
+
+/* Remove by index: move the last entry into the hole.  The reader must not be
+ * able to observe that move half-done, hence the lock. */
+static void kstat_table_del(int idx)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&kstat_table_lock, flags);
+	if (idx >= 0 && idx < nkstat) {
+		nkstat--;
+		if (idx != nkstat)
+			kstat_entries[idx] = kstat_entries[nkstat];
+	}
+	spin_unlock_irqrestore(&kstat_table_lock, flags);
+}
+
+static void kstat_table_clear(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&kstat_table_lock, flags);
+	nkstat = 0;
+	spin_unlock_irqrestore(&kstat_table_lock, flags);
+}
+
 /* rewrite the requested fields of the native user statbuf */
 static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
 {
-	struct sus_kstat_entry *e;
+	/* Snapshot, not a pointer into the table: the lookup hands out a private
+	 * copy so a concurrent writer cannot retarget the entry between the match
+	 * and the copy_to_user below (which must not run under a spinlock). */
+	struct sus_kstat_snapshot snap;
+	const struct sus_kstat_snapshot *e = &snap;
 	unsigned long ino = 0, dev = 0;
 	unsigned long v;
 	unsigned int v32;
@@ -161,8 +306,7 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
 	if (copy_from_user(&dev, (void __user *)(statbuf + ST_DEV_OFF), sizeof(dev)))
 		return;
 
-	e = susfs_kstat_lookup(ino, dev);
-	if (!e)
+	if (!susfs_kstat_lookup(ino, dev, &snap))
 		return;
 
 	if (e->flags & KSTAT_SPOOF_INO) {
@@ -230,7 +374,8 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
 /* compat (32-bit) statbuf: struct compat_stat, st_ino is u32 at offset 4 */
 static void susfs_kstat_spoof_compat_statbuf(unsigned long statbuf)
 {
-	struct sus_kstat_entry *e;
+	struct sus_kstat_snapshot snap;
+	const struct sus_kstat_snapshot *e = &snap;
 	unsigned int ino = 0, dev = 0;
 	unsigned int v32;
 	unsigned short v16;
@@ -240,8 +385,7 @@ static void susfs_kstat_spoof_compat_statbuf(unsigned long statbuf)
 		return;
 	if (copy_from_user(&dev, (void __user *)(statbuf + COMPAT_ST_DEV_OFF), sizeof(dev)))
 		return;
-	e = susfs_kstat_lookup(ino, dev);
-	if (!e)
+	if (!susfs_kstat_lookup(ino, dev, &snap))
 		return;
 
 	if (e->flags & KSTAT_SPOOF_INO) {
@@ -350,12 +494,13 @@ static int kr_vfs_getattr_entry(struct kretprobe_instance *ri, struct pt_regs *r
 
 static void susfs_kstat_spoof_kstat(struct inode *inode, struct kstat *stat)
 {
-	struct sus_kstat_entry *e;
+	struct sus_kstat_snapshot snap;
+	const struct sus_kstat_snapshot *e = &snap;
 
 	if (!inode || !stat)
 		return;
-	e = susfs_kstat_lookup(inode->i_ino, new_encode_dev(inode->i_sb->s_dev));
-	if (!e)
+	if (!susfs_kstat_lookup(inode->i_ino, new_encode_dev(inode->i_sb->s_dev),
+				&snap))
 		return;
 	if (e->flags & KSTAT_SPOOF_INO)
 		stat->ino = e->spoofed_ino;
@@ -405,8 +550,33 @@ static struct kretprobe krp_vfs_getattr = {
 
 /* ---- path resolution + rule management (original SUSFS semantics) ---- */
 
+/* resolve <path> to its CURRENT (ino, encoded dev).  Sleeps - never call this
+ * with kstat_table_lock held (writers hold only kstat_lock here). */
+static int susfs_kstat_resolve(const char *path, unsigned long *ino, dev_t *dev)
+{
+	struct path p;
+	struct inode *inode;
+	int err;
+
+	err = kern_path(path, 0, &p);
+	if (err)
+		return err;
+	inode = d_backing_inode(p.dentry);
+	if (!inode) {
+		path_put(&p);
+		return -ENOENT;
+	}
+	*ino = inode->i_ino;
+	*dev = new_encode_dev(inode->i_sb->s_dev);
+	path_put(&p);
+	return 0;
+}
+
 /* resolve <path> and fill the spoofed_* fields with its CURRENT stat
- * (generic_fillattr mapping from the inode fields). */
+ * (generic_fillattr mapping from the inode fields).
+ *
+ * Fills a DETACHED entry only.  Callers build here, then commit through one of
+ * the kstat_table_* helpers; nothing half-built is ever visible to a reader. */
 static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *path)
 {
 	struct path p;
@@ -441,73 +611,62 @@ static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *pat
 	return 0;
 }
 
-/* re-resolve only target_ino/target_dev; spoofed values stay untouched */
-static int susfs_kstat_reresolve(struct sus_kstat_entry *e)
-{
-	struct path p;
-	struct inode *inode;
-	int err;
-
-	err = kern_path(e->target_pathname, 0, &p);
-	if (err)
-		return err;
-	inode = d_backing_inode(p.dentry);
-	if (!inode) {
-		path_put(&p);
-		return -ENOENT;
-	}
-	e->target_ino = inode->i_ino;
-	e->target_dev = new_encode_dev(inode->i_sb->s_dev);
-	path_put(&p);
-	return 0;
-}
-
-static int susfs_kstat_add(const char *path)
-{
-	struct sus_kstat_entry *e;
-	int err;
-
-	e = susfs_kstat_find_by_path(path);
-	if (!e) {
-		if (nkstat >= SUS_KSTAT_MAX)
-			return -ENOSPC;
-		e = &kstat_entries[nkstat];
-		strscpy(e->target_pathname, path, KSTAT_PATH_MAX);
-		nkstat++;
-	}
-
-	err = susfs_kstat_fill_from_path(e, path);
-	if (err)
-		return err;
-	e->flags = KSTAT_AUTO_SPOOF;
-	return 0;
-}
-
+/* re-resolve only target_ino/target_dev; spoofed values stay untouched.
+ * Resolves first (sleeping), then re-targets under the lock: a reader sees the
+ * old pair or the new pair, never ino-of-B with dev-of-A. */
 static int susfs_kstat_update(const char *path, bool full_clone)
 {
 	struct sus_kstat_entry *e;
+	unsigned long ino;
+	dev_t dev;
 	int err;
 
 	e = susfs_kstat_find_by_path(path);
 	if (!e)
 		return -ENOENT;
-	err = susfs_kstat_reresolve(e);
+	err = susfs_kstat_resolve(path, &ino, &dev);
 	if (err)
 		return err;
-	e->flags |= full_clone ? KSTAT_AUTO_SPOOF_FULL_CLONE : KSTAT_AUTO_SPOOF;
+	kstat_table_retarget((int)(e - kstat_entries), ino, dev,
+			     full_clone ? KSTAT_AUTO_SPOOF_FULL_CLONE
+					: KSTAT_AUTO_SPOOF);
 	return 0;
+}
+
+/* add/update a rule from its pathname; kstat_lock held */
+static int susfs_kstat_add(const char *path)
+{
+	struct sus_kstat_entry tmp;
+	struct sus_kstat_entry *e;
+	int err, idx;
+
+	if (strlen(path) >= KSTAT_PATH_MAX)
+		return -ENAMETOOLONG;
+
+	e = susfs_kstat_find_by_path(path);
+
+	memset(&tmp, 0, sizeof(tmp));
+	err = susfs_kstat_fill_from_path(&tmp, path);
+	if (err)
+		return err;
+	strscpy(tmp.target_pathname, path, KSTAT_PATH_MAX);
+	tmp.flags = KSTAT_AUTO_SPOOF;
+
+	if (e) {
+		kstat_table_put((int)(e - kstat_entries), &tmp);
+		return 0;
+	}
+	idx = kstat_table_append(&tmp);
+	return idx < 0 ? -ENOSPC : 0;
 }
 
 static void susfs_kstat_del(const char *path)
 {
-	struct sus_kstat_entry *e;
-	int i;
+	struct sus_kstat_entry *e = susfs_kstat_find_by_path(path);
 
-	e = susfs_kstat_find_by_path(path);
 	if (!e)
 		return;
-	i = (int)(e - kstat_entries);
-	kstat_entries[i] = kstat_entries[--nkstat];
+	kstat_table_del((int)(e - kstat_entries));
 }
 
 /* parse "default" -> *is_default=true, else parse signed 64-bit int */
@@ -525,10 +684,11 @@ static int parse_override(const char *tok, bool *is_default, long long *val)
  * "default". */
 static int susfs_kstat_add_statically(char **argv, int argc)
 {
+	struct sus_kstat_entry tmp;
 	struct sus_kstat_entry *e;
 	long long val;
 	bool dflt;
-	int err, i;
+	int err, i, idx;
 	/* field index -> flag and setter, ordered as the CLI:
 	 * ino dev nlink size atime atime_nsec mtime mtime_nsec
 	 * ctime ctime_nsec blocks blksize */
@@ -542,20 +702,18 @@ static int susfs_kstat_add_statically(char **argv, int argc)
 	};
 	const char *path = argv[1];
 
-	e = susfs_kstat_find_by_path(path);
-	if (!e) {
-		if (nkstat >= SUS_KSTAT_MAX)
-			return -ENOSPC;
-		e = &kstat_entries[nkstat];
-		strscpy(e->target_pathname, path, KSTAT_PATH_MAX);
-		nkstat++;
-	}
+	if (strlen(path) >= KSTAT_PATH_MAX)
+		return -ENAMETOOLONG;
 
+	e = susfs_kstat_find_by_path(path);
+
+	memset(&tmp, 0, sizeof(tmp));
 	/* start from the CURRENT stat; non-default fields override it */
-	err = susfs_kstat_fill_from_path(e, path);
+	err = susfs_kstat_fill_from_path(&tmp, path);
 	if (err)
 		return err;
-	e->flags = 0;
+	strscpy(tmp.target_pathname, path, KSTAT_PATH_MAX);
+	tmp.flags = 0;
 
 	for (i = 0; i < 12; i++) {
 		err = parse_override(argv[2 + i], &dflt, &val);
@@ -563,60 +721,67 @@ static int susfs_kstat_add_statically(char **argv, int argc)
 			return err;
 		if (dflt)
 			continue;
-		e->flags |= f_flags[i];
+		tmp.flags |= f_flags[i];
 		switch (i) {
-		case 0: e->spoofed_ino = (unsigned long)val; break;
-		case 1: e->spoofed_dev = (unsigned long)val; break;
-		case 2: e->spoofed_nlink = (unsigned int)val; break;
-		case 3: e->spoofed_size = val; break;
-		case 4: e->spoofed_atime_tv_sec = (long)val; break;
-		case 5: e->spoofed_atime_tv_nsec = (unsigned long)val; break;
-		case 6: e->spoofed_mtime_tv_sec = (long)val; break;
-		case 7: e->spoofed_mtime_tv_nsec = (unsigned long)val; break;
-		case 8: e->spoofed_ctime_tv_sec = (long)val; break;
-		case 9: e->spoofed_ctime_tv_nsec = (unsigned long)val; break;
-		case 10: e->spoofed_blocks = val; break;
-		case 11: e->spoofed_blksize = (long)val; break;
+		case 0: tmp.spoofed_ino = (unsigned long)val; break;
+		case 1: tmp.spoofed_dev = (unsigned long)val; break;
+		case 2: tmp.spoofed_nlink = (unsigned int)val; break;
+		case 3: tmp.spoofed_size = val; break;
+		case 4: tmp.spoofed_atime_tv_sec = (long)val; break;
+		case 5: tmp.spoofed_atime_tv_nsec = (unsigned long)val; break;
+		case 6: tmp.spoofed_mtime_tv_sec = (long)val; break;
+		case 7: tmp.spoofed_mtime_tv_nsec = (unsigned long)val; break;
+		case 8: tmp.spoofed_ctime_tv_sec = (long)val; break;
+		case 9: tmp.spoofed_ctime_tv_nsec = (unsigned long)val; break;
+		case 10: tmp.spoofed_blocks = val; break;
+		case 11: tmp.spoofed_blksize = (long)val; break;
 		}
 	}
-	return 0;
+
+	if (e) {
+		kstat_table_put((int)(e - kstat_entries), &tmp);
+		return 0;
+	}
+	idx = kstat_table_append(&tmp);
+	return idx < 0 ? -ENOSPC : 0;
 }
 
 /* statically-add from the supercall ABI struct (is_statically=1): copy the
  * caller's 12 spoofed fields + flags verbatim; resolve target ino/dev here. */
 static int susfs_kstat_add_statically_abi(struct st_susfs_sus_kstat *info)
 {
+	struct sus_kstat_entry tmp;
 	struct sus_kstat_entry *e;
-	int err;
+	int err, idx;
 
 	e = susfs_kstat_find_by_path(info->target_pathname);
-	if (!e) {
-		if (nkstat >= SUS_KSTAT_MAX)
-			return -ENOSPC;
-		e = &kstat_entries[nkstat];
-		strscpy(e->target_pathname, info->target_pathname,
-			KSTAT_PATH_MAX);
-		nkstat++;
-	}
 
-	err = susfs_kstat_fill_from_path(e, info->target_pathname);
+	memset(&tmp, 0, sizeof(tmp));
+	err = susfs_kstat_fill_from_path(&tmp, info->target_pathname);
 	if (err)
 		return err;
+	strscpy(tmp.target_pathname, info->target_pathname, KSTAT_PATH_MAX);
 
-	e->spoofed_ino = info->spoofed_ino;
-	e->spoofed_dev = info->spoofed_dev;
-	e->spoofed_nlink = info->spoofed_nlink;
-	e->spoofed_size = info->spoofed_size;
-	e->spoofed_atime_tv_sec = info->spoofed_atime_tv_sec;
-	e->spoofed_atime_tv_nsec = info->spoofed_atime_tv_nsec;
-	e->spoofed_mtime_tv_sec = info->spoofed_mtime_tv_sec;
-	e->spoofed_mtime_tv_nsec = info->spoofed_mtime_tv_nsec;
-	e->spoofed_ctime_tv_sec = info->spoofed_ctime_tv_sec;
-	e->spoofed_ctime_tv_nsec = info->spoofed_ctime_tv_nsec;
-	e->spoofed_blocks = info->spoofed_blocks;
-	e->spoofed_blksize = info->spoofed_blksize;
-	e->flags = info->flags;
-	return 0;
+	tmp.spoofed_ino = info->spoofed_ino;
+	tmp.spoofed_dev = info->spoofed_dev;
+	tmp.spoofed_nlink = info->spoofed_nlink;
+	tmp.spoofed_size = info->spoofed_size;
+	tmp.spoofed_atime_tv_sec = info->spoofed_atime_tv_sec;
+	tmp.spoofed_atime_tv_nsec = info->spoofed_atime_tv_nsec;
+	tmp.spoofed_mtime_tv_sec = info->spoofed_mtime_tv_sec;
+	tmp.spoofed_mtime_tv_nsec = info->spoofed_mtime_tv_nsec;
+	tmp.spoofed_ctime_tv_sec = info->spoofed_ctime_tv_sec;
+	tmp.spoofed_ctime_tv_nsec = info->spoofed_ctime_tv_nsec;
+	tmp.spoofed_blocks = info->spoofed_blocks;
+	tmp.spoofed_blksize = info->spoofed_blksize;
+	tmp.flags = info->flags;
+
+	if (e) {
+		kstat_table_put((int)(e - kstat_entries), &tmp);
+		return 0;
+	}
+	idx = kstat_table_append(&tmp);
+	return idx < 0 ? -ENOSPC : 0;
 }
 
 /* supercall: CMD_SUSFS_ADD_SUS_KSTAT / UPDATE / STATICALLY */
@@ -627,6 +792,14 @@ void susfs_kstat_supercall(unsigned int cmd, void __user **arg)
 
 	if (copy_from_user(&info, (void __user *)*arg, sizeof(info))) {
 		info.err = -EFAULT;
+		goto out;
+	}
+
+	/* All three commands key on target_pathname, and a caller may fill all 256
+	 * bytes of that field - reject an unterminated one before any strlen() or
+	 * kern_path() can walk off our stack copy of the struct. */
+	if (!susfs_abi_path_ok(info.target_pathname, sizeof(info.target_pathname))) {
+		info.err = -ENAMETOOLONG;
 		goto out;
 	}
 
@@ -678,29 +851,11 @@ int susfs_kstat_init(void)
 {
 	int rc;
 
-	/* Not created unless asked for: see susfs_expose_proc. */
-	if (!susfs_expose_proc) {
-		pr_info("susfs_kstat: /proc node disabled (expose_proc=0)\n");
-		return 0;
-	}
-
-	/* 0777 is deliberate, not an oversight.  inode_permission() runs the DAC
-	 * check BEFORE security_inode_permission(), so a node the app cannot open
-	 * hands it EACCES - "this exists, you may not read it" - instead of the
-	 * ENOENT sus_path is supposed to produce.  0777 lets DAC pass and leaves
-	 * the answer to sus_path's LSM layer.
-	 *
-	 * That makes the LSM layer the ONLY thing between an app and a
-	 * world-writable control node, so without it we do not create the node. */
-	if (!sus_path_lsm_active()) {
-		pr_err("susfs_kstat: sus_path LSM layer inactive - NOT creating a 0777 node\n");
-		return 0;
-	}
-
-	kstat_proc_entry = proc_create("susfs_kstat", 0777, NULL, &kstat_proc_ops);
-	if (!kstat_proc_entry)
-		pr_warn("proc_create(susfs_kstat) failed\n");
-
+	/* The hooks are armed UNCONDITIONALLY, and that is not cosmetic: the
+	 * supercall interface (CMD_SUSFS_ADD_SUS_KSTAT) can install rules with no
+	 * /proc node at all, so skipping registration when expose_proc=0 silently
+	 * turned the whole feature into a no-op - rules accepted, never applied.
+	 * expose_proc decides whether the node exists, nothing else. */
 	rc = register_trace_sys_exit(kstat_sys_exit, NULL);
 	if (rc)
 		pr_warn("register_trace_sys_exit failed %d\n", rc);
@@ -713,7 +868,28 @@ int susfs_kstat_init(void)
 	else
 		kstat_krp_registered = true;
 
-	pr_info("kstat armed: %d rules (proc: /proc/susfs_kstat)\n", nkstat);
+	/* 0777 is deliberate, not an oversight.  inode_permission() runs the DAC
+	 * check BEFORE security_inode_permission(), so a node the app cannot open
+	 * hands it EACCES - "this exists, you may not read it" - instead of the
+	 * ENOENT sus_path is supposed to produce.  0777 lets DAC pass and leaves
+	 * the answer to sus_path's LSM layer.
+	 *
+	 * That makes the LSM layer the ONLY thing between an app and a
+	 * world-writable control node, so without it we do not create the node -
+	 * see susfs_control_node_allowed(). */
+	if (susfs_control_node_allowed()) {
+		kstat_proc_entry = proc_create("susfs_kstat", 0777, NULL,
+					       &kstat_proc_ops);
+		if (!kstat_proc_entry)
+			pr_warn("proc_create(susfs_kstat) failed\n");
+	} else {
+		pr_info("susfs_kstat: /proc node not created (expose_proc=%d lsm=%d)\n",
+			(int)susfs_expose_proc, (int)sus_path_lsm_active());
+	}
+
+	pr_info("kstat armed: %d rules (tp=%d krp=%d proc=%d)\n", nkstat,
+		kstat_tp_registered, kstat_krp_registered,
+		kstat_proc_entry != NULL);
 	return 0;
 }
 
@@ -732,7 +908,7 @@ void susfs_kstat_exit(void)
 		proc_remove(kstat_proc_entry);
 		kstat_proc_entry = NULL;
 	}
-	nkstat = 0;
+	kstat_table_clear();
 }
 
 static int kstat_proc_show(struct seq_file *m, void *v)
@@ -821,7 +997,7 @@ static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
 		susfs_kstat_del(argv[1]);
 		err = 0;
 	} else if (!strcmp(argv[0], "clear")) {
-		nkstat = 0;
+		kstat_table_clear();
 		err = 0;
 	}
 

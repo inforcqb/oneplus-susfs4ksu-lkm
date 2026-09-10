@@ -65,24 +65,21 @@ static struct proc_dir_entry *log_proc_entry;
 
 int susfs_enable_log_init(void)
 {
-	/* Not created unless asked for: see susfs_expose_proc. */
-	if (!susfs_expose_proc) {
-		pr_info("susfs_enable_log: /proc node disabled (expose_proc=0)\n");
-		return 0;
+	/* Nothing to register here - logging is toggled over the supercall or by
+	 * this node - so the node is the only thing to gate.  See
+	 * susfs_control_node_allowed(): 0777 so DAC passes and sus_path's LSM
+	 * layer gets to answer ENOENT. */
+	if (susfs_control_node_allowed()) {
+		log_proc_entry = proc_create("susfs_enable_log", 0777, NULL,
+					     &log_proc_ops);
+		if (!log_proc_entry)
+			pr_warn("proc_create(susfs_enable_log) failed\n");
+		else
+			pr_info("susfs_enable_log: armed (proc: /proc/susfs_enable_log)\n");
+	} else {
+		pr_info("susfs_enable_log: /proc node not created (expose_proc=%d lsm=%d)\n",
+			(int)susfs_expose_proc, (int)sus_path_lsm_active());
 	}
-
-	/* 0777 so DAC passes and sus_path's LSM layer gets to answer ENOENT;
-	 * see the long note in susfs_kstat.c. */
-	if (!sus_path_lsm_active()) {
-		pr_err("susfs_enable_log: sus_path LSM layer inactive - NOT creating a 0777 node\n");
-		return 0;
-	}
-
-	log_proc_entry = proc_create("susfs_enable_log", 0777, NULL, &log_proc_ops);
-	if (!log_proc_entry)
-		pr_warn("proc_create(susfs_enable_log) failed\n");
-	else
-		pr_info("susfs_enable_log: armed (proc: /proc/susfs_enable_log)\n");
 	return 0;
 }
 
