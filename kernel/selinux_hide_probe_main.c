@@ -63,6 +63,20 @@
 static int susfs_test_inode_getattr(const struct path *path);
 static int susfs_test_inode_permission(struct inode *inode, int mask);
 
+/* Compile-time proof that both signatures match what the kernel actually calls
+ * through the hook.  kCFI compares type hashes, so a mismatch is a hard panic at
+ * runtime; this turns that into a build failure instead of another reboot.  The
+ * types are taken from the kernel's own union security_list_options, so they are
+ * authoritative for whichever kernel we build against - no guessing. */
+#define LSM_HOOK_FN_TYPE(member) typeof(((union security_list_options *)0)->member)
+
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_getattr),
+					   typeof(susfs_test_inode_getattr)),
+	      "inode_getattr hook signature mismatch");
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_permission),
+					   typeof(susfs_test_inode_permission)),
+	      "inode_permission hook signature mismatch");
+
 static struct ksu_lsm_hook getattr_hook = KSU_LSM_HOOK_INIT(
 	inode_getattr, "selinux_inode_getattr",
 	(void *)susfs_test_inode_getattr, 0);
