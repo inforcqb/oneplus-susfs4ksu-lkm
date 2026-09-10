@@ -109,14 +109,16 @@ struct st_susfs_sus_kstat {
 	unsigned long spoofed_dev;
 	unsigned int spoofed_nlink;
 	long long spoofed_size;
+	/* EXPERIMENT: field order taken from the prebuilt ksu_susfs tool's own
+	 * payload dump (sec trio, then nsec trio, blksize before blocks). */
 	long spoofed_atime_tv_sec;
-	unsigned long spoofed_atime_tv_nsec;
 	long spoofed_mtime_tv_sec;
-	unsigned long spoofed_mtime_tv_nsec;
 	long spoofed_ctime_tv_sec;
+	unsigned long spoofed_atime_tv_nsec;
+	unsigned long spoofed_mtime_tv_nsec;
 	unsigned long spoofed_ctime_tv_nsec;
-	long long spoofed_blocks;
 	long spoofed_blksize;
+	long long spoofed_blocks;
 	int flags;
 	int err;
 };
