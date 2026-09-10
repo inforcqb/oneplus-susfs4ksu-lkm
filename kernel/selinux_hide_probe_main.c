@@ -48,20 +48,20 @@
 
 #include "lsm_hook.h"
 
-/* __nocfi is MANDATORY.  The LSM hook slot is invoked through a function pointer
- * under CFI, and we invoke the original through a function pointer as well.
- * Without it the kernel panics hard:
- *   "Kernel panic - not syncing: CFI failure
- *      (target: susfs_test_inode_permission.cfi_jt+0x0/0x8 [selinux_hide_probe])"
- * lsm_hook.c documents exactly the same requirement: "an __nocfi replacement".
+/* Type signature MUST match the LSM hook type exactly, and must NOT be __nocfi.
  *
- * The permission hook takes generic pointers and forwards them to the original
- * in the SAME register order, so the exact LSM hook type does not matter - be it
- * int(inode, mask) or int(mnt_userns, inode, mask), no argument is reordered or
- * reinterpreted.  Only pointer identity is compared, which cannot fault no
- * matter what the arguments really are. */
-static int __nocfi susfs_test_inode_getattr(const struct path *path);
-static int __nocfi susfs_test_inode_permission(void *a0, void *a1, void *a2, void *a3);
+ * Measured on this device: this kernel uses kCFI with cross-module checks.  The
+ * kernel's call site compares the callee's CFI type hash, so
+ *   - a mismatched signature  -> "CFI failure (target: ...cfi_jt)";
+ *   - a __nocfi function      -> no type hash at all -> __cfi_check_fail as well.
+ * (KernelSU's __nocfi advice assumes a non-kCFI or same-module setup.)
+ *
+ * The permission hook therefore uses the 5.15 LSM type int(inode, mask) - the
+ * mnt_userns parameter only reached the LSM hook in 6.3.  The build prints the
+ * authoritative declaration from the DDK headers so this can be verified rather
+ * than guessed. */
+static int susfs_test_inode_getattr(const struct path *path);
+static int susfs_test_inode_permission(struct inode *inode, int mask);
 
 static struct ksu_lsm_hook getattr_hook = KSU_LSM_HOOK_INIT(
 	inode_getattr, "selinux_inode_getattr",
@@ -87,7 +87,7 @@ static inline bool gated(void)
 	return gate_apps_only && current_uid().val < 10000;
 }
 
-static int __nocfi susfs_test_inode_getattr(const struct path *path)
+static int susfs_test_inode_getattr(const struct path *path)
 {
 	int (*orig)(const struct path *path) = (void *)getattr_hook.original;
 	struct inode *inode;
@@ -106,24 +106,19 @@ static int __nocfi susfs_test_inode_getattr(const struct path *path)
 	return orig(path);
 }
 
-static int __nocfi susfs_test_inode_permission(void *a0, void *a1, void *a2, void *a3)
+static int susfs_test_inode_permission(struct inode *inode, int mask)
 {
-	int (*orig)(void *, void *, void *, void *) = (void *)perm_hook.original;
+	int (*orig)(struct inode *, int) = (void *)perm_hook.original;
 
-	if (READ_ONCE(armed)) {
-		void *t = READ_ONCE(target_inode);
-
-		if ((a0 == t || a1 == t || a2 == t || a3 == t) && !gated()) {
-			atomic_inc(&n_hidden_perm);
-			return -ENOENT;
-		}
+	if (READ_ONCE(armed) && inode == READ_ONCE(target_inode) && !gated()) {
+		atomic_inc(&n_hidden_perm);
+		return -ENOENT;
 	}
 	if (!orig) {
 		atomic_inc(&n_orig_missing);
 		return 0;
 	}
-	/* forward in the original register order - signature agnostic */
-	return orig(a0, a1, a2, a3);
+	return orig(inode, mask);
 }
 
 static int probe_show(struct seq_file *m, void *v)

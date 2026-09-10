@@ -25,6 +25,21 @@ jobs:
           echo "CLANG_PATH=$CLANG_PATH"
           clang --version | head -1
 
+      # kCFI checks the callee's type hash at the call site, so an LSM hook
+      # replacement must match the hook type EXACTLY (and must not be __nocfi).
+      # Print the authoritative declarations instead of guessing them.
+      - name: Show authoritative LSM hook signatures
+        run: |
+          H=$KERNEL_SRC/include/linux/lsm_hooks.h
+          echo "=== header: $H ==="
+          echo "--- inode_permission ---"
+          grep -n -B3 -A3 "inode_permission)" "$H" || true
+          echo "--- inode_getattr ---"
+          grep -n -B2 -A2 "inode_getattr)" "$H" || true
+          echo "--- selinux impls ---"
+          grep -n -A4 "^static int selinux_inode_permission" "$KERNEL_SRC/security/selinux/hooks.c" || true
+          grep -n -A3 "^static int selinux_inode_getattr" "$KERNEL_SRC/security/selinux/hooks.c" || true
+
       - name: Build susfs_guard_lkm.ko (DDK way)
         run: |
           set -e
