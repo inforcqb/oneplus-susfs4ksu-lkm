@@ -69,5 +69,6 @@ jobs:
             kernel/inode_perm_probe_test.ko
             kernel/enoent_probe_test.ko
             kernel/selinux_probe_test.ko
+            kernel/selinux_hide_probe.ko
             test_sc
           if-no-files-found: error
