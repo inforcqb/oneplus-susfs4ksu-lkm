@@ -1,29 +1,34 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * selinux_hide_probe.c - make stat() report ENOENT for one inode, via LSM.
+ * selinux_hide_probe_main.c - make ALL path-based access report ENOENT, via LSM.
  *
- * Why this hook and not a kprobe:
+ * Background (all measured on this device, see TECHNICAL_NOTES.md):
  *
- *   - inode_permission() survives LTO but cannot hide a file from stat - Linux
- *     checks execute permission only on the directories along a path, never on
- *     the final target (measured: 178 newfstatat vs 34 inode_permission hits).
- *   - kprobes on the hot SELinux paths work but are far too expensive:
- *     selinux_inode_permission/avc_has_perm run hundreds of thousands of times
- *     per second, and a 7-probe version of this test froze the device.
- *   - The project already links lsm_hook.c (KernelSU's runtime security_hook
- *     replacement).  Patching the hook slot costs nothing per call and hands us
- *     the struct inode directly.
+ *   - inode_permission() survives LTO but cannot hide a file from stat: Linux
+ *     only checks execute permission on the directories along a path, never on
+ *     the final target (178 __arm64_sys_newfstatat hits vs 34 inode_permission
+ *     hits, and those 34 are directory checks).
+ *   - kprobes on the SELinux paths work but are too expensive: a 7-probe build
+ *     froze the device, because selinux_inode_permission/avc_has_perm run
+ *     hundreds of thousands of times per second.
+ *   - The project already links lsm_hook.c (KernelSU runtime security_hook
+ *     replacement): one slot patch, zero per-call cost.
  *
- * vfs_getattr() calls security_inode_getattr() before it ever looks at the
- * inode, so this is on the path of every stat/fstatat/statx - with SELinux
- * enforcing it is unavoidable for a caller, regardless of DAC.
+ * Two hooks cover everything, without enumerating a single syscall:
  *
- * Matching on the inode pointer covers '..', duplicate slashes, symlinks, hard
- * links, bind mounts and /proc/self/fd/N: none of them can dodge inode identity.
+ *   inode_getattr      <- vfs_getattr() calls security_inode_getattr() before it
+ *                         looks at the inode: stat/fstatat/statx
+ *   inode_permission   <- every path-based operation: open/exec/unlink/chmod/
+ *                         truncate/chdir/readdir/...
  *
- * Only inode_getattr is hooked here on purpose: it does not take part in any
- * permission decision, so a mistake can only affect stat - unlike
- * inode_permission, where a wrong hook would disable SELinux enforcement.
+ * Matching is on the inode pointer, so '..', '//', './', relative paths,
+ * symlinks (followed), hard links, bind mounts and /proc/self/root/... are all
+ * covered.
+ *
+ * Neither hook dereferences the inode it is handed, so an unexpected argument
+ * layout degrades to "never matches" instead of crashing.  Both always forward
+ * to the original SELinux implementation when not hiding, so enforcement is
+ * untouched.
  *
  *   echo 'arm /path/to/hide' > /proc/susfs_hide_probe
  *   cat  /proc/susfs_hide_probe
@@ -42,47 +47,103 @@
 #include <linux/string.h>
 #include <linux/sched.h>
 #include <linux/atomic.h>
+#include <linux/user_namespace.h>
 
 #include "lsm_hook.h"
 
 static int susfs_test_inode_getattr(const struct path *path);
+static int susfs_test_inode_permission(struct user_namespace *mnt_userns,
+				       struct inode *inode, int mask);
 
 static struct ksu_lsm_hook getattr_hook = KSU_LSM_HOOK_INIT(
 	inode_getattr, "selinux_inode_getattr",
 	(void *)susfs_test_inode_getattr, 0);
 
+static struct ksu_lsm_hook perm_hook = KSU_LSM_HOOK_INIT(
+	inode_permission, "selinux_inode_permission",
+	(void *)susfs_test_inode_permission, 0);
+
 static struct inode *target_inode;	/* ihold'ed while armed */
 static bool armed;
-static int gate_apps_only;		/* off for the experiment */
+static int gate_apps_only;		/* off by default for the experiment */
 module_param(gate_apps_only, int, 0644);
 
-static atomic_t n_calls = ATOMIC_INIT(0);
-static atomic_t n_hidden = ATOMIC_INIT(0);
-static atomic_t n_orig = ATOMIC_INIT(0);
-static atomic_t n_no_orig = ATOMIC_INIT(0);
+/* Counters are only touched on a hit: inode_permission runs hundreds of
+ * thousands of times per second and an atomic_inc there costs real time. */
+static atomic_t n_hidden_getattr = ATOMIC_INIT(0);
+static atomic_t n_hidden_perm = ATOMIC_INIT(0);
+static atomic_t n_orig_missing = ATOMIC_INIT(0);
+
+/* Pointer comparison only - never dereference, so a wrong argument layout is
+ * harmless. */
+static inline bool is_hidden(struct inode *inode)
+{
+	if (!READ_ONCE(armed) || inode != READ_ONCE(target_inode))
+		return false;
+	if (gate_apps_only && current_uid().val < 10000)
+		return false;
+	return true;
+}
 
 static int susfs_test_inode_getattr(const struct path *path)
 {
 	int (*orig)(const struct path *path) = (void *)getattr_hook.original;
 	struct inode *inode;
 
-	atomic_inc(&n_calls);
-
-	if (armed && !(gate_apps_only && current_uid().val < 10000)) {
-		inode = path && path->dentry ? d_inode(path->dentry) : NULL;
-		if (inode && inode == target_inode) {
-			atomic_inc(&n_hidden);
-			return -ENOENT;
-		}
+	inode = (path && path->dentry) ? d_inode(path->dentry) : NULL;
+	if (is_hidden(inode)) {
+		atomic_inc(&n_hidden_getattr);
+		return -ENOENT;
 	}
-
 	if (!orig) {
-		atomic_inc(&n_no_orig);
+		atomic_inc(&n_orig_missing);
 		return 0;
 	}
-	atomic_inc(&n_orig);
 	return orig(path);
 }
+
+static int susfs_test_inode_permission(struct user_namespace *mnt_userns,
+				       struct inode *inode, int mask)
+{
+	int (*orig)(struct user_namespace *, struct inode *, int) =
+		(void *)perm_hook.original;
+
+	if (is_hidden(inode)) {
+		atomic_inc(&n_hidden_perm);
+		return -ENOENT;
+	}
+	if (!orig) {
+		atomic_inc(&n_orig_missing);
+		return 0;
+	}
+	return orig(mnt_userns, inode, mask);
+}
+
+static int probe_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "getattr hook: %s -> %s entry=%s orig=%ps\n",
+		   getattr_hook.head_name ?: "?", getattr_hook.target_name ?: "?",
+		   getattr_hook.entry ? "patched" : "NOT-PATCHED",
+		   getattr_hook.original);
+	seq_printf(m, "perm    hook: %s -> %s entry=%s orig=%ps\n",
+		   perm_hook.head_name ?: "?", perm_hook.target_name ?: "?",
+		   perm_hook.entry ? "patched" : "NOT-PATCHED",
+		   perm_hook.original);
+	seq_printf(m, "hidden: getattr=%d perm=%d  orig_missing=%d\n",
+		   atomic_read(&n_hidden_getattr), atomic_read(&n_hidden_perm),
+		   atomic_read(&n_orig_missing));
+	seq_printf(m, "armed=%s gate_apps_only=%d target=%s\n",
+		   armed ? "yes" : "no", gate_apps_only,
+		   target_inode ? "set" : "none");
+	return 0;
+}
+
+static int probe_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, probe_show, NULL);
+}
+
+static void hide_disarm(void);
 
 static void hide_arm(const char *path)
 {
@@ -104,38 +165,24 @@ static void hide_arm(const char *path)
 	target_inode = inode;
 	ihold(target_inode);
 	path_put(&p);
-	armed = true;
-	pr_info("selinux_hide_probe: ARMED for %s (ino=%lu)\n", path, target_inode->i_ino);
+
+	atomic_set(&n_hidden_getattr, 0);
+	atomic_set(&n_hidden_perm, 0);
+	WRITE_ONCE(armed, true);
+	pr_info("selinux_hide_probe: ARMED %s (ino=%lu) getattr=%s perm=%s\n",
+		path, target_inode->i_ino,
+		getattr_hook.entry ? "on" : "off",
+		perm_hook.entry ? "on" : "off");
 }
 
 static void hide_disarm(void)
 {
-	armed = false;
+	WRITE_ONCE(armed, false);
 	if (target_inode) {
 		iput(target_inode);
 		target_inode = NULL;
 	}
 	pr_info("selinux_hide_probe: disarmed\n");
-}
-
-static int probe_show(struct seq_file *m, void *v)
-{
-	seq_printf(m, "hook: %s -> %s  entry=%s original=%ps\n",
-		   getattr_hook.head_name ?: "?", getattr_hook.target_name ?: "?",
-		   getattr_hook.entry ? "patched" : "NOT-PATCHED",
-		   getattr_hook.original);
-	seq_printf(m, "calls=%d hidden=%d orig_called=%d orig_missing=%d\n",
-		   atomic_read(&n_calls), atomic_read(&n_hidden),
-		   atomic_read(&n_orig), atomic_read(&n_no_orig));
-	seq_printf(m, "armed=%s gate_apps_only=%d target=%s\n",
-		   armed ? "yes" : "no", gate_apps_only,
-		   target_inode ? "set" : "none");
-	return 0;
-}
-
-static int probe_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, probe_show, NULL);
 }
 
 static ssize_t probe_write(struct file *file, const char __user *buf,
@@ -152,12 +199,7 @@ static ssize_t probe_write(struct file *file, const char __user *buf,
 		       cmd[len - 1] == ' '))
 		cmd[--len] = 0;
 
-	if (!strcmp(cmd, "reset")) {
-		atomic_set(&n_calls, 0);
-		atomic_set(&n_hidden, 0);
-		atomic_set(&n_orig, 0);
-		atomic_set(&n_no_orig, 0);
-	} else if (!strcmp(cmd, "disarm")) {
+	if (!strcmp(cmd, "disarm")) {
 		hide_disarm();
 	} else if (!strncmp(cmd, "arm ", 4)) {
 		hide_arm(cmd + 4);
@@ -182,12 +224,18 @@ static int __init selinux_hide_probe_init(void)
 	ksu_lsm_hook_init();
 
 	rc = ksu_register_lsm_hook(&getattr_hook);
-	if (rc) {
-		pr_warn("selinux_hide_probe: ksu_register_lsm_hook failed %d\n", rc);
-		return rc;
-	}
-	pr_info("selinux_hide_probe: hook installed, original=%ps\n",
-		getattr_hook.original);
+	if (rc)
+		pr_warn("selinux_hide_probe: getattr hook failed %d\n", rc);
+	else
+		pr_info("selinux_hide_probe: getattr hook on, orig=%ps\n",
+			getattr_hook.original);
+
+	rc = ksu_register_lsm_hook(&perm_hook);
+	if (rc)
+		pr_warn("selinux_hide_probe: perm hook failed %d\n", rc);
+	else
+		pr_info("selinux_hide_probe: perm hook on, orig=%ps\n",
+			perm_hook.original);
 
 	proc_entry = proc_create("susfs_hide_probe", 0666, NULL, &probe_ops);
 	if (!proc_entry)
@@ -200,6 +248,8 @@ static void __exit selinux_hide_probe_exit(void)
 	hide_disarm();
 	if (proc_entry)
 		proc_remove(proc_entry);
+	if (perm_hook.entry)
+		ksu_unregister_lsm_hook(&perm_hook);
 	if (getattr_hook.entry)
 		ksu_unregister_lsm_hook(&getattr_hook);
 	ksu_lsm_hook_exit();
@@ -209,4 +259,4 @@ static void __exit selinux_hide_probe_exit(void)
 module_init(selinux_hide_probe_init);
 module_exit(selinux_hide_probe_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("LSM inode_getattr ENOENT test");
+MODULE_DESCRIPTION("LSM getattr+permission ENOENT hide test");
