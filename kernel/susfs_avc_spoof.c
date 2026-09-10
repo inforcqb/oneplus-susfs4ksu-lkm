@@ -31,6 +31,7 @@
 #include <linux/string.h>
 #include "susfs_abi.h"
 #include "susfs_log.h"
+#include "susfs.h"	/* susfs_expose_proc */
 
 /* module_param overrides for the two domains.
  * Default su domain is the SukiSU variant ("ksu"); stock KernelSU uses "su".

@@ -17,6 +17,21 @@
 
 #define SUSFS_LKM_VERSION "2.3.0-gki"
 
+/* The /proc/susfs_* control nodes exist so the module can be configured without
+ * depending on a userspace tool whose ABI may not match.
+ *
+ * They are hidden from app processes with our OWN sus_path feature (see
+ * susfs_self_hide_nodes below): an app then gets "No such file or directory",
+ * whereas 0600 alone would give "Permission denied" - which advertises that the
+ * file exists and is merely off limits.  Root and shell keep full access, the
+ * same gate every other sus_path entry uses.
+ *
+ * Set expose_proc=0 to not create them at all.
+ *
+ * Declared here, before susfs_self_hide_nodes(), which reads it. */
+bool susfs_expose_proc = true;
+module_param_named(expose_proc, susfs_expose_proc, bool, 0600);
+
 /* Our own control nodes.  Hidden from app processes by sus_path below. */
 static const char *const susfs_self_hide_paths[] = {
     "/proc/susfs_kstat",
@@ -49,19 +64,6 @@ static void susfs_self_hide_nodes(void)
                     susfs_self_hide_paths[i], rc);
     }
 }
-
-/* The /proc/susfs_* control nodes exist so the module can be configured without
- * depending on a userspace tool whose ABI may not match.
- *
- * They are hidden from app processes with our OWN sus_path feature (see
- * susfs_self_hide_nodes below): an app then gets "No such file or directory",
- * whereas 0600 alone would give "Permission denied" - which advertises that the
- * file exists and is merely off limits.  Root and shell keep full access, the
- * same gate every other sus_path entry uses.
- *
- * Set expose_proc=0 to not create them at all. */
-bool susfs_expose_proc = true;
-module_param_named(expose_proc, susfs_expose_proc, bool, 0600);
 
 static int __init susfs_init(void)
 {

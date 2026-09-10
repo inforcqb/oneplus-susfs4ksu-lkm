@@ -50,6 +50,7 @@
 #include <linux/kdev_t.h>
 #include "susfs_abi.h"
 #include "susfs_log.h"
+#include "susfs.h"	/* susfs_expose_proc */
 
 /* KSTAT_SPOOF_* bits now live in susfs_abi.h (upstream declares them in
  * susfs.h next to struct st_susfs_sus_kstat).  KSTAT_AUTO_SPOOF* below are

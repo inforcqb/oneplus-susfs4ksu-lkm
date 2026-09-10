@@ -15,6 +15,7 @@
 #include <linux/uaccess.h>
 #include "susfs_abi.h"
 #include "susfs_log.h"
+#include "susfs.h"	/* susfs_expose_proc */
 
 static bool log_enabled;
 

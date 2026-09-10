@@ -44,6 +44,7 @@
 #include <linux/uaccess.h>
 #include "susfs_abi.h"
 #include "susfs_log.h"
+#include "susfs.h"	/* susfs_expose_proc */
 
 #define SUS_OR_MAX 64
 #define OR_PATH_MAX 128
