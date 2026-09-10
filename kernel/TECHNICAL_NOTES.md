@@ -190,7 +190,9 @@ syscall(SYS_reboot, 0xDEADBEEF, 0xFAFAFAFA, cmd_id, &mut payload)
   0xFAFAFAFA 互不干扰，两个 kprobe 可共存。
 
 验证方式：设备上 `ksud susfs version/status/features` 直接探测（返回 v2.3.0 /
-true / 8 个 feature），功能命令用 no-libc 的 C 程序 `test_sc` 发 reboot syscall。
+true / 9 个 feature），功能命令用 no-libc 的 C 程序 `test_sc` 发 reboot syscall。
+**注意 feature 列表现在是动态的**：条目带 `active()` 检查，注册失败的项不再上报
+（`hide_syms` 曾静默失败却仍宣称 `HIDE_KSU_SUSFS_SYMBOLS`，那是最容易被抓的矛盾）。
 
 **A/B 陷阱**：上游 SUSFS_VERSION 是 "v2.3.0"、SUSFS_VARIANT 是 "GKI"（大写），
 别照搬 sidex15 模块 README 里的 "1.5.2"（那是另一套 SUSFS 版本体系）。
@@ -255,17 +257,20 @@ nsec 三连排，且 blksize 在 blocks 之前），因此它对 kstat/open_redi
 `CMD_SUSFS_ADD_SUS_PATH_LOOP` 直接走同一路径：上游 `_LOOP` 只是"zygote 起 app 后重新
 打一次 inode flag"，本 LKM 的链表常驻、匹配无条件，两者天然等价。
 
-与上游的唯一行为差异：上游 `susfs_is_inode_sus_path()` 有
-`susfs_is_current_proc_umounted_app()` 门控，即**只有 app 进程**看不到该条目（root /
-adb shell 仍看得到）。本 LKM 无条件隐藏，root 也看不到——对本 LKM 的使用场景更符合
-直觉（用户就是要在自己的 root shell 里确认隐藏生效）。若将来需要严格对齐，把门控加回
-`sus_path_is_hidden()` 入口即可。
+与上游的差异（**本段 2026-09-10 更正**，旧版写的是"本 LKM 无条件隐藏、root 也看不到"，
+那已经不对了）：本 LKM 用 `hide_from_apps`（默认 1）复刻上游语义 —— 只有
+`uid >= 10000` 的进程受影响，且不隐藏调用者自己拥有的文件；root / adb shell 照常可见。
+与上游的唯一实质差距是 **没有 `TIF_PROC_UMOUNTED`**（设备内核没有编译 SUSFS 集成，
+实测 `grep -c susfs /proc/kallsyms` = 0，该 thread flag 永远不会置位），所以用
+"uid >= 10000" 做代理。`hide_from_apps=0` 则整体绕过门控（测试用）。
 
 调试用只读参数 `hide_list` 可打印当前所有已注册条目（`dev/ino/name`）。
+**权限是 0400 而不是 0444**：它列出了每一条被隐藏的路径，绝不能让 app 读到；
+里面也不再打印 inode 指针（`%px`），那等于把内核地址送出去。
 
 ### 与上游的能力鸿沟：上游会返回 -ENOENT，LKM 不会
 
-**上游 `sus_path` 是双层的**，patch 了 `fs/namei.c` 三处（见
+**上游 `sus_path` 是双层的**，patch 了 `fs/namei.c` **16 个 hunk**（见
 `kernel_patches/50_add_susfs_in_gki-android13-5.15.patch`）：
 
 1. `link_path_walk()`：路径中间组件命中 sus_path 时

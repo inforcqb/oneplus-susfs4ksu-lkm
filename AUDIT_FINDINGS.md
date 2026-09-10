@@ -1,5 +1,21 @@
 # SUSFS-LKM 审计发现（2026-09-10，逐函数级扫描）
 
+> **修复状态（commit `b9b0a2a`，真机验证通过）**
+>
+> 已修：P0 全部 5 条（0600 控制节点 / 0400 `hide_list` + 去 `%px` /
+> 动态 `enabled_features` / supercall init 失败即拒绝加载 / 未识别命令）；
+> P2 两条最便宜的（`show_vfsmnt` 补挂、compat getdents64）；
+> P4 两处文档错误（`mnt_alloc_id`、ctime typo）。
+>
+> 真机验证：控制节点 `-rw-------`；`hide_list` `-r--------` 且无内核指针；
+> app(uid 10378) 读两者均 Permission denied；app 视角 stat/cat 均 ENOENT 而
+> root 正常；临时把 `min_mnt_id` 设成 max(37270) 后 **mountinfo / mounts /
+> mountstats 三者同时 238→237**（证明 `show_vfsmnt` 生效），恢复后回到 238。
+>
+> **未修**（按优先级见 C 节）：P1 全部内存安全问题、P2 其余（sus_mount 域门控
+> 与阈值、sus_kstat 的 maps/门控、sus_map、open_redirect 反向伪装、
+> `_LOOP`）、P3 细节。
+
 对比基准：`susfs4ksu/kernel_patches/`（builtin，v2.3.0）
 被审计对象：`susfs4ksu-lkm/kernel/`
 
