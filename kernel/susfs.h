@@ -2,6 +2,15 @@
 #ifndef __SUSFS_H
 #define __SUSFS_H
 
+/* Add a path to sus_path's hidden set from kernel code (no supercall needed).
+ * Used to self-hide the /proc control nodes.  Returns 0 or a negative errno. */
+int sus_path_add_hidden(const char *path);
+
+/* Whether the /proc/susfs_* control nodes are created at all.  They are hidden
+ * from apps by sus_path either way; this only decides whether they exist for
+ * root.  Defined in susfs_main.c. */
+extern bool susfs_expose_proc;
+
 /* feature init/exit (each feature is its own translation unit) */
 int susfs_uname_init(void);
 void susfs_uname_exit(void);

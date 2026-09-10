@@ -170,6 +170,12 @@ static struct proc_dir_entry *or_proc_entry;
 
 int susfs_open_redirect_init(void)
 {
+	/* Not created unless asked for: see susfs_expose_proc. */
+	if (!susfs_expose_proc) {
+		pr_info("susfs_open_redirect: /proc node disabled (expose_proc=0)\n");
+		return 0;
+	}
+
 	/* 0600: the listing exposes both paths of every redirect rule. */
 	or_proc_entry = proc_create("susfs_open_redirect", 0600, NULL, &or_proc_ops);
 	if (!or_proc_entry)

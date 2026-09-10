@@ -677,6 +677,12 @@ int susfs_kstat_init(void)
 {
 	int rc;
 
+	/* Not created unless asked for: see susfs_expose_proc. */
+	if (!susfs_expose_proc) {
+		pr_info("susfs_kstat: /proc node disabled (expose_proc=0)\n");
+		return 0;
+	}
+
 	/* 0600, not 0666: the listing exposes configured rules and the switch
 	 * turns spoofing off - it must not be readable or writable by an app. */
 	kstat_proc_entry = proc_create("susfs_kstat", 0600, NULL, &kstat_proc_ops);

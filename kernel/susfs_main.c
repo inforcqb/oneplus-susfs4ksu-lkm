@@ -17,6 +17,52 @@
 
 #define SUSFS_LKM_VERSION "2.3.0-gki"
 
+/* Our own control nodes.  Hidden from app processes by sus_path below. */
+static const char *const susfs_self_hide_paths[] = {
+    "/proc/susfs_kstat",
+    "/proc/susfs_open_redirect",
+    "/proc/susfs_enable_log",
+    "/proc/susfs_avc_spoof",
+};
+
+/* Register our control nodes in sus_path's hidden set.
+ *
+ * An app probing /proc/susfs_kstat must see ENOENT, not EACCES: "permission
+ * denied" tells the detector the node is there, "no such file or directory"
+ * does not.  Using sus_path for this also means the module exercises its own
+ * hiding path on every boot, so a broken sus_path shows up immediately.
+ *
+ * Runs after every feature init, because the nodes must exist for kern_path()
+ * to resolve them, and after sus_path_init() so the hooks are already patched. */
+static void susfs_self_hide_nodes(void)
+{
+    int i;
+
+    if (!susfs_expose_proc)
+        return;
+
+    for (i = 0; i < ARRAY_SIZE(susfs_self_hide_paths); i++) {
+        int rc = sus_path_add_hidden(susfs_self_hide_paths[i]);
+
+        if (rc)
+            pr_warn("susfs_guard_lkm: self-hide %s failed %d\n",
+                    susfs_self_hide_paths[i], rc);
+    }
+}
+
+/* The /proc/susfs_* control nodes exist so the module can be configured without
+ * depending on a userspace tool whose ABI may not match.
+ *
+ * They are hidden from app processes with our OWN sus_path feature (see
+ * susfs_self_hide_nodes below): an app then gets "No such file or directory",
+ * whereas 0600 alone would give "Permission denied" - which advertises that the
+ * file exists and is merely off limits.  Root and shell keep full access, the
+ * same gate every other sus_path entry uses.
+ *
+ * Set expose_proc=0 to not create them at all. */
+bool susfs_expose_proc = true;
+module_param_named(expose_proc, susfs_expose_proc, bool, 0600);
+
 static int __init susfs_init(void)
 {
     int ret;
@@ -50,6 +96,8 @@ static int __init susfs_init(void)
      * advertising HIDE_KSU_SUSFS_SYMBOLS when this fails. */
     if (susfs_hide_syms_init())
         pr_err("susfs_guard_lkm: hide_syms init FAILED - kallsyms NOT hidden\n");
+
+    susfs_self_hide_nodes();
 
     return 0;
 }

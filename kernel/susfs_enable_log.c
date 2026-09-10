@@ -64,6 +64,12 @@ static struct proc_dir_entry *log_proc_entry;
 
 int susfs_enable_log_init(void)
 {
+	/* Not created unless asked for: see susfs_expose_proc. */
+	if (!susfs_expose_proc) {
+		pr_info("susfs_enable_log: /proc node disabled (expose_proc=0)\n");
+		return 0;
+	}
+
 	/* 0600: an app must not be able to turn logging on/off. */
 	log_proc_entry = proc_create("susfs_enable_log", 0600, NULL, &log_proc_ops);
 	if (!log_proc_entry)

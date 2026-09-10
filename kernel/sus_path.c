@@ -368,6 +368,70 @@ module_param_cb(hide_list, &sus_path_list_ops, NULL, 0400);
 
 static bool path_registered;
 
+/* Add a path to the hidden set from kernel code, bypassing the supercall.
+ * Used by susfs_init() to self-hide the /proc control nodes.
+ *
+ * Same entry shape and the same ihold discipline as sus_path_supercall(): the
+ * inode pointer is what the LSM layer matches on, and it must outlive
+ * path_put() below or the address could be recycled. */
+int sus_path_add_hidden(const char *path)
+{
+	struct path p;
+	struct inode *inode;
+	struct sus_path_entry *e;
+	int rc;
+
+	rc = kern_path(path, LOOKUP_FOLLOW, &p);
+	if (rc)
+		return rc;
+
+	inode = d_inode(p.dentry);
+	if (!inode) {
+		path_put(&p);
+		return -ENOENT;
+	}
+
+	e = kmalloc(sizeof(*e), GFP_KERNEL);
+	if (!e) {
+		path_put(&p);
+		return -ENOMEM;
+	}
+
+	e->dev = (u64)inode->i_sb->s_dev;
+	e->ino = (u64)inode->i_ino;
+	e->inode = inode;
+	ihold(inode);
+	strscpy(e->name, p.dentry->d_name.name, sizeof(e->name));
+	INIT_LIST_HEAD(&e->list);
+	path_put(&p);
+
+	spin_lock(&sus_path_lock);
+	{
+		struct sus_path_entry *cur;
+
+		list_for_each_entry(cur, &sus_path_list, list) {
+			if (cur->inode == inode) {
+				spin_unlock(&sus_path_lock);
+				iput(e->inode);
+				kfree(e);
+				return 0;	/* already hidden */
+			}
+		}
+	}
+	if (sus_path_count >= SUS_PATH_MAX_ENTRIES) {
+		spin_unlock(&sus_path_lock);
+		iput(e->inode);
+		kfree(e);
+		return -ENOSPC;
+	}
+	list_add_tail(&e->list, &sus_path_list);
+	sus_path_count++;
+	spin_unlock(&sus_path_lock);
+
+	pr_info("sus_path: hidden (built-in) '%s'\n", path);
+	return 0;
+}
+
 /* Whether the path-based layer actually installed.  Both hooks must be patched:
  * with only one, stat and open would disagree with each other. */
 bool sus_path_lsm_active(void)
