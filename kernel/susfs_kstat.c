@@ -51,21 +51,10 @@
 #include "susfs_abi.h"
 #include "susfs_log.h"
 
-/* KSTAT_SPOOF_* flags — bit values match original SUSFS (CTIME_TV_SEC fixed
- * from the upstream typo `1 < 8` to `1 << 8`). */
-#define KSTAT_SPOOF_INO          (1 << 0)
-#define KSTAT_SPOOF_DEV          (1 << 1)
-#define KSTAT_SPOOF_NLINK        (1 << 2)
-#define KSTAT_SPOOF_SIZE         (1 << 3)
-#define KSTAT_SPOOF_ATIME_TV_SEC  (1 << 4)
-#define KSTAT_SPOOF_ATIME_TV_NSEC (1 << 5)
-#define KSTAT_SPOOF_MTIME_TV_SEC  (1 << 6)
-#define KSTAT_SPOOF_MTIME_TV_NSEC (1 << 7)
-#define KSTAT_SPOOF_CTIME_TV_SEC  (1 << 8)
-#define KSTAT_SPOOF_CTIME_TV_NSEC (1 << 9)
-#define KSTAT_SPOOF_BLOCKS       (1 << 10)
-#define KSTAT_SPOOF_BLKSIZE      (1 << 11)
-
+/* KSTAT_SPOOF_* bits now live in susfs_abi.h (upstream declares them in
+ * susfs.h next to struct st_susfs_sus_kstat).  KSTAT_AUTO_SPOOF* below are
+ * local convenience masks for the /proc interface, not part of the supercall
+ * ABI. */
 #define KSTAT_AUTO_SPOOF (KSTAT_SPOOF_INO | KSTAT_SPOOF_DEV | \
 	KSTAT_SPOOF_ATIME_TV_SEC | KSTAT_SPOOF_ATIME_TV_NSEC | \
 	KSTAT_SPOOF_MTIME_TV_SEC | KSTAT_SPOOF_MTIME_TV_NSEC | \

@@ -98,7 +98,7 @@ static int sus_mount_register(void)
 /* supercall: CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS */
 void susfs_sus_mount_supercall(void __user **arg)
 {
-    struct st_susfs_hide_sus_mnts info = {0};
+    struct st_susfs_hide_sus_mnts_for_non_su_procs info = {0};
     int rc;
 
     if (copy_from_user(&info, (void __user *)*arg, sizeof(info))) {

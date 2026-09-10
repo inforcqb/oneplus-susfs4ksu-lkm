@@ -14,26 +14,38 @@
 #define __SUSFS_ABI_H
 
 #include <linux/types.h>
+#include <linux/utsname.h>	/* __NEW_UTS_LEN (struct st_susfs_uname) */
 
 #define KSU_INSTALL_MAGIC1 0xDEADBEEF
 #define SUSFS_MAGIC        0xFAFAFAFA
 
-/* command IDs (shared with ksu_susfs / ksud) */
-#define CMD_SUSFS_ADD_SUS_PATH                 0x55550
-#define CMD_SUSFS_ADD_SUS_PATH_LOOP            0x55553
+/* command IDs (shared with ksu_susfs / ksud) — identical to upstream
+ * susfs_def.h, including the ids upstream marks *deprecated*.  The deprecated
+ * ones are defined for ABI completeness only: no handler is wired for them,
+ * exactly like upstream kernels, which no longer dispatch them either. */
+#define CMD_SUSFS_ADD_SUS_PATH                  0x55550
+#define CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH    0x55551 /* deprecated */
+#define CMD_SUSFS_SET_SDCARD_ROOT_PATH          0x55552 /* deprecated */
+#define CMD_SUSFS_ADD_SUS_PATH_LOOP             0x55553
+#define CMD_SUSFS_ADD_SUS_MOUNT                 0x55560 /* deprecated */
 #define CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS 0x55561
-#define CMD_SUSFS_ADD_SUS_KSTAT                0x55570
-#define CMD_SUSFS_UPDATE_SUS_KSTAT             0x55571
-#define CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY     0x55572
-#define CMD_SUSFS_SET_UNAME                    0x55590
-#define CMD_SUSFS_ENABLE_LOG                   0x555a0
-#define CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG    0x555b0
-#define CMD_SUSFS_ADD_OPEN_REDIRECT            0x555c0
-#define CMD_SUSFS_SHOW_VERSION                 0x555e1
-#define CMD_SUSFS_SHOW_ENABLED_FEATURES        0x555e2
-#define CMD_SUSFS_SHOW_VARIANT                 0x555e3
-#define CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING      0x60010
-#define CMD_SUSFS_ADD_SUS_MAP                  0x60020
+#define CMD_SUSFS_UMOUNT_FOR_ZYGOTE_ISO_SERVICE 0x55562 /* deprecated */
+#define CMD_SUSFS_ADD_SUS_KSTAT                 0x55570
+#define CMD_SUSFS_UPDATE_SUS_KSTAT              0x55571
+#define CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY      0x55572
+#define CMD_SUSFS_ADD_TRY_UMOUNT                0x55580 /* deprecated */
+#define CMD_SUSFS_SET_UNAME                     0x55590
+#define CMD_SUSFS_ENABLE_LOG                    0x555a0
+#define CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG     0x555b0
+#define CMD_SUSFS_ADD_OPEN_REDIRECT             0x555c0
+#define CMD_SUSFS_SHOW_VERSION                  0x555e1
+#define CMD_SUSFS_SHOW_ENABLED_FEATURES         0x555e2
+#define CMD_SUSFS_SHOW_VARIANT                  0x555e3
+#define CMD_SUSFS_SHOW_SUS_SU_WORKING_MODE      0x555e4 /* deprecated */
+#define CMD_SUSFS_IS_SUS_SU_READY               0x555f0 /* deprecated */
+#define CMD_SUSFS_SUS_SU                        0x60000 /* deprecated */
+#define CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING       0x60010
+#define CMD_SUSFS_ADD_SUS_MAP                   0x60020
 
 #define ERR_CMD_NOT_SUPPORTED 126
 
@@ -46,6 +58,16 @@
 #define SUSFS_VERSION_STR "v2.3.0"
 #define SUSFS_VARIANT_STR "GKI"
 
+/* uid_scheme values of struct st_susfs_open_redirect (upstream enum UID_SCHEME,
+ * declared in susfs.h next to the structs) */
+enum UID_SCHEME {
+	UID_NON_APP_PROC = 0,
+	UID_ROOT_PROC_EXCEPT_SU_PROC,
+	UID_NON_SU_PROC,
+	UID_UMOUNTED_APP_PROC,
+	UID_UMOUNTED_PROC,
+};
+
 /* ---- payload structs (must match userspace #[repr(C)] layouts) ---- */
 
 struct st_susfs_sus_path {
@@ -57,6 +79,27 @@ struct st_susfs_sus_map {
 	char target_pathname[SUSFS_MAX_LEN_PATHNAME];
 	int err;
 };
+
+/* KSTAT_SPOOF_* bits of struct st_susfs_sus_kstat's `flags` field (upstream
+ * declares these in susfs.h right above that struct).
+ *
+ * Intentional deviation from upstream: upstream has a typo
+ *   SUSFS:  #define KSTAT_SPOOF_CTIME_TV_SEC (1 < 8)   <- evaluates to 0
+ * while the userspace side (ksu_susfs, and ksud types.rs KSTAT_AUTO_SPOOF)
+ * uses the intended (1 << 8).  Keep the corrected value here so bit 8 really
+ * spoofs ctime.tv_sec; do NOT "resync" this to the upstream typo. */
+#define KSTAT_SPOOF_INO           (1 << 0)
+#define KSTAT_SPOOF_DEV           (1 << 1)
+#define KSTAT_SPOOF_NLINK         (1 << 2)
+#define KSTAT_SPOOF_SIZE          (1 << 3)
+#define KSTAT_SPOOF_ATIME_TV_SEC  (1 << 4)
+#define KSTAT_SPOOF_ATIME_TV_NSEC (1 << 5)
+#define KSTAT_SPOOF_MTIME_TV_SEC  (1 << 6)
+#define KSTAT_SPOOF_MTIME_TV_NSEC (1 << 7)
+#define KSTAT_SPOOF_CTIME_TV_SEC  (1 << 8)	/* upstream typo: (1 < 8) */
+#define KSTAT_SPOOF_CTIME_TV_NSEC (1 << 9)
+#define KSTAT_SPOOF_BLOCKS        (1 << 10)
+#define KSTAT_SPOOF_BLKSIZE       (1 << 11)
 
 struct st_susfs_sus_kstat {
 	int is_statically;
@@ -79,8 +122,8 @@ struct st_susfs_sus_kstat {
 };
 
 struct st_susfs_uname {
-	char release[65];
-	char version[65];
+	char release[__NEW_UTS_LEN+1];
+	char version[__NEW_UTS_LEN+1];
 	int err;
 };
 
@@ -94,7 +137,7 @@ struct st_susfs_avc_log_spoofing {
 	int err;
 };
 
-struct st_susfs_hide_sus_mnts {
+struct st_susfs_hide_sus_mnts_for_non_su_procs {
 	bool enabled;
 	int err;
 };

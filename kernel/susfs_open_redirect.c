@@ -48,13 +48,8 @@
 #define SUS_OR_MAX 64
 #define OR_PATH_MAX 128
 
-enum uid_scheme {
-	UID_NON_APP_PROC = 0,
-	UID_ROOT_PROC_EXCEPT_SU_PROC,
-	UID_NON_SU_PROC,
-	UID_UMOUNTED_APP_PROC,
-	UID_UMOUNTED_PROC,
-};
+/* UID_SCHEME (uid_scheme values) now lives in susfs_abi.h, mirroring upstream
+ * susfs.h where the enum sits next to the ABI structs. */
 
 struct sus_or_entry {
 	char target_pathname[OR_PATH_MAX];
