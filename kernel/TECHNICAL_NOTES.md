@@ -282,12 +282,10 @@ adb shell 仍看得到）。本 LKM 无条件隐藏，root 也看不到——对
 `getdents64` 出口过滤 dirent，因此**按已知路径的 `stat`/`open` 仍然成功**。
 这是 builtin 版与 LKM 版最本质的能力差距，不要误以为"上游设计如此"。
 
-要在 LKM 里补上，可行的替代是给路径类 syscall 的 wrapper 挂 kprobe，命中时短路：
-`regs->pc = regs->regs[30]; regs->regs[0] = -ENOENT; return 1;`
-（与本仓库 supercall 让 reboot 返回 0 用的是同一招，已在本内核验证可行）。
-设备上 `__arm64_sys_newfstatat` / `_statx` / `_openat` / `_faccessat` /
-`_readlinkat` / `_execve` / `_openat2` 符号均存在，具备实现条件。局限：只能拦绝对路径
-（pre_handler 里拿不到 dfd），且只能做字符串比较，不解析 `..` 与符号链接。
+**这一差距已经补上了**——用两个 LSM hook 替换实现，效果等价于上游的 namei patch，
+详见下一节。（中途也验证过 syscall wrapper 短路方案：`regs->pc = regs->regs[30];
+regs->regs[0] = -ENOENT; return 1` 实测有效，但需要枚举 syscall、只能拦绝对路径、
+且只能做字符串比较，最终没有采用。）
 
 **推论（安全建议不变）**：把 root 工具放在 `/data/local/tmp`
 （`shell_data_file`，appdomain 被允许 `file read`）在**本 LKM** 下永远不安全——正确做法是
@@ -296,22 +294,46 @@ adb shell 仍看得到）。本 LKM 无条件隐藏，root 也看不到——对
 ## 十二、LSM hook 让路径访问返回 ENOENT（已实测可用）
 
 上面那条 LKM 能力差距**已经补上了**，方案不是枚举 syscall，而是替换两个 LSM hook。
-实测（`kernel/selinux_hide_probe_main.c`，本内核 android13-5.15）：
+**已合并进 `sus_path.c`**（先在独立实验模块 `selinux_hide_probe_main.c` 验证通过）：
 
 | hook | 替换目标 | 覆盖 |
 |---|---|---|
 | `inode_getattr` | `selinux_inode_getattr` | `stat` / `fstatat` / `statx` |
-| `inode_permission` | `selinux_inode_permission` | `open` / `exec` / `unlink` / `chmod` / 列目录 … |
+| `inode_permission` | `selinux_inode_permission` | `open` / `exec` / `chmod` / `truncate` / 列目录 … |
 
 `vfs_getattr()` 在碰 inode 之前就先调 `security_inode_getattr()`，所以 stat 必过此路；
 而 `inode_permission` 是所有路径操作的门。**无需枚举任何 syscall。**
+
+于是 `sus_path` 现在是**两层**（对应上游的 filldir64 + namei patch）：
+
+1. **目录项层**：getdents64 出口过滤 dirent（按 dev+ino+name 精确匹配）；
+2. **路径层**：两个 LSM hook，按**ihold 住的 inode 指针**匹配，命中即返回 `-ENOENT`。
 
 匹配用 **inode 指针**，因此下列绕过**全部实测失效（都返回 ENOENT）**：
 直接路径、`//`、`./`、相对路径、符号链接（`stat -L`）、**硬链接**（同 inode）、
 `/proc/self/root/...`。对照组文件与目录列表完全正常。
 
 实测能力：`ls -l` / `cat` / `>> 追加写` / `chmod` / `test -e` 全部 ENOENT；
-`disarm` 后立即恢复；性能零影响（`ls /system/bin` 0.02s）。
+性能零影响（`ls /system/bin` 0.02s，hook 只做一次指针比较，且链表空时无锁直接返回）。
+
+**门控与上游一致**（`hide_from_apps=1`，默认）：只有 `uid >= 10000` 的进程受影响，
+且**不隐藏调用者自己拥有的文件**（上游 `is_i_uid_not_allowed()`）。实测：
+
+| 视角 | gate=1（默认，susfs 语义） | gate=0（测试用） |
+|---|---|---|
+| root `stat`/`cat`/列目录 | 正常 | ENOENT |
+| app (uid 10378) `stat`/`cat` | **ENOENT** | ENOENT |
+| 对照组文件 | 正常 | 正常 |
+
+两个坑：
+- **`hide_from_apps=0` 必须整体绕过门控，包括归属检查**。否则 root 访问 root 拥有的
+  文件时 `0 != 0` 为假，门控"关掉"了却什么都不放行（实测踩到）。
+- getdents 层只有 inode 号、没有 inode，所以只能做 uid 那一半门控
+  （`sus_path_gate_uid_ok()`），归属检查只在 LSM 层做（`sus_path_gate_ok()`）。
+  两层门控必须一致，否则"列表看不到但能 cat"（实测踩到）。
+
+**拦不住的**：`unlink` / `rename` 作用于**父目录**的 inode，不是目标文件，所以不会被拦。
+
 
 ### kCFI 教训（用两次内核 panic 换来的）
 
