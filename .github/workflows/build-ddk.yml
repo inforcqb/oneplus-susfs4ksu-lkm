@@ -61,6 +61,14 @@ jobs:
           file test_sc
           ls -la test_sc
 
+      - name: Build 32-bit compat test binary (armv7, no libc)
+        run: |
+          set -e
+          clang --target=armv7-linux-gnueabi -march=armv7-a -static -nostdlib \
+                -fuse-ld=lld -o test_compat_open test_compat_open.c
+          file test_compat_open
+          ls -la test_compat_open
+
       - name: Verify sections (__versions / .BTF / cfi)
         run: |
           f=kernel/susfs_guard_lkm.ko

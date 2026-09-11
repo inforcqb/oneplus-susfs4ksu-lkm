@@ -46,12 +46,14 @@
 #include <linux/fs.h>
 #include <linux/err.h>
 #include <linux/kprobes.h>
+#include <linux/compat.h>	/* compat_ptr(), for 32-bit callers */
 #include <linux/limits.h>
 #include <linux/cred.h>
 #include <linux/atomic.h>
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
+#include "symbol_resolver.h"	/* find_kernel_symbol_exact, for optional compat probes */
 #include "lsm_hook.h"
 
 #define DIRENT_BUF_SIZE 65536  /* getdents usually returns <= 32-64KB */
@@ -576,13 +578,29 @@ static struct kprobe kp_user_path = {
 static int kp_sys_path_answer(struct pt_regs *regs, int argno)
 {
     const struct pt_regs *uregs = (const struct pt_regs *)regs->regs[0];
+    unsigned long reg;
+    void __user *up;
     char buf[SUS_PATH_LEN];
     long n;
 
     if (!uregs)
         return 0;
-    n = strncpy_from_user(buf, (const char __user *)uregs->regs[argno],
-                          sizeof(buf) - 1);
+
+    reg = uregs->regs[argno];
+    /* A 32-bit task's registers are 32 bits wide: only the low half of the saved
+     * slot is meaningful, so mask it exactly like compat_ptr() does - otherwise
+     * whatever the upper half holds becomes part of a user pointer. */
+    if (is_compat_task()) {
+#ifdef CONFIG_COMPAT
+        up = compat_ptr((u32)reg);
+#else
+        return 0;
+#endif
+    } else {
+        up = (void __user *)reg;
+    }
+
+    n = strncpy_from_user(buf, (const char __user *)up, sizeof(buf) - 1);
     if (n <= 0)
         return 0;
     buf[n] = '\0';
@@ -619,12 +637,40 @@ static struct kprobe *sys_path_probes[] = {
     &kp___arm64_sys_execve,
 };
 
+/* 32-bit (AArch32) callers.
+ *
+ * Only the syscalls that need different semantics get their own wrapper: on
+ * this kernel kallsyms has __arm64_compat_sys_openat, _execve and _execveat and
+ * nothing else, which means the rest of the 32-bit table points at the very
+ * __arm64_sys_* wrappers above and is already covered.  These entries are
+ * registered only when the symbol exists, so a name that is absent on another
+ * kernel is skipped silently instead of warning. */
+SUSFS_SYS_PROBE(__arm64_compat_sys_openat, 1);
+SUSFS_SYS_PROBE(__arm64_compat_sys_openat2, 1);
+SUSFS_SYS_PROBE(__arm64_compat_sys_fstatat64, 1);
+SUSFS_SYS_PROBE(__arm64_compat_sys_statx, 1);
+SUSFS_SYS_PROBE(__arm64_compat_sys_faccessat, 1);
+SUSFS_SYS_PROBE(__arm64_compat_sys_readlinkat, 1);
+SUSFS_SYS_PROBE(__arm64_compat_sys_execve, 0);
+
+static struct kprobe *compat_path_probes[] = {
+    &kp___arm64_compat_sys_openat,
+    &kp___arm64_compat_sys_openat2,
+    &kp___arm64_compat_sys_fstatat64,
+    &kp___arm64_compat_sys_statx,
+    &kp___arm64_compat_sys_faccessat,
+    &kp___arm64_compat_sys_readlinkat,
+    &kp___arm64_compat_sys_execve,
+};
+
 #define N_SYS_PATH_PROBES ARRAY_SIZE(sys_path_probes)
+#define N_COMPAT_PATH_PROBES ARRAY_SIZE(compat_path_probes)
 static bool sys_path_probes_registered[N_SYS_PATH_PROBES];
+static bool compat_path_probes_registered[N_COMPAT_PATH_PROBES];
 
 static void sus_path_syscall_register(void)
 {
-    int i, n = 0;
+    int i, n = 0, c = 0;
 
     for (i = 0; i < N_SYS_PATH_PROBES; i++) {
         int rc = register_kprobe(sys_path_probes[i]);
@@ -637,14 +683,35 @@ static void sus_path_syscall_register(void)
         sys_path_probes_registered[i] = true;
         n++;
     }
-    pr_info("sus_path: syscall layer armed (%d/%d probes)\n", n,
-            (int)N_SYS_PATH_PROBES);
+
+    for (i = 0; i < N_COMPAT_PATH_PROBES; i++) {
+        const char *sym = compat_path_probes[i]->symbol_name;
+
+        /* Absent by design on kernels that share the native wrapper. */
+        if (!find_kernel_symbol_exact(sym))
+            continue;
+        if (register_kprobe(compat_path_probes[i])) {
+            pr_warn("sus_path: kprobe(%s) failed\n", sym);
+            continue;
+        }
+        compat_path_probes_registered[i] = true;
+        c++;
+    }
+
+    pr_info("sus_path: syscall layer armed (%d/%d native, %d/%d compat probes)\n",
+            n, (int)N_SYS_PATH_PROBES, c, (int)N_COMPAT_PATH_PROBES);
 }
 
 static void sus_path_syscall_unregister(void)
 {
     int i;
 
+    for (i = 0; i < N_COMPAT_PATH_PROBES; i++) {
+        if (!compat_path_probes_registered[i])
+            continue;
+        unregister_kprobe(compat_path_probes[i]);
+        compat_path_probes_registered[i] = false;
+    }
     for (i = 0; i < N_SYS_PATH_PROBES; i++) {
         if (!sys_path_probes_registered[i])
             continue;
