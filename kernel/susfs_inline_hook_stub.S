@@ -6,22 +6,26 @@
  * argument registers untouched, LR still the caller's return address, and SP
  * exactly as it was on entry to the real function.
  *
- * Two rules learned the hard way (see INLINE_HOOK.md):
+ * Rules learned the hard way (see INLINE_HOOK.md):
  *
  *  - x0-x18 must survive the C calls: the allow path hands the original
- *    arguments to the trampoline, which replays the target's prologue.
- *
- *  - a stub must NOT take a module symbol's address itself.  `ldr x16, =sym`
- *    becomes movz/movk, and even adrp/add or adrp/:got: get folded into the same
- *    thing by the assembler - a module address is not known until load time.  So
- *    the trampoline pointer is fetched by CALLING C (susfs_ih_get_tramp), where
- *    the compiler emits the addressing it knows is correct.
+ *    arguments to the trampoline, which replays the target's prologue;
+ *  - immediates inside a macro body must NOT be written as hash-param: cpp reads
+ *    that as the stringise operator, and the assembler then sees a quoted
+ *    string where an immediate belongs;
+ *  - each stub loads its trampoline address from a .bss variable that C fills in
+ *    at install time.  This is the shape verified end to end in the standalone
+ *    test module.
  *
  * Entering the trampoline uses `br`, which does not touch the return-address
- * stack; a `ret` there would pop it and guarantee a return misprediction for
- * every hooked call.  Resuming the target at entry+8 still has to use `ret`: it
- * is mid-function, so BTI rejects br/blr there and only ret is exempt.
+ * stack; a `ret` there would pop it and cost a return misprediction on every
+ * hooked call.  Resuming the target at entry+8 still has to use `ret`: it is
+ * mid-function, so BTI rejects br/blr there and only ret is exempt.
  */
+
+.hidden susfs_ih_decide
+.hidden susfs_ih_decide_name
+.hidden susfs_ih_after_getname
 
 #define IH_SAVE()						\
 	sub	sp, sp, #192;					\
@@ -48,12 +52,15 @@
 	ldp	x14, x15, [sp, #112];				\
 	ldr	x18, [sp, #144]
 
-/* allow path: ask C for this entry's trampoline, then leave for it */
-#define IH_TAIL(idx)						\
-	mov	w0, idx;					\
-	bl	susfs_ih_get_tramp;				\
-	mov	x16, x0;					\
+#define IH_TRAMP_ADDR(n)					\
+	adrp	x16, susfs_ih_tramp_##n;			\
+	add	x16, x16, :lo12:susfs_ih_tramp_##n;		\
+	ldr	x16, [x16]
+
+/* allow path: pick up this entry's trampoline and leave for it */
+#define IH_TAIL(n)						\
 	IH_RESTORE_ARGS();					\
+	IH_TRAMP_ADDR(n);					\
 	br	x16
 
 /* hit path: leave with ENOENT instead of running the original */
@@ -64,16 +71,11 @@
 	mov	x0, #-2;	/* -ENOENT */			\
 	ret
 
-.hidden susfs_ih_decide
-.hidden susfs_ih_decide_name
-.hidden susfs_ih_after_getname
-.hidden susfs_ih_get_tramp
-
 	.text
 
 /* syscall wrappers: x0 is the pt_regs to read the user pointer from, argno the
  * x-register holding the pathname in the 64-bit ABI. */
-#define SUSFS_IH_SYS_STUB(n, idx, argno)			\
+#define SUSFS_IH_SYS_STUB(n, argno)				\
 	.globl	susfs_ih_stub_##n;				\
 	.type	susfs_ih_stub_##n, %function;			\
 susfs_ih_stub_##n:;						\
@@ -83,13 +85,13 @@ susfs_ih_stub_##n:;						\
 	cbz	x0, 8f;						\
 	IH_HIDE();						\
 8:;								\
-	IH_TAIL(idx);						\
+	IH_TAIL(n);						\
 	.size	susfs_ih_stub_##n, . - susfs_ih_stub_##n
 
 /* name-taking entries (filename_lookup, do_filp_open, user_path_at_empty): the
  * name is in x1, w1 carries the mode (0 = struct filename, already in kernel
  * memory, 1 = user pointer). */
-#define SUSFS_IH_NAME_STUB(n, idx, mode)			\
+#define SUSFS_IH_NAME_STUB(n, mode)				\
 	.globl	susfs_ih_stub_##n;				\
 	.type	susfs_ih_stub_##n, %function;			\
 susfs_ih_stub_##n:;						\
@@ -100,7 +102,7 @@ susfs_ih_stub_##n:;						\
 	cbz	x0, 8f;						\
 	IH_HIDE();						\
 8:;								\
-	IH_TAIL(idx);						\
+	IH_TAIL(n);						\
 	.size	susfs_ih_stub_##n, . - susfs_ih_stub_##n
 
 /* onLeave: the stub hands the frame back to itself.
@@ -113,18 +115,16 @@ susfs_ih_stub_##n:;						\
  *
  * Layout: [0..144] x0-x18, [152] LR for the target, [160] real LR,
  *         [168] the target's return value. */
-#define SUSFS_IH_LEAVE_STUB(n, idx, after_fn)			\
+#define SUSFS_IH_LEAVE_STUB(n, after_fn)			\
 	.globl	susfs_ih_stub_##n;				\
 	.type	susfs_ih_stub_##n, %function;			\
 susfs_ih_stub_##n:;						\
 	IH_SAVE();						\
 	adr	x9, 9f;						\
 	str	x9, [sp, #152];					\
-	mov	w0, idx;					\
-	bl	susfs_ih_get_tramp;				\
-	mov	x16, x0;					\
-	ldr	x30, [sp, #152];				\
+	mov	x30, x9;					\
 	IH_RESTORE_ARGS();					\
+	IH_TRAMP_ADDR(n);					\
 	br	x16;						\
 9:;								\
 	str	x0, [sp, #168];					\
@@ -136,18 +136,37 @@ susfs_ih_stub_##n:;						\
 	ret;							\
 	.size	susfs_ih_stub_##n, . - susfs_ih_stub_##n
 
-/* Index into ih_table[] in sus_path.c - the order must match. */
-	SUSFS_IH_SYS_STUB(openat, 0, 1)
-	SUSFS_IH_SYS_STUB(openat2, 1, 1)
-	SUSFS_IH_SYS_STUB(newfstatat, 2, 1)
-	SUSFS_IH_SYS_STUB(statx, 3, 1)
-	SUSFS_IH_SYS_STUB(faccessat, 4, 1)
-	SUSFS_IH_SYS_STUB(faccessat2, 5, 1)
-	SUSFS_IH_SYS_STUB(readlinkat, 6, 1)
-	SUSFS_IH_SYS_STUB(execve, 7, 0)
+	SUSFS_IH_SYS_STUB(openat, 1)
+	SUSFS_IH_SYS_STUB(openat2, 1)
+	SUSFS_IH_SYS_STUB(newfstatat, 1)
+	SUSFS_IH_SYS_STUB(statx, 1)
+	SUSFS_IH_SYS_STUB(faccessat, 1)
+	SUSFS_IH_SYS_STUB(faccessat2, 1)
+	SUSFS_IH_SYS_STUB(readlinkat, 1)
+	SUSFS_IH_SYS_STUB(execve, 0)
 
-	SUSFS_IH_NAME_STUB(filename_lookup, 8, 0)
-	SUSFS_IH_NAME_STUB(do_filp_open, 9, 0)
-	SUSFS_IH_NAME_STUB(user_path_at_empty, 10, 1)
+	SUSFS_IH_NAME_STUB(filename_lookup, 0)
+	SUSFS_IH_NAME_STUB(do_filp_open, 0)
+	SUSFS_IH_NAME_STUB(user_path_at_empty, 1)
 
-	SUSFS_IH_LEAVE_STUB(getname, 11, susfs_ih_after_getname)
+	SUSFS_IH_LEAVE_STUB(getname, susfs_ih_after_getname)
+
+	.bss
+	.align	3
+#define SUSFS_IH_TRAMP(n)					\
+	.globl	susfs_ih_tramp_##n;				\
+susfs_ih_tramp_##n:;						\
+	.quad	0
+
+	SUSFS_IH_TRAMP(openat)
+	SUSFS_IH_TRAMP(openat2)
+	SUSFS_IH_TRAMP(newfstatat)
+	SUSFS_IH_TRAMP(statx)
+	SUSFS_IH_TRAMP(faccessat)
+	SUSFS_IH_TRAMP(faccessat2)
+	SUSFS_IH_TRAMP(readlinkat)
+	SUSFS_IH_TRAMP(execve)
+	SUSFS_IH_TRAMP(filename_lookup)
+	SUSFS_IH_TRAMP(do_filp_open)
+	SUSFS_IH_TRAMP(user_path_at_empty)
+	SUSFS_IH_TRAMP(getname)
