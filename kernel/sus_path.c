@@ -259,37 +259,42 @@ static int sus_path_inode_permission(struct inode *inode, int mask)
     return orig(inode, mask);
 }
 
-/* ---- path-lookup layer ----
+/* ---- DAC layer ----
  *
- * Why the LSM layer is not enough.  inode_permission() is:
+ * Everything else in this file sits either after the DAC check (the LSM hooks)
+ * or beside it (the getdents64 tracepoint).  inode_permission() is:
  *
- *     retval = do_inode_permission(...);       DAC
- *     if (retval) return retval;               <-- EACCES leaves HERE
- *     return security_inode_permission(...);   our hook
+ *     retval = sb_permission(...);
+ *     retval = do_inode_permission(...);        DAC   <-- EACCES leaves HERE
+ *     retval = devcgroup_inode_permission(...);
+ *     return security_inode_permission(...);    our LSM hook
  *
- * so a path whose PARENT denies the app execute permission answers EACCES
- * before the hook is ever called - and "permission denied" tells the caller the
- * entry exists, which is the one answer sus_path must never give.  Not
- * theoretical: /data/adb is 0700 root:root, so an app running
- * `ls /data/adb/service.d` gets EACCES no matter what is registered for
- * service.d.  It only looked like it worked while the tests used 0755 paths
- * like /data/local/tmp, where DAC passes and the LSM layer is reached.
+ * So an inode the caller may not touch is answered EACCES before any hook of
+ * ours runs - and "permission denied" also tells the caller the entry EXISTS,
+ * which is precisely what sus_path must never say.  Reported from the device:
+ * an app listing /data/adb/service.d got EACCES, while every earlier test had
+ * passed because those used 0755 paths (/data/local/tmp) where DAC lets the
+ * caller through and the LSM layer is reached.
  *
- * Upstream does not have this hole: it patches fs/namei.c at the LOOKUP level
- * (lookup_fast, __lookup_slow, lookup_dcache, link_path_walk, lookup_open) and
- * turns the dentry into "not found" before any permission check on the target.
+ * Upstream rewrites the answer inside fs/namei.c at the lookup level, i.e.
+ * before the target inode is permission-checked at all.  An LKM cannot patch
+ * namei: the helpers are inlined by this kernel's LTO (lookup_fast and
+ * open_last_lookups have no symbol) and struct nameidata is defined inside
+ * fs/namei.c rather than in a header.
  *
- * The LKM equivalent is a kretprobe on the lookup helpers that already hold the
- * dentry, rewriting a hit into -ENOENT.  Hooks are on walk_component (covers
- * every component of the path walk), __lookup_slow and lookup_dcache (the
- * open-last-component paths).  lookup_fast and open_last_lookups were inlined by
- * this kernel's LTO and have no symbol, which is why these three are the ones
- * used. */
-struct sus_path_walk_args {
-    struct nameidata *nd;
-};
+ * DAC, however, has exactly one entry point and it is exported: skip
+ * inode_permission() itself for a hidden inode.  Being entered before a single
+ * check runs, one kprobe covers every caller - including the path walk's own
+ * MAY_EXEC check on a hidden directory, which is what makes
+ * `ls /data/adb/service.d` answer ENOENT once /data/adb is registered.
+ *
+ * The limit no layer can remove: hiding a child of a directory that denies the
+ * caller and is not itself registered still answers EACCES, because the walk
+ * cannot reach the child's lookup at all.  Upstream behaves the same way -
+ * register the directory. */
+static atomic_t n_enoent_dac = ATOMIC_INIT(0);
 
-/* The LSM layer's decision, reused so every layer agrees. */
+/* The other layers' decision, reused so every layer agrees. */
 static bool sus_path_lookup_hit(struct inode *inode)
 {
     if (!inode)
@@ -297,120 +302,58 @@ static bool sus_path_lookup_hit(struct inode *inode)
     return sus_path_inode_hidden(inode) && sus_path_gate_ok(inode);
 }
 
-static int kr_walk_component_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+/* 5.15 signature: inode_permission(struct user_namespace *mnt_userns,
+ * struct inode *inode, int mask) - the inode is argument 2, i.e. x1.  If that
+ * ever changes the lookup simply misses and nothing else is affected. */
+static int kp_inode_permission_pre(struct kprobe *kp, struct pt_regs *regs)
 {
-    struct sus_path_walk_args *a = (struct sus_path_walk_args *)ri->data;
+    struct inode *inode = (struct inode *)regs->regs[1];
 
-    a->nd = (struct nameidata *)regs->regs[0];
-    return 0;
-}
-
-/* walk_component() returns 1 with nd->path already updated to the component it
- * resolved, so a hit here answers "no such file" before the caller's
- * inode_permission() on the parent directory can answer EACCES. */
-static int kr_walk_component_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-    struct sus_path_walk_args *a = (struct sus_path_walk_args *)ri->data;
-    struct dentry *d;
-
-    if ((long)regs_return_value(regs) <= 0 || !a->nd)
+    if (!sus_path_lookup_hit(inode))
         return 0;
 
-    d = READ_ONCE(a->nd->path.dentry);
-    if (d && sus_path_lookup_hit(READ_ONCE(d->d_inode)))
-        regs_set_return_value(regs, (unsigned long)ERR_PTR(-ENOENT));
-    return 0;
+    atomic_inc(&n_enoent_dac);
+    /* Answer "no such file" and skip the whole function: the DAC check inside
+     * it is what would otherwise answer EACCES. */
+    regs_set_return_value(regs, (unsigned long)-ENOENT);
+    regs->pc = regs->regs[30];
+    return 1;
 }
 
-/* lookup_dcache() feeds open's last component; __lookup_slow() is the
- * cache-miss path taken by the walk.  Both already return ERR_PTR(...), so the
- * same trick applies. */
-static int kr_lookup_dcache_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-    struct dentry *d = (struct dentry *)regs_return_value(regs);
-
-    if (IS_ERR_OR_NULL(d))
-        return 0;
-    if (sus_path_lookup_hit(READ_ONCE(d->d_inode)))
-        regs_set_return_value(regs, (unsigned long)ERR_PTR(-ENOENT));
-    return 0;
-}
-
-static struct kretprobe krp_walk_component = {
-    .kp.symbol_name = "walk_component",
-    .entry_handler = kr_walk_component_entry,
-    .handler = kr_walk_component_ret,
-    .data_size = sizeof(struct sus_path_walk_args),
-    .maxactive = 64,
+static struct kprobe kp_inode_permission = {
+    .symbol_name = "inode_permission",
+    .pre_handler = kp_inode_permission_pre,
 };
 
-static struct kretprobe krp_lookup_dcache = {
-    .kp.symbol_name = "lookup_dcache",
-    .handler = kr_lookup_dcache_ret,
-    .maxactive = 64,
-};
+static bool dac_hook_registered;
 
-static struct kretprobe krp_lookup_slow = {
-    .kp.symbol_name = "__lookup_slow",
-    .handler = kr_lookup_dcache_ret,     /* same return-value rewrite */
-    .maxactive = 64,
-};
+/* Off means an app gets EACCES instead of ENOENT whenever the DAC check would
+ * have denied it - i.e. the layer this exists for. */
+static int hide_by_dac = 1;
+module_param_named(hide_by_dac, hide_by_dac, int, 0644);
 
-static bool lookup_walk_registered;
-static bool lookup_dcache_registered;
-static bool lookup_slow_registered;
-
-/* The lookup helpers are on the hottest path there is, so a kretprobe on them is
- * not free.  Off means an app gets EACCES (instead of ENOENT) whenever a parent
- * directory denies it, which is upstream's behaviour only for paths whose
- * parents are reachable. */
-static int hide_by_lookup = 1;
-module_param_named(hide_by_lookup, hide_by_lookup, int, 0644);
-
-static void sus_path_lookup_register(void)
+static void sus_path_dac_register(void)
 {
     int rc;
 
-    if (!hide_by_lookup)
+    if (!hide_by_dac)
         return;
 
-    rc = register_kretprobe(&krp_walk_component);
-    if (rc)
-        pr_warn("sus_path: kretprobe(walk_component) failed %d\n", rc);
-    else
-        lookup_walk_registered = true;
-
-    rc = register_kretprobe(&krp_lookup_dcache);
-    if (rc)
-        pr_warn("sus_path: kretprobe(lookup_dcache) failed %d\n", rc);
-    else
-        lookup_dcache_registered = true;
-
-    rc = register_kretprobe(&krp_lookup_slow);
-    if (rc)
-        pr_warn("sus_path: kretprobe(__lookup_slow) failed %d\n", rc);
-    else
-        lookup_slow_registered = true;
-
-    pr_info("sus_path: lookup layer armed (walk=%d dcache=%d slow=%d)\n",
-            lookup_walk_registered, lookup_dcache_registered,
-            lookup_slow_registered);
+    rc = register_kprobe(&kp_inode_permission);
+    if (rc) {
+        pr_warn("sus_path: kprobe(inode_permission) failed %d\n", rc);
+        return;
+    }
+    dac_hook_registered = true;
+    pr_info("sus_path: DAC layer armed (inode_permission)\n");
 }
 
-static void sus_path_lookup_unregister(void)
+static void sus_path_dac_unregister(void)
 {
-    if (lookup_slow_registered) {
-        unregister_kretprobe(&krp_lookup_slow);
-        lookup_slow_registered = false;
-    }
-    if (lookup_dcache_registered) {
-        unregister_kretprobe(&krp_lookup_dcache);
-        lookup_dcache_registered = false;
-    }
-    if (lookup_walk_registered) {
-        unregister_kretprobe(&krp_walk_component);
-        lookup_walk_registered = false;
-    }
+    if (!dac_hook_registered)
+        return;
+    unregister_kprobe(&kp_inode_permission);
+    dac_hook_registered = false;
 }
 
 /* compact the dirent chain in-place; returns the new byte count */
@@ -674,9 +617,9 @@ int sus_path_init(void)
         pr_info("sus_path: perm hook armed, orig=%ps\n",
                 sus_path_perm_hook.original);
 
-    /* And the lookup layer, without which a parent that denies the caller gives
-     * EACCES instead of ENOENT (see the note above it). */
-    sus_path_lookup_register();
+    /* And the DAC layer, without which a caller DAC denies gets EACCES instead
+     * of ENOENT (see the note above it). */
+    sus_path_dac_register();
 
     return 0;
 }
@@ -688,7 +631,7 @@ void sus_path_exit(void)
 
     /* Unregister the hooks FIRST: after this nothing can match, so the entries
      * (and their inode references) can be torn down safely. */
-    sus_path_lookup_unregister();
+    sus_path_dac_unregister();
     if (sus_path_perm_hook.entry)
         ksu_unregister_lsm_hook(&sus_path_perm_hook);
     if (sus_path_getattr_hook.entry)
