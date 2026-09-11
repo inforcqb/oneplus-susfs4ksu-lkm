@@ -38,35 +38,22 @@ static void putstr(const char *s)
     sc3(__NR_write, 1, (long)s, n);
 }
 
-static void putdec(long v)
-{
-    char b[12];
-    int i = 0;
-    u32 u = v < 0 ? (u32)(-v) : (u32)v;
-
-    if (v < 0)
-        sc3(__NR_write, 1, (long)"-", 1);
-    if (!u) {
-        sc3(__NR_write, 1, (long)"0", 1);
-        return;
-    }
-    while (u && i < 12) {
-        b[i++] = '0' + (u % 10);
-        u /= 10;
-    }
-    while (i--)
-        sc3(__NR_write, 1, (long)&b[i], 1);
-}
-
 void _start(void)
 {
     long ret = sc3(__NR_openat, AT_FDCWD, (long)target, O_RDONLY);
 
+    /* Deliberately no number formatting: 32-bit division would pull in
+     * __aeabi_uidiv, which -nostdlib does not provide.  The three cases are all
+     * this probe needs to tell apart. */
     putstr("32-bit openat -> ");
-    putdec(ret);
-    putstr(ret == -2 ? "  (ENOENT: hidden by sus_path)\n"
-                     : ret == -13 ? "  (EACCES: DAC rejected first)\n"
-                                  : "  (opened or other)\n");
+    if (ret == -2)
+        putstr("ENOENT  (hidden by sus_path)\n");
+    else if (ret == -13)
+        putstr("EACCES  (DAC rejected before sus_path got a say)\n");
+    else if (ret < 0)
+        putstr("other negative (not ENOENT/EACCES)\n");
+    else
+        putstr("opened\n");
 
     sc3(__NR_exit, 0, 0, 0);
     for (;;)
