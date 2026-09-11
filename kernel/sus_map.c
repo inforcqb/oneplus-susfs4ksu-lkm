@@ -10,6 +10,10 @@
  * show_map_vma(m, vma): vma is arg #2 (regs->regs[1]); returns non-zero from
  * the pre_handler so the arm64 kprobe core skips singlestep and continues at
  * the modified pc (same trick kprg uses).
+ *
+ * The skip is gated exactly like upstream's, so only processes the gate treats
+ * as apps see the line dropped and root/init keep seeing the real mapping - see
+ * "the read gate" below.
  */
 #include <linux/module.h>
 #include <linux/kprobes.h>
@@ -18,6 +22,8 @@
 #include <linux/namei.h>
 #include <linux/dcache.h>
 #include <linux/uaccess.h>
+#include <linux/cred.h>		/* current_uid(), for the read gate */
+#include <linux/spinlock.h>	/* serialises rule publication */
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
@@ -32,6 +38,19 @@ struct sus_map_entry {
 static struct sus_map_entry map_entries[SUS_MAP_MAX];
 static int nmap;
 
+/* Serialises rule PUBLICATION only, and the reader stays lock-free on purpose:
+ * entries are append-only and never rewritten in place (unlike kstat's, which
+ * are replaced wholesale, hence its reader-side snapshot under a spinlock), so
+ * a release/acquire pair on nmap is enough for sus_map_lookup() to see either a
+ * fully filled entry or none at all - and it is what it has to be on arm64,
+ * where plain WRITE_ONCE/READ_ONCE would let the count become visible before
+ * the entry it publishes.
+ *
+ * What the lock is really for: two concurrent supercalls - each dispatched from
+ * its own task's task_work - would otherwise read the same nmap, fill the same
+ * slot and silently drop one rule while both report success to userspace. */
+static DEFINE_SPINLOCK(map_table_lock);
+
 /* temporary interface: insmod susfs_guard_lkm.ko map_ino=<n> hides that inode */
 static unsigned long param_map_ino;
 module_param_named(map_ino, param_map_ino, ulong, 0644);
@@ -40,14 +59,23 @@ module_param_named(map_ino, param_map_ino, ulong, 0644);
  * which cannot know the device). */
 static int sus_map_add_full(unsigned long ino, dev_t dev)
 {
+    unsigned long flags;
+    int rc = 0;
+
     if (!ino)
         return -EINVAL;
-    if (nmap >= SUS_MAP_MAX)
-        return -ENOSPC;
-    map_entries[nmap].target_ino = ino;
-    map_entries[nmap].target_dev = dev;
-    nmap++;
-    return 0;
+
+    /* Bounds check and fill under the lock, then publish: see map_table_lock. */
+    spin_lock_irqsave(&map_table_lock, flags);
+    if (nmap < SUS_MAP_MAX) {
+        map_entries[nmap].target_ino = ino;
+        map_entries[nmap].target_dev = dev;
+        smp_store_release(&nmap, nmap + 1);
+    } else {
+        rc = -ENOSPC;
+    }
+    spin_unlock_irqrestore(&map_table_lock, flags);
+    return rc;
 }
 
 static void sus_map_add(unsigned long ino)
@@ -57,9 +85,10 @@ static void sus_map_add(unsigned long ino)
 
 static bool sus_map_lookup(unsigned long ino, dev_t dev)
 {
+    int n = smp_load_acquire(&nmap);
     int i;
 
-    for (i = 0; i < nmap; i++) {
+    for (i = 0; i < n; i++) {
         if (map_entries[i].target_ino != ino)
             continue;
         if (map_entries[i].target_dev && map_entries[i].target_dev != dev)
@@ -69,17 +98,51 @@ static bool sus_map_lookup(unsigned long ino, dev_t dev)
     return false;
 }
 
+/* ---- the read gate ----
+ *
+ * Upstream hides the line behind SUSFS_IS_INODE_SUS_MAP(), which ends in
+ * susfs_is_current_proc_umounted_app() - i.e. app processes only, so root/init
+ * still see the real mapping.  Without the gate this LKM hid the line from
+ * everyone, which is a wider behaviour than upstream and a fidelity gap
+ * (AUDIT_FINDINGS.md P2 #15).
+ *
+ * That upstream predicate is (test_thread_flag(TIF_PROC_UMOUNTED) &&
+ * current_uid().val >= 10000), and TIF_PROC_UMOUNTED cannot be reproduced in
+ * this LKM: KernelSU sets it only when the SUSFS integration is compiled into
+ * the kernel, which this device's kernel is not (see AUDIT_FINDINGS.md, "已确认
+ * 无法在 LKM 内复刻").  uid >= 10000 is the project-wide proxy, identical to
+ * susfs_kstat_gate_ok() in susfs_kstat.c (commit 543b369) and to sus_path's.
+ *
+ * Configuration stays ungated: the supercall and the map_ino parameter are rule
+ * management, not a read path. */
+static bool sus_map_gate_ok(void)
+{
+    return current_uid().val >= 10000;
+}
+
 static int sus_map_show_map_vma_pre(struct kprobe *kp, struct pt_regs *regs)
 {
-    struct vm_area_struct *vma = (struct vm_area_struct *)regs->regs[1];
+    struct vm_area_struct *vma;
     struct inode *inode;
 
+    /* Cheapest test first: for a root/init reader - the entire point of the
+     * gate - we return before touching the vma or its inode. */
+    if (!sus_map_gate_ok())
+        return 0;
+
+    vma = (struct vm_area_struct *)regs->regs[1];
     if (!vma || !vma->vm_file)
         return 0;
     inode = file_inode(vma->vm_file);
     if (!inode)
         return 0;
     if (sus_map_lookup(inode->i_ino, inode->i_sb->s_dev)) {
+        /* ratelimited, like sus_path's hit logs; the path is not stored in the
+         * rule, so ino/dev identify it */
+        pr_info_ratelimited("sus_map: hid maps line (ino=%lu dev=%lu uid=%u)\n",
+                            inode->i_ino,
+                            (unsigned long)inode->i_sb->s_dev,
+                            current_uid().val);
         /* skip this maps line: return early via the saved return address */
         regs->pc = regs->regs[30];
         return 1;
