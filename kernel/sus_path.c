@@ -282,6 +282,14 @@ static atomic_t sus_path_pend_logged_rc = ATOMIC_INIT(1);   /* rc already report
  * Defined up here because every decision layer below - the dirent filter, the
  * inode lookups and the path-string matcher - has to ask the same question. */
 
+/* Upstream gates on susfs_is_current_proc_umounted_app() && is_i_uid_not_allowed():
+ * only app processes, and never a file owned by the caller.  TIF_PROC_UMOUNTED is
+ * a SUSFS-specific thread flag this LKM does not have, so uid >= 10000 is the
+ * proxy.  hide_from_apps=0 applies the hidden set to every process including
+ * root - handy when testing from an adb shell. */
+static int hide_from_apps = 1;
+module_param(hide_from_apps, int, 0644);
+
 /* UID half of the upstream gate.  Separate because the getdents64 tracepoint
  * only has an inode NUMBER, not an inode, so it cannot apply the ownership
  * check in sus_path_gate_ok(). */
@@ -632,9 +640,9 @@ static struct ksu_lsm_hook sus_path_perm_hook = KSU_LSM_HOOK_INIT(
  * is_i_uid_not_allowed(inode i_uid): only app processes, and never a file owned
  * by the caller.  TIF_PROC_UMOUNTED is a SUSFS-specific thread flag this LKM does
  * not have, so uid >= 10000 is the proxy.  Set hide_from_apps=0 to apply to every
- * process including root - handy when testing from an adb shell. */
-static int hide_from_apps = 1;
-module_param(hide_from_apps, int, 0644);
+ * process including root - handy when testing from an adb shell.
+ *
+ * Declared up here because the gates near the top of the file read it. */
 
 static atomic_t n_enoent_getattr = ATOMIC_INIT(0);
 static atomic_t n_enoent_perm = ATOMIC_INIT(0);
