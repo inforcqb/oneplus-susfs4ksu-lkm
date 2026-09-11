@@ -938,6 +938,7 @@ extern void susfs_ih_stub_filename_lookup(void);
 extern void susfs_ih_stub_do_filp_open(void);
 extern void susfs_ih_stub_user_path_at_empty(void);
 extern void susfs_ih_stub_getname(void);
+extern void susfs_ih_stub_getname(void);
 extern u64 susfs_ih_tramp_openat;
 extern u64 susfs_ih_tramp_openat2;
 extern u64 susfs_ih_tramp_newfstatat;
@@ -1080,6 +1081,9 @@ static struct {
 	{ "__arm64_sys_faccessat2",    susfs_ih_stub_faccessat2,    &susfs_ih_tramp_faccessat2 },
 	{ "__arm64_sys_readlinkat",    susfs_ih_stub_readlinkat,    &susfs_ih_tramp_readlinkat },
 	{ "__arm64_sys_execve",        susfs_ih_stub_execve,        &susfs_ih_tramp_execve },
+	/* onLeave: getname gets no entry decision - the stub lets the original run
+	 * and inspects the struct filename it returned (INLINE_HOOK.md 5.9). */
+	{ "getname",                   susfs_ih_stub_getname,       &susfs_ih_tramp_getname },
 };
 
 #define N_IH_HOOKS ARRAY_SIZE(ih_table)
