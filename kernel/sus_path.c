@@ -1053,10 +1053,6 @@ static struct {
 	{ "__arm64_sys_faccessat2",    susfs_ih_stub_faccessat2,    &susfs_ih_tramp_faccessat2 },
 	{ "__arm64_sys_readlinkat",    susfs_ih_stub_readlinkat,    &susfs_ih_tramp_readlinkat },
 	{ "__arm64_sys_execve",        susfs_ih_stub_execve,        &susfs_ih_tramp_execve },
-	{ "filename_lookup",           susfs_ih_stub_filename_lookup, &susfs_ih_tramp_filename_lookup },
-	{ "do_filp_open",              susfs_ih_stub_do_filp_open,  &susfs_ih_tramp_do_filp_open },
-	{ "user_path_at_empty",        susfs_ih_stub_user_path_at_empty, &susfs_ih_tramp_user_path_at_empty },
-	{ "getname",                   susfs_ih_stub_getname,       &susfs_ih_tramp_getname },
 };
 
 #define N_IH_HOOKS ARRAY_SIZE(ih_table)
