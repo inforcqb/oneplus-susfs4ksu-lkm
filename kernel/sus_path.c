@@ -933,18 +933,18 @@ extern void susfs_ih_stub_do_filp_open(void);
 extern void susfs_ih_stub_user_path_at_empty(void);
 extern void susfs_ih_stub_getname(void);
 
-extern u64 susfs_ih_tramp_openat;
-extern u64 susfs_ih_tramp_openat2;
-extern u64 susfs_ih_tramp_newfstatat;
-extern u64 susfs_ih_tramp_statx;
-extern u64 susfs_ih_tramp_faccessat;
-extern u64 susfs_ih_tramp_faccessat2;
-extern u64 susfs_ih_tramp_readlinkat;
-extern u64 susfs_ih_tramp_execve;
-extern u64 susfs_ih_tramp_filename_lookup;
-extern u64 susfs_ih_tramp_do_filp_open;
-extern u64 susfs_ih_tramp_user_path_at_empty;
-extern u64 susfs_ih_tramp_getname;
+
+
+
+
+
+
+
+
+
+
+
+
 
 /* onLeave handler for getname(): the stub calls this after the original ran, with
  * the original arguments and its return value (in x2).  Returning a different
@@ -1033,18 +1033,18 @@ static struct {
 	void *stub;
 	u64 *tramp;
 } ih_table[] = {
-	{ "__arm64_sys_openat",        susfs_ih_stub_openat,        &susfs_ih_tramp_openat },
-	{ "__arm64_sys_openat2",       susfs_ih_stub_openat2,       &susfs_ih_tramp_openat2 },
-	{ "__arm64_sys_newfstatat",    susfs_ih_stub_newfstatat,    &susfs_ih_tramp_newfstatat },
-	{ "__arm64_sys_statx",         susfs_ih_stub_statx,         &susfs_ih_tramp_statx },
-	{ "__arm64_sys_faccessat",     susfs_ih_stub_faccessat,     &susfs_ih_tramp_faccessat },
-	{ "__arm64_sys_faccessat2",    susfs_ih_stub_faccessat2,    &susfs_ih_tramp_faccessat2 },
-	{ "__arm64_sys_readlinkat",    susfs_ih_stub_readlinkat,    &susfs_ih_tramp_readlinkat },
-	{ "__arm64_sys_execve",        susfs_ih_stub_execve,        &susfs_ih_tramp_execve },
-	{ "filename_lookup",           susfs_ih_stub_filename_lookup, &susfs_ih_tramp_filename_lookup },
-	{ "do_filp_open",              susfs_ih_stub_do_filp_open,  &susfs_ih_tramp_do_filp_open },
-	{ "user_path_at_empty",        susfs_ih_stub_user_path_at_empty, &susfs_ih_tramp_user_path_at_empty },
-	{ "getname",                   susfs_ih_stub_getname,       &susfs_ih_tramp_getname },
+	{ "__arm64_sys_openat",        susfs_ih_stub_openat,        NULL },
+	{ "__arm64_sys_openat2",       susfs_ih_stub_openat2,       NULL },
+	{ "__arm64_sys_newfstatat",    susfs_ih_stub_newfstatat,    NULL },
+	{ "__arm64_sys_statx",         susfs_ih_stub_statx,         NULL },
+	{ "__arm64_sys_faccessat",     susfs_ih_stub_faccessat,     NULL },
+	{ "__arm64_sys_faccessat2",    susfs_ih_stub_faccessat2,    NULL },
+	{ "__arm64_sys_readlinkat",    susfs_ih_stub_readlinkat,    NULL },
+	{ "__arm64_sys_execve",        susfs_ih_stub_execve,        NULL },
+	{ "filename_lookup",           susfs_ih_stub_filename_lookup, NULL },
+	{ "do_filp_open",              susfs_ih_stub_do_filp_open,  NULL },
+	{ "user_path_at_empty",        susfs_ih_stub_user_path_at_empty, NULL },
+	{ "getname",                   susfs_ih_stub_getname,       NULL },
 };
 
 #define N_IH_HOOKS ARRAY_SIZE(ih_table)

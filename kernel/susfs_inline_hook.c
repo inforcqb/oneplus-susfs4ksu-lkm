@@ -178,14 +178,16 @@ static __nocfi int susfs_ih_install_impl(struct susfs_ih_hook *h,
 	if (!h->tramp)
 		return -ENOMEM;
 	h->tramp_var = tramp_var;
-	*tramp_var = (u64)(unsigned long)h->tramp;
+	if (tramp_var)
+		*tramp_var = (u64)(unsigned long)h->tramp;
 
 	patch[0] = 0xd503245fu;					/* bti c */
 	patch[1] = 0x14000000u | (((u32)(delta >> 2)) & 0x03ffffffu);
 
 	if (susfs_ih_write(h->entry, patch, sizeof(patch), true)) {
 		pr_err("susfs_ih: could not patch %s\n", sym);
-		*tramp_var = 0;
+		if (tramp_var)
+			*tramp_var = 0;
 		return -EIO;
 	}
 
