@@ -867,6 +867,10 @@ static bool hooks_armed;
 /* The tracepoint callback and the filter it drives are defined below. */
 static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret);
 
+/* Inline hooks are defined further down; armed from sus_path_hooks_arm(). */
+static int sus_path_ih_register(void);
+static void sus_path_ih_unregister(void);
+
 static void sus_path_tracepoint_register(void)
 {
     int rc = register_trace_sys_exit(sus_path_sys_exit, NULL);
