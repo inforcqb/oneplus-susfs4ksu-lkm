@@ -28,6 +28,10 @@ struct ksu_lsm_hook_entry {
     struct ksu_lsm_hook *hook;
 };
 
+/* Defined below, called from ksu_unregister_lsm_hook() - see its comment for why
+ * synchronize_rcu() alone is not enough. */
+static void ksu_lsm_hook_drain(void);
+
 static DEFINE_MUTEX(ksu_lsm_hook_lock);
 static struct ksu_lsm_hook_entry ksu_lsm_hook_entries[16];
 static int ksu_lsm_hook_count;
@@ -452,8 +456,6 @@ void ksu_lsm_unhook(struct ksu_lsm_hook *hook)
 #endif
     mutex_unlock(&ksu_lsm_hook_lock);
 }
-
-static void ksu_lsm_hook_drain(void);
 
 /* Wait until nothing can still be inside a replacement function.
  *
