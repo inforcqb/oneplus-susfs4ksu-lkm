@@ -2,40 +2,202 @@
 /*
  * sus_mount.c - hide KSU mounts from /proc/mounts and /proc/mountinfo.
  *
- * Upstream SUSFS skips the line in show_vfsstat()/show_mountinfo() when
- * mnt_id >= DEFAULT_KSU_MNT_ID (mounts created by the ksu process).  Those
- * show functions are static but live behind proc_ops function pointers, so
- * they are NOT LTO-inlined and remain kprobe-able (verified in kallsyms).
+ * Upstream SUSFS skips a mount line when r->mnt_id >= DEFAULT_KSU_MNT_ID, and
+ * (patch:1561-1585) it only installs those show functions for NON-ksu domains:
+ * mounts_open()/mountinfo_open()/mountstats_open() pick susfs_show_vfsmnt()/
+ * susfs_show_mountinfo()/susfs_show_vfsstat() only when
+ * !susfs_is_current_ksu_domain(), so the su/ksu domain keeps seeing its own
+ * mounts.  The stock show functions are static but live behind proc_ops
+ * function pointers, so they are NOT LTO-inlined and remain kprobe-able
+ * (verified in kallsyms).
  *
- * The LKM hooks both show functions with a kprobe pre_handler and returns
- * early (regs->pc = x30) when the mount id is in the KSU range.  struct mount
- * / real_mount() come from the private fs/mount.h (its includes are all
- * public headers, so -I$(srctree)/fs is enough).
+ * The LKM hooks all three show functions with a kprobe pre_handler and returns
+ * early (regs->pc = x30) when the mount id is in the KSU range - but only for
+ * non-su/ksu processes, mirroring upstream's domain gate: the su domain must
+ * keep seeing its own mounts or su tooling (zygisk in post-fs-data, ksud)
+ * breaks.  struct mount / real_mount() come from the private fs/mount.h (its
+ * includes are all public headers, so -I$(srctree)/fs is enough).
+ *
+ * HOW THE ID RANGE IS PRODUCED (this is the part that used to be missing):
+ * upstream gets KSU mounts into that range by ADDING an allocator
+ * (susfs_alloc_non_unshare_ksu_vfsmnt(), which calls
+ * ida_alloc_min(&mnt_id_ida, DEFAULT_KSU_MNT_ID, GFP_KERNEL), patch:676-693) and
+ * SWAPPING THE CALL SITES in vfs_create_mount()/clone_mnt() (patch:764, 800);
+ * mnt_alloc_id() itself is never patched.  The LKM does not patch kernel text
+ * at all, so its stock allocator (plain ida_alloc, smallest free id) keeps
+ * handing out small ids - measured on device: 91..39693, so the old fixed 2e9
+ * threshold could never match and the feature was 100% OFF.
+ *
+ * Instead, sus_mount_mark_ksu_mounts() retro-fits upstream's semantics: at
+ * enable time (and at module load) it walks the current mount namespace and
+ * rewrites the mnt_id of every mount that looks like one of KernelSU's.
+ *
+ * The new id is a REAL id taken from the kernel's own mnt_id_ida:
+ *   ida_alloc_range(&mnt_id_ida, DEFAULT_KSU_MNT_ID, INT_MAX - 1, GFP_KERNEL)
+ * NOT an invented number.  That is not a style choice.  mnt_free_id()
+ * (fs/namespace.c:136-139) unconditionally calls ida_free(&mnt_id_ida,
+ * mnt->mnt_id) when the mount finally goes away, so a hand-made id makes
+ * lib/idr.c:523-525 fire WARN(1, "ida_free called for id=%d which is not
+ * allocated.") on umount - and a WARN plus stack dump in dmesg is exactly the
+ * kind of trace a root detector greps for, i.e. worse than the feature doing
+ * nothing.  Upstream is under the same constraint and short-circuits the free
+ * for its fake ids (patch:582-588); mnt_free_id() is static + LTO-inlined on
+ * this kernel, so we cannot patch it - owning the id for real is the fix.
+ *
+ * Degradation: if mnt_id_ida / ida_alloc_range / ida_free cannot ALL be
+ * resolved, nothing is marked at all.  min_mnt_id then stays false, the feature
+ * does nothing, and every missing symbol is named in a pr_warn.  Falling back to
+ * a self-made id is deliberately NOT an option (see the WARN above).
+ *
+ * A mount is recognised by either of:
+ *   - mnt_devname contains "/data/adb/" (KSU/module bind mounts, whose source is
+ *     the file under /data/adb/modules/...);
+ *   - the mount POINT - d_path() of {mnt, mnt_root}, i.e. the same path
+ *     show_mountinfo() prints - is under /data/adb/modules, /data/adb/ksu or
+ *     /data/adb/magisk (catches meta-overlayfs, whose source is a loop device:
+ *     "/dev/block/loop48 /data/adb/modules/meta-overlayfs/mnt ext4 rw,...").
+ * Marked ids are never restored on disable, matching upstream, where an id is
+ * assigned once at mount time and stays for the mount's lifetime.
+ *
+ * Known blind spots of the scan (see AUDIT_FINDINGS.md B10):
+ *   - overlayfs mounts that KernelSU places on /system have d_path "/system"
+ *     and mnt_devname "overlay", so they are NOT recognised; only intercepting
+ *     vfs_create_mount()/clone_mnt() by su domain (upstream's group (1)) would
+ *     catch those;
+ *   - only the mount namespace of the process that enables the feature is
+ *     scanned; a mount namespace cloned later (copy_mnt_ns()/unshare()) gets
+ *     fresh small ids from the stock allocator (upstream handles that in
+ *     clone_mnt() with CL_COPY_MNT_NS, patch:789-810).
  */
 #include <linux/module.h>
 #include <linux/kprobes.h>
 #include <linux/fs.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
-#include "mount.h"      /* fs/mount.h: struct mount + real_mount() */
+#include <linux/sched.h>
+#include <linux/cred.h>
+#include <linux/nsproxy.h>
+#include <linux/rcupdate.h>
+#include <linux/spinlock.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/list.h>
+#include <linux/idr.h>      /* struct ida + ida_alloc_range()/ida_free() prototypes */
+#include <linux/err.h>
+#include <linux/errno.h>    /* -ENOSYS/-ENOENT/-ENOMEM used by the scan result */
+#include <linux/dcache.h>   /* d_path() - called through a resolved symbol */
+#include <linux/limits.h>   /* PATH_MAX, INT_MAX (via vdso/limits.h) */
+#include <linux/security.h> /* security_secctx_to_secid() */
+#include "mount.h"      /* fs/mount.h: struct mount + struct mnt_namespace + real_mount() */
+#include "symbol_resolver.h"
 #include "susfs_abi.h"
 #include "susfs_log.h"
 
 #define DEFAULT_KSU_MNT_ID 2000000000ULL
 
-/* NOTE: upstream SUSFS gets KSU mounts an mnt_id >= DEFAULT_KSU_MNT_ID by
- * ADDING its own allocator (susfs_alloc_non_unshare_ksu_vfsmnt(), which calls
- * ida_alloc_min(&mnt_id_ida, DEFAULT_KSU_MNT_ID)) and SWAPPING THE CALL SITES in
- * vfs_create_mount()/clone_mnt().  mnt_alloc_id() itself is never patched.
- * (An earlier note here claimed it was - that was wrong.)
- *
- * This LKM does not reimplement that allocator, so the stock allocator (plain
- * ida_alloc, smallest free id) keeps handing out small ids.  Measured on device:
- * mnt_id stayed in 91..37270, so a 2e9 threshold can never match and this
- * feature is effectively OFF on a stock KernelSU device.  min_mnt_id stays a
- * tunable until the allocator side exists. */
+/* P3: min_mnt_id is a raw ulong tunable and 0/1 would make EVERY mount line
+ * match the threshold below, hiding the whole of /proc/mounts,
+ * /proc/<pid>/mountinfo and /proc/<pid>/mountstats from every process (su
+ * included).  Anything below this is clamped back to DEFAULT_KSU_MNT_ID. */
+#define SUS_MOUNT_MIN_SANE_MNT_ID 1000
+
+/* Hard bound on the mount-namespace walk.  A concurrent umount_tree() does
+ * list_del_init() on the entry it removes, which makes that node point at
+ * itself, so an unbounded list_for_each() can spin forever if it lands on it. */
+#define SUS_MOUNT_MAX_SCAN 65536
+
+/* Everything at/above this is "already a KSU-range id" (upstream's own test,
+ * patch:807).  The marking side deliberately uses this constant instead of the
+ * min_mnt_id tunable: if the tunable were raised above 2e9 a tunable-based test
+ * would re-mark an already-marked mount and allocate a SECOND id from the ida,
+ * leaking the first one for the mount's lifetime.  With the default tunable
+ * (2e9) the two tests are identical. */
+#define SUS_MOUNT_KSU_ID_MIN ((unsigned int)DEFAULT_KSU_MNT_ID)
+
 static unsigned long param_min_mnt_id = DEFAULT_KSU_MNT_ID;
 module_param_named(min_mnt_id, param_min_mnt_id, ulong, 0644);
+
+/* P2-12: SELinux context of the su/ksu domain, resolved to a sid at init.
+ * Keep in sync with susfs_avc_spoof.c's avc_su_ctx default ("u:r:ksu:s0", the
+ * SukiSU variant; stock KernelSU uses "u:r:su:s0", override with
+ * susfs_guard_lkm.su_ctx=u:r:su:s0). */
+static char param_su_ctx[128] = "u:r:ksu:s0";
+module_param_string(su_ctx, param_su_ctx, sizeof(param_su_ctx), 0644);
+
+static u32 su_sid;
+
+/* The kernel's own mount-id allocator, resolved at init:
+ *   - mnt_id_ida: `static DEFINE_IDA(mnt_id_ida)` in fs/namespace.c:68 (data
+ *     symbol; exactly one definition in the tree);
+ *   - ida_alloc_range(): the out-of-line allocator (lib/idr.c:380;
+ *     ida_alloc_min() is only a header inline over it, which is why ida_alloc_min
+ *     has no kallsyms entry - do not try to resolve that one);
+ *   - ida_free(): resolved as a corroborating check only.  We never call it: the
+ *     paired free is done by the kernel itself in mnt_free_id()
+ *     (fs/namespace.c:136-139) when a marked mount is finally freed, which is
+ *     exactly what we want (and what keeps the umount path WARN-free).
+ * All three must be present or we refuse to mark anything (fail closed). */
+static struct ida *sus_mount_mnt_id_ida;
+static int (*pfn_ida_alloc_range)(struct ida *ida, unsigned int min,
+                                  unsigned int max, gfp_t gfp);
+static void (*pfn_ida_free)(struct ida *ida, unsigned int id);
+
+static bool sus_mount_ida_ready(void)
+{
+    return sus_mount_mnt_id_ida && pfn_ida_alloc_range && pfn_ida_free;
+}
+
+/* Resolved kernel symbols.  security_cred_getsecid() is an EXPORT_SYMBOL in
+ * security/security.c:1742, but GKI's symbol list is not guaranteed to carry it
+ * for modules, so it is looked up in kallsyms like the other optional symbols
+ * this LKM uses. */
+static void (*pfn_security_cred_getsecid)(const struct cred *cred, u32 *secid);
+static char *(*pfn_d_path)(const struct path *path, char *buf, int buflen);
+
+/* __nocfi on every function that reaches a resolved kernel symbol through a
+ * function pointer: kCFI validates the type hash at such a call site and panics
+ * with "CFI failure (target: ...)" otherwise.  We hit exactly that once (see
+ * susfs_inline_hook.c:60-63 and :106-118, "CFI failure (target:
+ * smp_call_function)"), so these wrappers must keep the attribute. */
+static __nocfi bool sus_mount_is_su_domain(void)
+{
+    u32 sid = 0;
+
+    /* Unresolved symbol or an unresolvable su context: we cannot tell su apart,
+     * so nothing is exempted (hide from every process) - loud in the init log. */
+    if (!pfn_security_cred_getsecid || !su_sid)
+        return false;
+    /* kprobe pre_handler runs on the probed task with preemption disabled:
+     * reading current->cred and the LSM hook list never sleeps. */
+    pfn_security_cred_getsecid(current_cred(), &sid);
+    return sid == su_sid;
+}
+
+/* Allocate a genuine id in the KSU range out of the kernel's mnt_id_ida.
+ * Process context (GFP_KERNEL, may sleep).  Returns the id, or a negative errno
+ * (-ENOMEM / -ENOSPC) - never a bogus id. */
+static __nocfi int sus_mount_ida_alloc(void)
+{
+    return pfn_ida_alloc_range(sus_mount_mnt_id_ida,
+                               (unsigned int)DEFAULT_KSU_MNT_ID,
+                               (unsigned int)(INT_MAX - 1), GFP_KERNEL);
+}
+
+static __nocfi char *sus_mount_d_path(const struct path *path, char *buf, int buflen)
+{
+    if (!pfn_d_path)
+        return ERR_PTR(-ENOSYS);
+    return pfn_d_path(path, buf, buflen);
+}
+
+/* Effective threshold: clamped on every read too, because the sysfs knob can be
+ * written at any time (init/enable also write the clamped value back). */
+static unsigned long sus_mount_min_mnt_id(void)
+{
+    if (param_min_mnt_id < SUS_MOUNT_MIN_SANE_MNT_ID)
+        return DEFAULT_KSU_MNT_ID;
+    return param_min_mnt_id;
+}
 
 static int sus_mount_show_pre(struct kprobe *kp, struct pt_regs *regs)
 {
@@ -45,16 +207,21 @@ static int sus_mount_show_pre(struct kprobe *kp, struct pt_regs *regs)
     if (!mnt)
         return 0;
     r = real_mount(mnt);
-    if ((unsigned int)r->mnt_id >= param_min_mnt_id) {
-        regs->pc = regs->regs[30];   /* skip this mount line */
-        /* These show_* callbacks return int and x0 still holds seq_file*.
-         * seq_read() treats a negative return as a hard error, so a stray high
-         * bit here would break the whole read; upstream's equivalent site
-         * explicitly returns 0. */
-        regs->regs[0] = 0;
-        return 1;
-    }
-    return 0;
+    /* Cheap test first: only the handful of mounts in the KSU id range pay for
+     * the domain lookup below. */
+    if ((unsigned int)r->mnt_id < sus_mount_min_mnt_id())
+        return 0;
+    /* P2-12 domain gate, upstream patch:1561-1585: the su/ksu domain is not
+     * touched at all, it must be able to see its own mounts. */
+    if (sus_mount_is_su_domain())
+        return 0;
+    regs->pc = regs->regs[30];   /* skip this mount line */
+    /* These show_* callbacks return int and x0 still holds seq_file*.
+     * seq_read() treats a negative return as a hard error, so a stray high
+     * bit here would break the whole read; upstream's equivalent site
+     * explicitly returns 0. */
+    regs->regs[0] = 0;
+    return 1;
 }
 
 static struct kprobe kp_vfsstat = {
@@ -69,8 +236,9 @@ static struct kprobe kp_mountinfo = {
 
 /* /proc/mounts and /proc/<pid>/mounts go through show_vfsmnt - a DIFFERENT
  * function from show_vfsstat (which serves mountstats).  Missing this hook left
- * /proc/mounts completely unhidden while mountinfo was filtered, which the
- * header comment here claimed was covered.  Verified on device. */
+ * /proc/mounts completely unhidden while mountinfo was filtered.  Upstream hooks
+ * all three (patch:1402 susfs_show_vfsmnt, :1439 susfs_show_mountinfo, :1504
+ * susfs_show_vfsstat). */
 static struct kprobe kp_vfsmnt = {
     .symbol_name = "show_vfsmnt",
     .pre_handler = sus_mount_show_pre,
@@ -78,12 +246,227 @@ static struct kprobe kp_vfsmnt = {
 
 static bool mount_registered;
 
+static bool sus_mount_is_adb_devname(const char *devname)
+{
+    if (!devname)
+        return false;
+    return strstr(devname, "/data/adb/") != NULL;
+}
+
+static bool sus_mount_is_adb_mountpoint(const char *path)
+{
+    if (!path)
+        return false;
+    return strstr(path, "/data/adb/modules") != NULL ||
+           strstr(path, "/data/adb/ksu") != NULL ||
+           strstr(path, "/data/adb/magisk") != NULL;
+}
+
+/* Retro-fit upstream's "KSU mounts carry an id >= DEFAULT_KSU_MNT_ID" onto the
+ * mounts that already exist.  Process context only (kmalloc + d_path +
+ * ida_alloc_range with GFP_KERNEL); called from module load and from the
+ * supercall enable path.
+ *
+ * Upstream never needs this: it allocates the big id while the mount is being
+ * created (susfs_alloc_non_unshare_ksu_vfsmnt(), patch:676-693, whose
+ * ida_alloc_min(&mnt_id_ida, DEFAULT_KSU_MNT_ID, GFP_KERNEL) is the same
+ * allocation we do here, just at a different moment).  Two properties matter:
+ *   - the id is genuinely allocated from mnt_id_ida, so the ida_free() the
+ *     kernel runs in mnt_free_id() (fs/namespace.c:136-139) when the mount is
+ *     finally freed is paired and does not WARN (lib/idr.c:523-525).  This is
+ *     the whole reason we do not invent the number;
+ *   - nothing else rewrites the field, so the assignment sticks until the mount
+ *     is gone (which is what upstream assumes as well), and because the id now
+ *     belongs to the ida it is reused after the mount is freed - normal
+ *     allocator behaviour, not a leak.
+ */
+static int sus_mount_mark_ksu_mounts(void)
+{
+    struct mnt_namespace *ns;
+    struct list_head *pos;
+    char *buf;
+    unsigned long min;
+    int marked = 0;
+    unsigned int seen = 0;
+    bool hit_cap = false;
+    bool failed = false;
+
+    /* Fail closed: without all three symbols we cannot own a real id, and a
+     * self-made id would leave an ida_free WARN behind on umount. */
+    if (!sus_mount_ida_ready()) {
+        pr_warn("sus_mount: NOT marking: mnt_id_ida=%d ida_alloc_range=%d ida_free=%d must all resolve; min_mnt_id stays false, so the feature does nothing\n",
+                !!sus_mount_mnt_id_ida, !!pfn_ida_alloc_range, !!pfn_ida_free);
+        return -ENOSYS;
+    }
+
+    if (!current->nsproxy || !current->nsproxy->mnt_ns) {
+        pr_warn("sus_mount: current has no mnt_ns, cannot scan for KSU mounts\n");
+        return -ENOENT;
+    }
+    ns = current->nsproxy->mnt_ns;
+
+    /* P3: clamp the tunable (a value of 0/1 would match every mount line). */
+    if (param_min_mnt_id < SUS_MOUNT_MIN_SANE_MNT_ID) {
+        pr_warn("sus_mount: min_mnt_id=%lu is below %d, clamping to %llu\n",
+                param_min_mnt_id, SUS_MOUNT_MIN_SANE_MNT_ID, DEFAULT_KSU_MNT_ID);
+        param_min_mnt_id = DEFAULT_KSU_MNT_ID;
+    }
+    min = sus_mount_min_mnt_id();
+
+    buf = kmalloc(PATH_MAX, GFP_KERNEL);
+    if (!buf) {
+        pr_warn("sus_mount: kmalloc(PATH_MAX) failed, no KSU mount marked\n");
+        return -ENOMEM;
+    }
+
+    /* fs/mount.h documents the traversal protocol as "namespace_sem for read AND
+     * ns_lock" (fs/namespace.c:704-713, :4484-4540).  namespace_sem is static in
+     * fs/namespace.c and down_read() is an inline over rwsem internals, so an
+     * out-of-tree module can only take the ns_lock half:
+     *   - ns_lock keeps us out of the kernel's own list readers and of every
+     *     list mutation that takes it (list_add/list_del under ns_lock);
+     *   - the iteration bound above covers the only mutation that does not take
+     *     ns_lock (umount_tree()'s list_del_init under namespace_sem);
+     *   - rcu_read_lock keeps a mount that is being torn down alive: mounts that
+     *     were ever on this list are freed through call_rcu() in
+     *     cleanup_mnt() (fs/namespace.c:1144-1145), so a stale pointer we picked
+     *     up from the list cannot be reused under us.
+     * Nothing called while the lock is held sleeps: d_path() only takes the
+     * rename/mount seqlocks, dentry locks and current->fs->lock, and printk with
+     * a spinlock held is normal.  Lock order ns_lock -> (mount_lock, rename_lock,
+     * fs->lock) has no reverse path in the tree. */
+    rcu_read_lock();
+    spin_lock(&ns->ns_lock);
+    for (pos = ns->list.next; pos != &ns->list; pos = pos->next) {
+        struct path mnt_path;
+        struct mount *r;
+        const char *shown;
+        char *dp;
+        int new_id;
+
+        if (seen++ >= SUS_MOUNT_MAX_SCAN) {
+            hit_cap = true;
+            break;
+        }
+        r = list_entry(pos, struct mount, mnt_list);
+        /* proc_mounts cursors are fake mounts anchored in this same list
+         * (fs/namespace.c:678-681 mnt_is_cursor(), include/linux/mount.h:70). */
+        if (r->mnt_ns != ns || (r->mnt.mnt_flags & MNT_CURSOR))
+            continue;
+        /* Skip anything already carrying a KSU-range id: this is the idempotency
+         * guard (a re-enable, or an enable after the load-time scan, must not
+         * allocate a second id for the same mount - that would leak the first
+         * one for the mount's lifetime) and it is upstream's own test
+         * (patch:807).  Uses the constant, not the tunable, see
+         * SUS_MOUNT_KSU_ID_MIN. */
+        if ((unsigned int)r->mnt_id >= SUS_MOUNT_KSU_ID_MIN)
+            continue;
+
+        if (sus_mount_is_adb_devname(r->mnt_devname)) {
+            shown = r->mnt_devname;
+        } else {
+            /* meta-overlayfs style: the source is /dev/block/loopNN, so only the
+             * mount point says /data/adb/... .  d_path() of {mnt, mnt_root} is
+             * the mountpoint path show_mountinfo() prints. */
+            mnt_path.mnt = &r->mnt;
+            mnt_path.dentry = r->mnt.mnt_root;
+            dp = sus_mount_d_path(&mnt_path, buf, PATH_MAX);
+            if (IS_ERR_OR_NULL(dp) || !sus_mount_is_adb_mountpoint(dp))
+                continue;
+            shown = dp;
+        }
+
+        /* A real id out of the kernel's mnt_id_ida: never write a bogus value
+         * into mnt_id, and never invent one (a hand-made id would make the
+         * kernel's paired ida_free() WARN on umount). */
+        new_id = sus_mount_ida_alloc();
+        if (new_id < 0) {
+            pr_warn("sus_mount: ida_alloc_range failed %d, stopping (remaining mounts left unmarked)\n",
+                    new_id);
+            failed = true;
+            break;
+        }
+        if (new_id < (int)DEFAULT_KSU_MNT_ID) {
+            /* Below our floor, i.e. the ida handed out something outside the
+             * requested [DEFAULT_KSU_MNT_ID, INT_MAX-1] range: the resolved
+             * mnt_id_ida is not what we think it is.  Stop before writing. */
+            pr_warn("sus_mount: ida_alloc_range returned %d (< %llu) - resolved mnt_id_ida is suspect, stopping\n",
+                    new_id, DEFAULT_KSU_MNT_ID);
+            failed = true;
+            break;
+        }
+        pr_info("sus_mount: marked mnt_id %d -> %d (%s, devname %s)\n",
+                r->mnt_id, new_id, shown,
+                r->mnt_devname ? r->mnt_devname : "none");
+        r->mnt_id = new_id;
+        marked++;
+    }
+    spin_unlock(&ns->ns_lock);
+    rcu_read_unlock();
+
+    kfree(buf);
+
+    if (hit_cap)
+        pr_warn("sus_mount: walk stopped after %u entries (cap %d), result may be incomplete\n",
+                seen, SUS_MOUNT_MAX_SCAN);
+    if (failed)
+        pr_warn("sus_mount: marking stopped early (see the warning above), %d mount(s) marked\n",
+                marked);
+    if (marked)
+        pr_info("sus_mount: %d KSU mount(s) marked with real mnt_id_ida ids (>= %llu)\n",
+                marked, DEFAULT_KSU_MNT_ID);
+    else
+        pr_info("sus_mount: 0 KSU mounts marked (nothing under /data/adb matched in this mnt ns, hide threshold %lu)\n",
+                min);
+    return marked;
+}
+
 int susfs_sus_mount_init(void)
 {
+    int err;
+
+    pfn_security_cred_getsecid =
+        (void *)find_kernel_symbol_exact("security_cred_getsecid");
+    pfn_d_path = (void *)find_kernel_symbol_exact("d_path");
+    sus_mount_mnt_id_ida = (struct ida *)find_kernel_symbol_exact("mnt_id_ida");
+    pfn_ida_alloc_range = (void *)find_kernel_symbol_exact("ida_alloc_range");
+    pfn_ida_free = (void *)find_kernel_symbol_exact("ida_free");
+
+    err = security_secctx_to_secid(param_su_ctx, strlen(param_su_ctx), &su_sid);
+    if (err) {
+        pr_warn("sus_mount: secctx_to_secid(%s) failed %d\n", param_su_ctx, err);
+        su_sid = 0;
+    }
+
+    if (param_min_mnt_id < SUS_MOUNT_MIN_SANE_MNT_ID) {
+        pr_warn("sus_mount: min_mnt_id=%lu is below %d, clamping to %llu\n",
+                param_min_mnt_id, SUS_MOUNT_MIN_SANE_MNT_ID, DEFAULT_KSU_MNT_ID);
+        param_min_mnt_id = DEFAULT_KSU_MNT_ID;
+    }
+
+    pr_info("sus_mount: su ctx \"%s\" -> sid %u (stock KernelSU uses \"u:r:su:s0\", override with susfs_guard_lkm.su_ctx)\n",
+            param_su_ctx, su_sid);
+    if (!pfn_security_cred_getsecid)
+        pr_warn("sus_mount: security_cred_getsecid not found - no su-domain gating, KSU mounts will be hidden from EVERY process including su\n");
+    if (!pfn_d_path)
+        pr_warn("sus_mount: d_path not found - only mnt_devname is checked, meta-overlayfs style mounts will NOT be marked\n");
+    /* The id side must own real ids; each missing symbol is named explicitly and
+     * only disables the marking (the hook itself can still be installed). */
+    if (!sus_mount_mnt_id_ida)
+        pr_warn("sus_mount: mnt_id_ida not found - KSU mounts will NOT be marked, threshold stays false (feature does nothing)\n");
+    if (!pfn_ida_alloc_range)
+        pr_warn("sus_mount: ida_alloc_range not found - KSU mounts will NOT be marked, threshold stays false (feature does nothing)\n");
+    if (!pfn_ida_free)
+        pr_warn("sus_mount: ida_free not found - KSU mounts will NOT be marked, threshold stays false (feature does nothing)\n");
+
     /* upstream defaults this OFF (static key false) so zygisk can see sus
      * mounts during post-fs-data; the LKM mirrors that: no hook until
-     * CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS enables it. */
+     * CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS enables it.  The id assignment
+     * itself is not gated on that flag - the hook compares ids, so the mounts
+     * have to carry KSU ids before it is switched on (and the next enable
+     * rescans anyway, which picks up mounts created since load). */
     pr_info("sus_mount: disabled by default (enable via CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS)\n");
+    (void)sus_mount_mark_ksu_mounts();
     return 0;
 }
 
@@ -95,6 +478,11 @@ void susfs_sus_mount_exit(void)
         unregister_kprobe(&kp_vfsmnt);
         mount_registered = false;
     }
+    /* Marked mnt_ids are deliberately NOT restored: upstream assigns an id once
+     * per mount and never rewrites it, so a marked id stays for the mount's
+     * lifetime (and a later enable only has to scan for new mounts).  The id
+     * itself goes back to mnt_id_ida through the kernel's own mnt_free_id()
+     * when the mount is finally freed - we never free it ourselves. */
 }
 
 static int sus_mount_register(void)
@@ -138,6 +526,14 @@ void susfs_sus_mount_supercall(void __user **arg)
             info.err = rc;
             goto out;
         }
+        /* Only now does the threshold matter, so mark the KSU mounts (also
+         * catches everything mounted since the module was loaded).  A scan
+         * failure is not reported to userspace - the hook itself is live - but
+         * it is never silent: the scan logs its own result. */
+        rc = sus_mount_mark_ksu_mounts();
+        if (rc < 0)
+            pr_warn("sus_mount: scan on enable failed %d, hook is live but no new mount was marked\n",
+                    rc);
     } else if (mount_registered) {
         unregister_kprobe(&kp_mountinfo);
         unregister_kprobe(&kp_vfsstat);
