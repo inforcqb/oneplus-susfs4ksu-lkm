@@ -69,6 +69,22 @@ jobs:
           file test_compat_open
           ls -la test_compat_open
 
+      - name: Dump the inline-hook stub as the assembler sees it
+        run: |
+          set +e
+          # The stub is macro-expanded by cpp and then assembled.  The only way to
+          # see what the assembler objected to is to run the same preprocessing
+          # here and keep the result as an artifact.
+          clang -E -x assembler-with-cpp kernel/susfs_inline_hook_stub.S \
+                -o stub.preprocessed.s
+          echo "preprocessed lines: $(wc -l < stub.preprocessed.s)"
+          echo "--- expanded stubs (long lines) ---"
+          awk 'length > 150 { printf "%d: %s\n", NR, substr($0, 1, 700) }' \
+                stub.preprocessed.s | head -6
+          echo "--- movz/movk or plt leftovers ---"
+          grep -n -e movz -e movk -e "\.plt" stub.preprocessed.s | head -10
+          set -e
+
       - name: Verify sections (__versions / .BTF / cfi)
         run: |
           f=kernel/susfs_guard_lkm.ko
