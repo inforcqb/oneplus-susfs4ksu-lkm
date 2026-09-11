@@ -103,7 +103,11 @@ static void susfs_ih_remote_flush(void *info)
 	isb();
 }
 
-static void susfs_ih_flush_range_remote(unsigned long lo, unsigned long hi)
+/* __nocfi for the same reason as susfs_ih_init_impl(): this calls a resolved
+ * kernel symbol through a function pointer, and kCFI validates the type hash at
+ * that call site - without it the very first flush panics with
+ * "CFI failure (target: smp_call_function)". */
+static __nocfi void susfs_ih_flush_range_remote(unsigned long lo, unsigned long hi)
 {
 	struct ih_flush_range r = { lo, hi };
 

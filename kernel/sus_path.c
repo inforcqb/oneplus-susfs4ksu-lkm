@@ -678,21 +678,13 @@ static struct kprobe *compat_path_probes[] = {
 static bool sys_path_probes_registered[N_SYS_PATH_PROBES];
 static bool compat_path_probes_registered[N_COMPAT_PATH_PROBES];
 
-static void sus_path_syscall_register(void)
+/* The 32-bit wrappers are their own symbols, so they keep their kprobes even
+ * when the native ones are inline-hooked: a kprobe only conflicts with an inline
+ * hook on the SAME entry.  Without this the 32-bit callers would lose the
+ * syscall layer the moment ih took over the native wrappers. */
+static void sus_path_compat_register(void)
 {
-    int i, n = 0, c = 0;
-
-    for (i = 0; i < N_SYS_PATH_PROBES; i++) {
-        int rc = register_kprobe(sys_path_probes[i]);
-
-        if (rc) {
-            pr_warn("sus_path: kprobe(%s) failed %d\n",
-                    sys_path_probes[i]->symbol_name, rc);
-            continue;
-        }
-        sys_path_probes_registered[i] = true;
-        n++;
-    }
+    int i, c = 0;
 
     for (i = 0; i < N_COMPAT_PATH_PROBES; i++) {
         const char *sym = compat_path_probes[i]->symbol_name;
@@ -708,8 +700,29 @@ static void sus_path_syscall_register(void)
         c++;
     }
 
-    pr_info("sus_path: syscall layer armed (%d/%d native, %d/%d compat probes)\n",
-            n, (int)N_SYS_PATH_PROBES, c, (int)N_COMPAT_PATH_PROBES);
+    pr_info("sus_path: 32-bit syscall layer armed (%d/%d compat probes)\n",
+            c, (int)N_COMPAT_PATH_PROBES);
+}
+
+static void sus_path_syscall_register(void)
+{
+    int i, n = 0;
+
+    for (i = 0; i < N_SYS_PATH_PROBES; i++) {
+        int rc = register_kprobe(sys_path_probes[i]);
+
+        if (rc) {
+            pr_warn("sus_path: kprobe(%s) failed %d\n",
+                    sys_path_probes[i]->symbol_name, rc);
+            continue;
+        }
+        sys_path_probes_registered[i] = true;
+        n++;
+    }
+
+    pr_info("sus_path: syscall layer armed (%d/%d native probes)\n",
+            n, (int)N_SYS_PATH_PROBES);
+    sus_path_compat_register();
 }
 
 static void sus_path_syscall_unregister(void)
@@ -911,9 +924,16 @@ static void sus_path_hooks_arm(void)
      * probe them.  Never both - a kprobe owns the first instruction of its
      * target.  getname is in the patched set too now: its stub returns to
      * itself after the original ran, which is what the kretprobe used to do. */
-    if (sus_path_ih_register())
+    if (sus_path_ih_register()) {
         pr_info("sus_path: syscall/path/getname use inline hooks\n");
-    else {
+        /* The inline hooks cover the eight native wrappers (and getname).
+         * Everything else targets a DIFFERENT symbol, so it keeps its probe:
+         * a kprobe and an inline hook only collide on the same entry.  Without
+         * this the 32-bit wrappers and the path layer would silently lose their
+         * coverage the moment the inline hooks came up. */
+        sus_path_path_register();
+        sus_path_compat_register();
+    } else {
         sus_path_syscall_register();
         sus_path_path_register();
         sus_path_getname_register();
