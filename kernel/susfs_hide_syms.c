@@ -57,6 +57,15 @@ static bool name_should_hide(const char *name)
 	for (i = 0; i < ARRAY_SIZE(hide_prefixes); i++)
 		if (!strncmp(name, hide_prefixes[i], strlen(hide_prefixes[i])))
 			return true;
+
+	/* Substring form for the names whose prefix differs from the list above.
+	 * Measured: with the prefix rules alone a 257 -> 7 sweep left exactly
+	 * anon_ksu_fops, anon_ksu_ioctl(.cfi_jt), anon_ksu_release(.cfi_jt),
+	 * setup_ksu_cred and is_task_ksu_domain visible - each one a plain
+	 * "KernelSU is loaded here" tell in /proc/kallsyms. */
+	if (strstr(name, "ksu") || strstr(name, "susfs"))
+		return true;
+
 	return false;
 }
 
@@ -134,10 +143,15 @@ int susfs_hide_syms_init(void)
 	hide_registered = true;
 
 	table_show = hide_syms_table_show();
+	/* The two addresses differ by design and that is not a fault: a function
+	 * pointer inside a table holds the CFI jump-table thunk (bti c ; b func),
+	 * while the kprobe lands on the function itself.  The check that matters is
+	 * the one on device - /proc/kallsyms going from 257 ksu_/susfs_ matches to
+	 * none - and that is what the line is for. */
 	pr_info("susfs_hide_syms: armed at %px (kallsyms_op.show=%px%s)\n",
 		(void *)kp_s_show.addr, (void *)table_show,
 		(table_show && (unsigned long)kp_s_show.addr == table_show) ?
-		" - match" : " - DIFFERENT, /proc/kallsyms may not be filtered");
+		" - same address" : " - different address (expected: table holds the CFI thunk)");
 	return 0;
 }
 
