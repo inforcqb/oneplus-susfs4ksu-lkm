@@ -47,6 +47,27 @@
 #define CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING       0x60010
 #define CMD_SUSFS_ADD_SUS_MAP                   0x60020
 
+/* 126 is a USERSPACE-side sentinel that the kernel never produces.  The
+ * ksu_susfs C tool pre-seeds payload.err with it and prints "SUSFS operation not
+ * supported, please enable it in kernel" when the field is STILL 126 after the
+ * syscall - i.e. when the kernel never wrote err back:
+ *
+ *   ksu_susfs/jni/includes/susfs_defs.h:16  #define ERR_CMD_NOT_SUPPORTED 126
+ *   ksu_susfs/jni/includes/susfs_defs.h:18  PRT_MSG_IF_CMD_NOT_SUPPORTED(err, cmd)
+ *   ksu_susfs/jni/features/sus_map.c:51-53  info.err = ERR_CMD_NOT_SUPPORTED;
+ *                                           syscall(SYS_reboot, ...);
+ *                                           PRT_MSG_IF_CMD_NOT_SUPPORTED(...)
+ *
+ * The kernel half of that contract is only "do not write err for a command you
+ * do not handle": upstream's ksu_handle_sys_reboot() default case returns
+ * -EINVAL without touching the payload
+ * (KernelSU/10_enable_susfs_for_ksu.patch:2925-2926), and reboot.c's
+ * `if (ret) goto orig_flow;` then lets the real reboot path reject the magic
+ * values with -EINVAL.  We mirror that in susfs_supercall.c: the kprobe does not
+ * hijack a command susfs_cmd_handled() rejects, and writes nothing.
+ *
+ * Kept only because the userspace side defines it; the kernel side never uses
+ * this macro. */
 #define ERR_CMD_NOT_SUPPORTED 126
 
 #define SUSFS_MAX_LEN_PATHNAME                  256
@@ -86,9 +107,12 @@ struct st_susfs_sus_map {
  * Intentional deviation from upstream, and the correction of an earlier note
  * here that got this wrong:
  *
- *   upstream KERNEL   susfs.h:71                    #define ..._CTIME_TV_SEC (1 < 8)  -> 1
- *   upstream USERSPACE ksu_susfs/jni/.../sus_kstat.c:25  #define ..._CTIME_TV_SEC (1 < 8)  -> 1
- *   SukiSU ksud (Rust) consts.rs                    uses the intended (1 << 8) = 256
+ *   upstream KERNEL    kernel_patches/include/linux/susfs.h:71
+ *                      #define ..._CTIME_TV_SEC (1 < 8)      -> 1
+ *   upstream USERSPACE ksu_susfs/jni/features/sus_kstat.c:25
+ *                      #define ..._CTIME_TV_SEC (1 < 8)      -> 1
+ *   SukiSU ksud (Rust) userspace/ksud/src/susfs/abi/consts.rs:52
+ *                      uses the intended (1 << 8)           -> 256
  *
  * i.e. the typo lives on BOTH upstream sides - the C tool has it too, so bit 8
  * is really "an alias of bit 0 (INO)" there, and upstream's ctime spoof never

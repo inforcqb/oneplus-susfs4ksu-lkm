@@ -206,6 +206,24 @@ static bool susfs_kstat_gate_ok(void)
  * kstat_lock, which is what makes the index they pass in stable.
  */
 
+/* Cheapest possible gate for the READ paths: with nothing registered, no lookup
+ * can match, so there is no reason to touch user memory at all.  On the sys_exit
+ * tracepoint that saves the two copy_from_user() reads the spoofers do before
+ * matching; on the show_map_vma kprobe (still armed after a `clear`) and the
+ * vfs_getattr kretprobe it saves an uncontended spinlock per VMA / per lookup.
+ *
+ * READ_ONCE is enough.  nkstat is published only AFTER the entry it counts has
+ * been written, under kstat_table_lock (kstat_table_append stores the entry,
+ * then bumps the count), so a stale non-zero value only means we do the work we
+ * used to do; a stale zero can cost at most the single read that races the very
+ * first add.  The authoritative test remains the locked lookup below.
+ * sus_path uses the same idiom (READ_ONCE(sus_path_count) in
+ * sus_path_match_path) - this is the kstat equivalent. */
+static bool susfs_kstat_table_empty(void)
+{
+	return READ_ONCE(nkstat) == 0;
+}
+
 /* Hot-path lookup: match on (ino, dev) and copy the entry out atomically with
  * respect to the writers.  Returns true and fills *out on a match. */
 static bool susfs_kstat_lookup(unsigned long ino, dev_t dev,
@@ -329,6 +347,8 @@ static int kstat_show_map_vma_pre(struct kprobe *kp, struct pt_regs *regs)
 	struct sus_kstat_snapshot snap;
 	struct inode *inode;
 
+	if (susfs_kstat_table_empty())
+		return 0;
 	if (!vma || !vma->vm_file)
 		return 0;
 	inode = file_inode(vma->vm_file);
@@ -394,6 +414,8 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
 	long long v64;
 	long sl;
 
+	if (susfs_kstat_table_empty())
+		return;
 	if (!susfs_kstat_gate_ok())
 		return;
 
@@ -477,6 +499,8 @@ static void susfs_kstat_spoof_compat_statbuf(unsigned long statbuf)
 	unsigned short v16;
 	int v;
 
+	if (susfs_kstat_table_empty())
+		return;
 	if (!susfs_kstat_gate_ok())
 		return;
 
@@ -596,6 +620,8 @@ static void susfs_kstat_spoof_kstat(struct inode *inode, struct kstat *stat)
 	struct sus_kstat_snapshot snap;
 	const struct sus_kstat_snapshot *e = &snap;
 
+	if (susfs_kstat_table_empty())
+		return;
 	if (!inode || !stat)
 		return;
 	if (!susfs_kstat_gate_ok())

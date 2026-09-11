@@ -98,7 +98,12 @@ del <path>  /  clear
 - 填 spoof 值直接读 inode 字段（`i_ino/i_sb->s_dev/i_nlink/i_size/i_atime/...`），
   与 `generic_fillattr` 的映射一致；blksize 用 `1 << i_blkbits`。
 - 上游 `KSTAT_SPOOF_CTIME_TV_SEC` 有个 typo（`1 < 8`），本移植修正为 `1 << 8`。
-- `proc_create` 用 0666，但写操作要在 root 上下文执行；`su -c` 的重定向
+- `proc_create` 用 **0777 而不是 0666**（`susfs_kstat.c` 的 `/proc/susfs_kstat` 与
+  另外三个功能节点；只有那些一次性调试探针模块还留 0666）。原因见第十二节：
+  `inode_permission()` 的 DAC 检查在 LSM hook 之前，节点太严会给 app EACCES
+  （= "文件存在但我没权限"）而不是 ENOENT；0777 让 DAC 放行，把判断交给 sus_path 的
+  LSM 层。也正因如此，节点只在 `sus_path_lsm_active()` 为真时才创建。写操作要在 root
+  上下文执行；`su -c` 的重定向
   `>` 会被外层非 root shell 处理导致 Permission denied，正确姿势是
   `su -c 'sh -c "... > /proc/susfs_kstat"'` 或把命令写进脚本 `su -c 'sh 脚本'`。
 
@@ -191,6 +196,13 @@ syscall(SYS_reboot, 0xDEADBEEF, 0xFAFAFAFA, cmd_id, &mut payload)
 
 验证方式：设备上 `ksud susfs version/status/features` 直接探测（返回 v2.3.0 /
 true / 9 个 feature），功能命令用 no-libc 的 C 程序 `test_sc` 发 reboot syscall。
+**"9 个"的来源是代码，不是这条实测记录**：`kernel/susfs_supercall.c` 里
+`enabled_features[]` 数组是 9 个元素（`:87-97`）—— SUS_PATH / SUS_MOUNT / SUS_KSTAT /
+SPOOF_UNAME / ENABLE_LOG / HIDE_KSU_SUSFS_SYMBOLS / SPOOF_CMDLINE_OR_BOOTCONFIG /
+OPEN_REDIRECT / SUS_MAP。上游 `fs/susfs.c` 的 `susfs_get_enabled_features()`
+（`:1185-1229`）是同样 9 个 `#ifdef` 条目、**同名同序**。口径说明：这个数字既不能数
+`CONFIG_KSU_SUSFS_*` 宏（上游还有 AVC 等不在列表里的开关），也不是数 supercall 命令
+（那是 15 个）。
 **注意 feature 列表现在是动态的**：条目带 `active()` 检查，注册失败的项不再上报
 （`hide_syms` 曾静默失败却仍宣称 `HIDE_KSU_SUSFS_SYMBOLS`，那是最容易被抓的矛盾）。
 
@@ -211,8 +223,18 @@ offset/size 断言、LP64 模型、Python packing 引擎）：
   enabled_features 8196。
 - 结构体名要与上游一致（`st_susfs_hide_sus_mnts_for_non_su_procs`）。
 - uname 用 `__NEW_UTS_LEN+1`，不要硬编码 65。
-- `KSTAT_SPOOF_CTIME_TV_SEC` 保持修正值 `(1 << 8)`；上游是 typo `(1 < 8)`，不要
-  "同步"回去（用户态 ksu_susfs / ksud 用的都是正确的 bit 8）。
+- `KSTAT_SPOOF_CTIME_TV_SEC` 保持修正值 `(1 << 8)`，不要"同步"回上游。三方实测：
+  上游 kernel `kernel_patches/include/linux/susfs.h:71` 是 typo `(1 < 8)`（值为 1，
+  退化成 bit 0 的别名）；上游**用户态 C 工具同样有 typo**
+  （`ksu_susfs/jni/features/sus_kstat.c:25`，所以它的 `KSTAT_AUTO_SPOOF` 实际是
+  `0xEF3`，想置 bit8 其实置的是 bit0）；**只有 SukiSU ksud (Rust) 用正确的
+  `(1 << 8)`**（`SukiSU-Ultra/userspace/ksud/src/susfs/abi/consts.rs:52`，
+  AUTO = `0xFF3`）。旧版笔记写"用户态 ksu_susfs / ksud 用的都是正确的 bit 8"是错的
+  —— 只有 ksud 对。
+  后果：supercall 走 C 工具 `KSTAT_AUTO_SPOOF` 的调用方在**两侧都不会**伪装
+  ctime.tv_sec；而 ksud 发 bit8 时上游 kernel 忽略（它的宏是 1）、我们会伪装 →
+  这是我们**比上游多**的一处行为分叉（只有本 LKM 的 `/proc/susfs_kstat` 与 ksud 路径
+  会产生真实的 ctime 伪装）。
 
 **行为**也要对齐，不只是布局：
 
@@ -271,7 +293,14 @@ nsec 三连排，且 blksize 在 blocks 之前），因此它对 kstat/open_redi
 ### 与上游的能力鸿沟：上游会返回 -ENOENT，LKM 不会
 
 **上游 `sus_path` 是双层的**，patch 了 `fs/namei.c` **16 个 hunk**（见
-`kernel_patches/50_add_susfs_in_gki-android13-5.15.patch`）：
+`kernel_patches/50_add_susfs_in_gki-android13-5.15.patch`）。统计口径：`fs/namei.c`
+一个文件共 **22 个 hunk**（`patch:116-551`），其中新增行引用
+`CONFIG_KSU_SUSFS_SUS_PATH` / `susfs_is_inode_sus_path` / `susfs_fake_qstr_name` 的
+**16 个**（含文件头部那一个，它同时补了 `CONFIG_KSU_SUSFS_OPEN_REDIRECT` 的 extern），
+其余 6 个只属 `CONFIG_KSU_SUSFS_OPEN_REDIRECT`。**下面列出的三处是关键机制，不是全部
+16 处注入点**（16 处分布在 `lookup_dcache` / `lookup_one_qstr_excl`×3 / `lookup_fast`×3 /
+`__lookup_slow`×3 / `walk_component` / `link_path_walk` / `lookup_last` / `lookup_open` /
+`open_last_lookups`，外加文件头部那一个）：
 
 1. `link_path_walk()`：路径中间组件命中 sus_path 时
    `return -ENOENT;`（注释原文 "walking the sub path of sus path"）；

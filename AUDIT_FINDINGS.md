@@ -97,12 +97,23 @@
 >    会静默失去覆盖。
 > 6. ih 命中路径补上 `n_enoent_path` 计数与 ratelimited 日志，和 kprobe 路径一致。
 >
-> 有意不做：入口 8 字节的**两阶段原子写**（目前靠 `stop_machine` 保证不同时执行，残余风险是
-> 某 CPU 恰停在 4 字节中间）；trampoline 尾部 `ret x16` 造成的 RAS 净下溢（纯预测，本 SoC 无 GCS）。
+> 入口 8 字节已改成**两阶段原子写**（`susfs_ih_patch_entry()` / `susfs_ih_restore_entry()`）。
+> 每条入口的首指令都是 `paciasp`，所以"新 word0 + 旧 word1"会让 prologue 少了签名指令、
+> 目标自己的 `autiasp` 必失败；安全顺序是唯一的：安装时先写 `b <stub>`（entry[1]）再写
+> `bti c`（entry[0]），卸载时先写回 `orig[0]` 再写回 `orig[1]` —— 中途状态永远是
+> "真指令 + 分支"，而 stub 本来就是为这种进入方式设计的（trampoline 会再放一遍 prologue，
+> 重复的 `paciasp` 写同一地址同一签名）。真机 9 条入口全绿。
 >
-> 真机最终形状：默认参数装 **9 条**（8 个 native wrapper + `getname_flags`），
-> app(10123) 的 `cat`/`ls -l`/`stat`/`test -r`/执行该文件全部 ENOENT，root 正常，
-> `/dev/ptmx` 正常，8 CPU 全程在线，ring buffer 无 `CFI failure`/`BUG`/`WARNING`，`rmmod` 干净恢复。
+> trampoline 尾部 `ret x16` 造成的 RAS 净下溢仍未处理（纯预测影响，本 SoC 无 GCS）。
+>
+> **P2 验证工具与基线（实测）**：`ksu_susfs` 工具**没有**
+> `hide_sus_mnts_for_non_su_procs` 与 `add_sus_path_loop` 子命令，所以新增
+> `tools/susfs_sc.c`（freestanding aarch64 客户端，CI 编译成 `susfs_sc`，走
+> `reboot(0xDEADBEEF, 0xFAFAFAFA, cmd, payload)` 那条 supercall）。实测
+> `susfs_sc 0x55561 0100000000000000` → dmesg `sus_mount: hide (supercall)`，回读 err 正常。
+>
+> sus_mount 基线（改动前，同一台设备）：启用后 **root 与 app 的 `/proc/mounts` 都是 238 行、
+> `/data/adb` 都还是 1 行** —— 实测确认 P2-13"阈值恒假、功能 100% 不生效"。
 >
 > **未修**（按优先级见 C 节）：P2 其余（sus_mount 域门控与阈值、sus_map 门控、
 > open_redirect 反向伪装与 scheme 1-4、`_LOOP` 语义）、P3 细节。
@@ -260,8 +271,8 @@ stock KernelSU 是 `u:r:su:s0` —— 默认值不匹配时会静默失效。
 
 | 位置 | 值 |
 |---|---|
-| 上游 kernel `susfs.h:71` | `(1 < 8)` → **0**（typo） |
-| 上游**用户态** `ksu_susfs/jni/features/sus_kstat.c:25` | `(1 < 8)` → **0**（**同样有 typo**） |
+| 上游 kernel `susfs.h:71` | `(1 < 8)` → **1**（typo，等于 `1 < 8` 的比较结果为真） |
+| 上游**用户态** `ksu_susfs/jni/features/sus_kstat.c:25` | `(1 < 8)` → **1**（**同样有 typo**，置 bit 8 实际置的是 bit 0） |
 | 我们的 `susfs_abi.h:99` | `(1 << 8)` → **256**（修正值） |
 
 **结论**：

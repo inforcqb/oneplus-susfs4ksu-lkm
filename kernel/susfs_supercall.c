@@ -171,10 +171,55 @@ static void susfs_tw_func(struct callback_head *cb)
 		susfs_sus_mount_supercall(&arg);
 		break;
 	default:
+		/* Unreachable: reboot_pre() only defers a command that
+		 * susfs_cmd_handled() accepted.  Kept as a net in case the two
+		 * lists ever drift apart. */
 		pr_info("susfs supercall: unsupported cmd 0x%x\n", tw->cmd);
 		break;
 	}
 	kfree(tw);
+}
+
+/* Commands susfs_tw_func() above actually dispatches - keep the two in sync.
+ *
+ * The kprobe consults this BEFORE it commits to swallowing the syscall, because
+ * upstream answers an unrecognised command with `return -EINVAL` from
+ * ksu_handle_sys_reboot() (KernelSU/10_enable_susfs_for_ksu.patch:2925-2926);
+ * reboot.c's `if (ret) goto orig_flow;` then falls through to the real reboot
+ * path, whose magic check rejects 0xDEADBEEF/0xFAFAFAFA with -EINVAL - i.e.
+ * userspace gets -EINVAL out of reboot(2).  Upstream writes NOTHING to
+ * payload.err in that case, and that is the whole kernel-side contract: 126
+ * (ERR_CMD_NOT_SUPPORTED) is a USERSPACE sentinel - the ksu_susfs C tool
+ * pre-seeds err with it and treats "still 126 after the syscall" as "the kernel
+ * never handled this command" (ksu_susfs/jni/features/sus_map.c:51-53,
+ * ksu_susfs/jni/includes/susfs_defs.h:16-18).
+ *
+ * So an unknown command must NOT be hijacked: leave the regs alone, let
+ * reboot(2) return -EINVAL, leave err untouched.  Every command listed here
+ * still short-circuits to 0 exactly as before, which is what the already
+ * verified command paths depend on. */
+static bool susfs_cmd_handled(unsigned int cmd)
+{
+	switch (cmd) {
+	case CMD_SUSFS_SHOW_VERSION:
+	case CMD_SUSFS_SHOW_VARIANT:
+	case CMD_SUSFS_SHOW_ENABLED_FEATURES:
+	case CMD_SUSFS_ADD_SUS_PATH:
+	case CMD_SUSFS_ADD_SUS_PATH_LOOP:
+	case CMD_SUSFS_ADD_SUS_MAP:
+	case CMD_SUSFS_ADD_SUS_KSTAT:
+	case CMD_SUSFS_UPDATE_SUS_KSTAT:
+	case CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY:
+	case CMD_SUSFS_SET_UNAME:
+	case CMD_SUSFS_ENABLE_LOG:
+	case CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING:
+	case CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG:
+	case CMD_SUSFS_ADD_OPEN_REDIRECT:
+	case CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS:
+		return true;
+	default:
+		return false;
+	}
 }
 
 static int reboot_pre(struct kprobe *kp, struct pt_regs *regs)
@@ -192,6 +237,15 @@ static int reboot_pre(struct kprobe *kp, struct pt_regs *regs)
 		return 0;
 	if (current_uid().val != 0)
 		return 0;
+
+	/* Not ours to answer: leave the syscall alone so reboot(2) reports the
+	 * -EINVAL upstream reports, and payload.err keeps whatever the caller put
+	 * there (that is how the C tool detects "command not supported").  See
+	 * susfs_cmd_handled(). */
+	if (!susfs_cmd_handled(cmd)) {
+		pr_info("susfs supercall: unsupported cmd 0x%x\n", cmd);
+		return 0;
+	}
 
 	tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
 	if (!tw)
