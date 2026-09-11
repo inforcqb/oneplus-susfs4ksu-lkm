@@ -171,10 +171,99 @@ static DEFINE_SPINLOCK(sus_path_buf_lock);
  * filtered" visible instead of just producing a longer listing. */
 static atomic_t n_dirent_rewrite_fail = ATOMIC_INIT(0);
 
+/* ---- the resolver's own exemption ----
+ *
+ * Every layer below answers "hidden" to whoever asks, and the background
+ * resolution of a pending rule has to ask the VFS itself (kern_path).  That walk
+ * passes through our own hooks, and the path-string layer matches the very rule
+ * being resolved - it is registered, that is the whole point - so the walk gets
+ * answered -ENOENT and the rule can never resolve.  Measured on the device: the
+ * pending rule stays pending, while the same path is correctly hidden by the
+ * string layer in the meantime.  Upstream has no such trap because its hiding is
+ * a flag set on an inode rather than a refusal to answer, and because it walks
+ * from the workqueue under override_creds(ksu_cred) (susfs.c:139, reverted at
+ * susfs.c:171) - see sus_path_override_creds() below, which mirrors that.
+ *
+ * So exactly one task is exempt: the task inside the resolve call, i.e. the one
+ * that stored itself here.  The exemption is per-task by construction, so every
+ * other process keeps being hidden for the whole window, and it is cleared
+ * immediately after kern_path() returns, on every path.  The exempt task is the
+ * root supercall caller (task_work) or a workqueue worker (retry timer).
+ */
+static struct task_struct *sus_path_resolver;
+
+static inline bool sus_path_is_resolver(void)
+{
+    return READ_ONCE(sus_path_resolver) == current;
+}
+
+/* Upstream resolves its _LOOP list from a workqueue worker too, and it does it
+ * under override_creds(ksu_cred) (susfs.c:139 ... revert_creds() at :171): the
+ * creds a worker walks with are not the ones the path is supposed to be visible
+ * to, and everything that decides on the caller - SELinux, DAC and our own gate
+ * - can tell the difference.  Same here.
+ *
+ * ksu_cred is a `struct cred *` in KernelSU (the `kernelsu` module on this
+ * device), so the symbol address points at the pointer and the value has to be
+ * read at use.  Resolved once; a missing symbol, a NULL pointer or a cred nobody
+ * holds a reference to means the walk simply runs with the caller's creds.
+ * use_ksu_cred=0 turns it off at runtime. */
+static int sus_path_use_ksu_cred = 1;
+module_param_named(use_ksu_cred, sus_path_use_ksu_cred, int, 0644);
+static struct cred **sus_path_ksu_cred_slot;
+static bool sus_path_ksu_cred_lookup_done;
+
+static const struct cred *sus_path_override_creds(void)
+{
+    struct cred *cred;
+
+    if (!sus_path_use_ksu_cred)
+        return NULL;
+
+    if (!sus_path_ksu_cred_lookup_done) {
+        sus_path_ksu_cred_slot = (struct cred **)find_kernel_symbol_exact("ksu_cred");
+        sus_path_ksu_cred_lookup_done = true;
+        pr_info("sus_path: ksu_cred %s - pending paths are resolved with %s creds\n",
+                sus_path_ksu_cred_slot ? "found" : "NOT found",
+                sus_path_ksu_cred_slot ? "KernelSU's" : "the caller's");
+    }
+    if (!sus_path_ksu_cred_slot)
+        return NULL;
+
+    cred = (struct cred *)READ_ONCE(*sus_path_ksu_cred_slot);
+    /* A cred with no reference left is stale (KernelSU sets this pointer once
+     * and never frees it while loaded) - do not walk with it. */
+    if (!cred || atomic_read(&cred->usage) <= 0)
+        return NULL;
+
+    return override_creds(cred);
+}
+
+static void sus_path_revert_creds(const struct cred *saved)
+{
+    if (saved)
+        revert_creds(saved);
+}
+
+/* What the pending machinery did, for hide_list: "pending never drops" has to be
+ * distinguishable from "the timer never ran" and from "the walk itself fails". */
+static atomic_t sus_path_pend_passes = ATOMIC_INIT(0);      /* resolve passes run */
+static atomic_t sus_path_pend_ticks = ATOMIC_INIT(0);       /* timer ticks run */
+static atomic_t sus_path_pend_walks = ATOMIC_INIT(0);       /* walks that succeeded */
+static atomic_t sus_path_pend_lost = ATOMIC_INIT(0);        /* walk ok, rule gone */
+static atomic_t sus_path_pend_last_rc = ATOMIC_INIT(0);     /* last walk result */
+static atomic_t sus_path_pend_logged_rc = ATOMIC_INIT(1);   /* rc already reported */
+
 static bool sus_path_is_hidden(u64 ino, const char *name)
 {
     struct sus_path_entry *e;
     bool hidden = false;
+
+    /* The one task resolving a pending rule is never answered "hidden": its own
+     * walk would otherwise be refused by this very table (see the block above
+     * sus_path_resolver).  Per-task, so nothing else changes. */
+    if (sus_path_is_resolver())
+        return false;
 
     /* A dirent is identified by (d_ino, name) and nothing else here - the
      * sys_exit tracepoint has neither the fd nor the superblock.  A rule whose
@@ -225,11 +314,16 @@ static bool sus_path_is_hidden(u64 ino, const char *name)
  *   - sus_path_resolve_pending() retries the lookup in sleepable context: from
  *     sus_path_supercall() (every add is a retry opportunity, which is what the
  *     tool produces naturally when it registers a batch of rules) and from a
- *     bounded retry timer.
+ *     bounded retry timer;
+ *   - the resolving task is exempt from our own hiding and walks with KernelSU's
+ *     creds, because the walk of a registered path is exactly what every layer
+ *     below would refuse (sus_path_resolver, sus_path_override_creds(); upstream
+ *     needs the creds half of this for its own workqueue walk, susfs.c:139).
  *
  * A rule that is still missing after the timer gives up keeps hiding the path
  * through the string layer; what it loses is only the getdents64 filter and the
- * by-inode layers, and the next add re-arms the timer.
+ * by-inode layers, and the next add re-arms the timer - re-adding the same path
+ * after it exists also completes the pending entry on the spot.
  */
 
 /* Basename of a registered path: what the getdents64 filter compares d_name
@@ -258,6 +352,7 @@ static int sus_path_resolve_pending(void)
      * the supercall never blocks behind a pass that is sleeping in kern_path(). */
     if (!mutex_trylock(&sus_path_pending_lock))
         return 0;
+    atomic_inc(&sus_path_pend_passes);
 
     /* Pass marker.  0 means "never attempted", so generation 0 is skipped. */
     spin_lock(&sus_path_lock);
@@ -269,8 +364,11 @@ static int sus_path_resolve_pending(void)
     while (budget-- > 0) {
         struct sus_path_entry *e, *slot;
         struct inode *inode = NULL;
+        const struct cred *saved;
         struct path p;
         char name[NAME_MAX + 1];
+        bool published = false;
+        int rc;
 
         path[0] = '\0';
         spin_lock(&sus_path_lock);
@@ -288,7 +386,20 @@ static int sus_path_resolve_pending(void)
             break;              /* every pending rule was attempted */
 
         name[0] = '\0';
-        if (!kern_path(path, LOOKUP_FOLLOW, &p)) {
+
+        /* Exempt THIS task (and only it) from our own hiding for the duration of
+         * the walk, and walk with KernelSU's creds like upstream does.  Both are
+         * cleared/undone immediately, whatever the walk answers - the exemption
+         * is per-task, so every other process keeps being hidden throughout. */
+        WRITE_ONCE(sus_path_resolver, current);
+        saved = sus_path_override_creds();
+        rc = kern_path(path, LOOKUP_FOLLOW, &p);
+        sus_path_revert_creds(saved);
+        WRITE_ONCE(sus_path_resolver, NULL);
+
+        atomic_set(&sus_path_pend_last_rc, rc);
+        if (!rc) {
+            atomic_inc(&sus_path_pend_walks);
             inode = d_inode(p.dentry);
             if (inode) {
                 strscpy(name, p.dentry->d_name.name, sizeof(name));
@@ -297,6 +408,14 @@ static int sus_path_resolve_pending(void)
                 ihold(inode);
             }
             path_put(&p);
+        } else if (rc != atomic_read(&sus_path_pend_logged_rc)) {
+            /* Report each distinct answer once: a rule that never resolves has
+             * to be distinguishable from a timer that never ran, and the answer
+             * (-ENOENT, -EACCES, -ENOTDIR) says which of the two it is without
+             * putting the hidden path itself into the log. */
+            atomic_set(&sus_path_pend_logged_rc, rc);
+            pr_info("sus_path: pending walk rc=%d (%d pending, pass %u)\n",
+                    rc, atomic_read(&sus_path_n_pending), gen);
         }
 
         /* The entry is re-found rather than used across the sleep: the table can
@@ -319,11 +438,14 @@ static int sus_path_resolve_pending(void)
             inode = NULL;               /* the table holds the reference now */
             atomic_dec(&sus_path_n_pending);
             resolved++;
+            published = true;
         }
         spin_unlock(&sus_path_lock);
 
         if (inode)
             iput(inode);                /* the rule is gone, or already resolved */
+        else if (!rc && !published)
+            atomic_inc(&sus_path_pend_lost);    /* walk ok, nothing to publish */
     }
 
     if (resolved)
@@ -353,10 +475,18 @@ static void sus_path_pending_arm(void)
 
 /* Retry timer.  Bounded on purpose: upstream's equivalent runs once per app
  * spawn, which is a free trigger, while this one costs a periodic work item -
- * and a rule whose path never appears must not keep it alive forever. */
+ * and a rule whose path never appears must not keep it alive forever.
+ *
+ * A tick that cannot resolve anything is not silent any more: the walk's own
+ * result is logged once per distinct value by sus_path_resolve_pending(), and
+ * hide_list carries the pass/tick/walk counters, so "the timer never ran" and
+ * "the walk keeps failing" are told apart without guessing. */
 static void sus_path_pending_work(struct work_struct *w)
 {
-    int resolved = sus_path_resolve_pending();
+    int resolved;
+
+    atomic_inc(&sus_path_pend_ticks);
+    resolved = sus_path_resolve_pending();
 
     if (!atomic_read(&sus_path_n_pending))
         return;                 /* every rule has its inode now */
@@ -365,8 +495,9 @@ static void sus_path_pending_work(struct work_struct *w)
         atomic_set(&sus_path_pending_tries, 0);     /* progress: keep trying */
 
     if (atomic_inc_return(&sus_path_pending_tries) > SUS_PATH_PENDING_TRIES) {
-        pr_info("sus_path: %d rule(s) still pending after %d retries - retry timer stops; the path layer keeps hiding them, the next add tries again\n",
-                atomic_read(&sus_path_n_pending), SUS_PATH_PENDING_TRIES);
+        pr_info("sus_path: %d rule(s) still pending after %d retries (last walk rc=%d) - retry timer stops; the path layer keeps hiding them, the next add tries again\n",
+                atomic_read(&sus_path_n_pending), SUS_PATH_PENDING_TRIES,
+                atomic_read(&sus_path_pend_last_rc));
         return;
     }
     schedule_delayed_work(&sus_path_pending_wq, SUS_PATH_PENDING_RETRY_S * HZ);
@@ -489,6 +620,11 @@ static bool sus_path_inode_hidden(struct inode *inode)
     bool hidden = false;
 
     if (!inode || !READ_ONCE(sus_path_count))
+        return false;
+
+    /* See sus_path_resolver: the task resolving a pending rule must not be
+     * answered by its own table, or its walk of that very path is refused. */
+    if (sus_path_is_resolver())
         return false;
 
     spin_lock(&sus_path_lock);
@@ -736,6 +872,12 @@ static bool sus_path_match_path(const char *path)
 {
     struct sus_path_entry *e;
     bool hit = false;
+
+    /* NOT a matching rule, an exemption: the task resolving a pending rule walks
+     * that rule's own path, so it must not be answered by it (see
+     * sus_path_resolver).  Everything below is unchanged. */
+    if (sus_path_is_resolver())
+        return false;
 
     if (!path || path[0] != '/')    /* only absolute paths are comparable */
         return false;
@@ -1647,6 +1789,18 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
                    "dirent: rewrite-fail=%d  pending=%d\n",
                    atomic_read(&n_dirent_rewrite_fail),
                    atomic_read(&sus_path_n_pending));
+    /* Everything the pending machinery did, so that "still pending" can be read
+     * for what it is: passes/ticks == 0 means the retry never ran at all, walks
+     * > 0 with pending > 0 means the walk kept failing (last-rc says how), and
+     * lost > 0 would mean a walk succeeded with no rule left to publish it. */
+    n += scnprintf(buf + n, PAGE_SIZE - n,
+                   "pend: passes=%d ticks=%d walks=%d lost=%d last-rc=%d ksu-cred=%d\n",
+                   atomic_read(&sus_path_pend_passes),
+                   atomic_read(&sus_path_pend_ticks),
+                   atomic_read(&sus_path_pend_walks),
+                   atomic_read(&sus_path_pend_lost),
+                   atomic_read(&sus_path_pend_last_rc),
+                   (int)(sus_path_use_ksu_cred && sus_path_ksu_cred_slot != NULL));
 
     spin_lock(&sus_path_lock);
     list_for_each_entry(e, &sus_path_list, list)
@@ -1960,6 +2114,25 @@ void sus_path_supercall(void __user **arg)
                     iput(e->inode);
                 kfree(e);
                 info.err = 0;   /* already registered, upstream is idempotent */
+                goto out;
+            }
+            /* The rule is there as a pending one and this add is what resolved
+             * it: complete that entry instead of registering a second one for
+             * the same path (a boot script that runs twice would otherwise
+             * leave one resolved and one pending entry behind).  Re-adding a
+             * path is therefore also the manual way to force the resolution. */
+            if (inode && !cur->inode && !strcmp(cur->path, e->path)) {
+                cur->dev = dev;
+                cur->ino = ino;
+                strscpy(cur->name, e->name, sizeof(cur->name));
+                cur->inode = e->inode;      /* the reference moves over */
+                e->inode = NULL;
+                atomic_dec(&sus_path_n_pending);
+                spin_unlock(&sus_path_lock);
+                kfree(e);
+                info.err = 0;
+                pr_info("sus_path: hide '%s' (pending rule completed by this add, dev=%llu ino=%llu)\n",
+                        info.target_pathname, dev, ino);
                 goto out;
             }
         }

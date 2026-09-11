@@ -289,6 +289,8 @@ static int sus_mount_mark_ksu_mounts(void)
     int marked = 0;
     unsigned int seen = 0;
     int scan_logged = 0;
+    unsigned int n_devname = 0, n_dpath_ok = 0, n_dpath_err = 0;
+    unsigned int n_skipped_ns = 0, n_skipped_marked = 0;
     bool hit_cap = false;
     bool failed = false;
 
@@ -352,18 +354,23 @@ static int sus_mount_mark_ksu_mounts(void)
         r = list_entry(pos, struct mount, mnt_list);
         /* proc_mounts cursors are fake mounts anchored in this same list
          * (fs/namespace.c:678-681 mnt_is_cursor(), include/linux/mount.h:70). */
-        if (r->mnt_ns != ns || (r->mnt.mnt_flags & MNT_CURSOR))
+        if (r->mnt_ns != ns || (r->mnt.mnt_flags & MNT_CURSOR)) {
+            n_skipped_ns++;
             continue;
+        }
         /* Skip anything already carrying a KSU-range id: this is the idempotency
          * guard (a re-enable, or an enable after the load-time scan, must not
          * allocate a second id for the same mount - that would leak the first
          * one for the mount's lifetime) and it is upstream's own test
          * (patch:807).  Uses the constant, not the tunable, see
          * SUS_MOUNT_KSU_ID_MIN. */
-        if ((unsigned int)r->mnt_id >= SUS_MOUNT_KSU_ID_MIN)
+        if ((unsigned int)r->mnt_id >= SUS_MOUNT_KSU_ID_MIN) {
+            n_skipped_marked++;
             continue;
+        }
 
         if (sus_mount_is_adb_devname(r->mnt_devname)) {
+            n_devname++;
             shown = r->mnt_devname;
         } else {
             /* meta-overlayfs style: the source is /dev/block/loopNN, so only the
@@ -379,7 +386,12 @@ static int sus_mount_mark_ksu_mounts(void)
                 pr_info("sus_mount: scan %s -> %s\n", r->mnt_devname,
                         IS_ERR_OR_NULL(dp) ? "(d_path failed)" : dp);
             }
-            if (IS_ERR_OR_NULL(dp) || !sus_mount_is_adb_mountpoint(dp))
+            if (IS_ERR_OR_NULL(dp)) {
+                n_dpath_err++;
+                continue;
+            }
+            n_dpath_ok++;
+            if (!sus_mount_is_adb_mountpoint(dp))
                 continue;
             shown = dp;
         }
@@ -426,6 +438,9 @@ static int sus_mount_mark_ksu_mounts(void)
     else
         pr_info("sus_mount: 0 KSU mounts marked (nothing under /data/adb matched in this mnt ns, hide threshold %lu)\n",
                 min);
+    pr_info("sus_mount: scan stats: seen=%u devname_hits=%u dpath_ok=%u dpath_err=%u skipped(other ns/cursor)=%u skipped(already marked)=%u marked=%d\n",
+            seen, n_devname, n_dpath_ok, n_dpath_err, n_skipped_ns,
+            n_skipped_marked, marked);
     return marked;
 }
 
