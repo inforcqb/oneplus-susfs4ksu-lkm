@@ -16,8 +16,10 @@ obj-m += enoent_probe_test.o
 obj-m += selinux_probe_test.o
 obj-m += selinux_hide_probe.o
 obj-m += ih_probe_test.o
+obj-m += ih_hook_test.o
 selinux_hide_probe-objs := selinux_hide_probe_main.o lsm_hook.o patch_memory.o symbol_resolver.o
 ih_probe_test-objs := ih_probe_main.o symbol_resolver.o
+ih_hook_test-objs := ih_hook_main.o ih_hook_stub.o patch_memory.o symbol_resolver.o
 
 susfs_guard_lkm-objs := susfs_main.o patch_memory.o symbol_resolver.o lsm_hook.o \
               susfs_uname.o susfs_kstat.o sus_map.o sus_path.o sus_mount.o \

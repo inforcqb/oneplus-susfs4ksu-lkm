@@ -96,4 +96,5 @@ jobs:
             test_sc
             test_compat_open
             kernel/ih_probe_test.ko
+            kernel/ih_hook_test.ko
           if-no-files-found: error
