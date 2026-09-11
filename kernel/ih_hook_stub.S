@@ -50,6 +50,22 @@
 
 	.text
 
+/* Self-test target, written in assembly on purpose: a C function in a module
+ * gets a paciasp prologue AND a stack-protector canary, and that canary is
+ * loaded with adrp (PC-relative), which is exactly what the patch sanity check
+ * must refuse.  This one has a prologue that can be replayed verbatim. */
+	.globl	ih_test_target
+	.type	ih_test_target, %function
+ih_test_target:
+	stp	x29, x30, [sp, #-16]!
+	mov	x29, sp
+	mov	w1, #3
+	mul	x0, x0, x1
+	add	x0, x0, #7
+	ldp	x29, x30, [sp], #16
+	ret
+	.size	ih_test_target, . - ih_test_target
+
 	.globl	ih_openat_stub
 	.type	ih_openat_stub, %function
 ih_openat_stub:

@@ -61,15 +61,11 @@ static int hook_syscall;
 module_param(hook_syscall, int, 0444);
 
 /* ------------------------------------------------------------------ */
-/* self-test target: a real function in this module, so the whole path can be
- * exercised without touching anything the system depends on. */
+/* self-test target: a real function in this module (assembly, see
+ * ih_hook_stub.S), so the whole path can be exercised without touching anything
+ * the system depends on. */
 
-static noinline long ih_test_target(long x)
-{
-	return x * 3 + 7;
-}
-
-static long (*volatile ih_test_call)(long) = ih_test_target;
+extern long ih_test_target(long x);
 
 static long ih_selftest_arg;
 static int ih_selftest_hide;
@@ -119,7 +115,7 @@ static void ih_flush_icache(void *addr, unsigned long len)
 
 /* Patch either core text (ksu_patch_text, which knows how to get at read-only
  * kernel text) or this module's own read-only text (unlock, write, re-lock). */
-static int ih_write_text(void *dst, const void *src, size_t len, bool core_text)
+static __nocfi int ih_write_text(void *dst, const void *src, size_t len, bool core_text)
 {
 	unsigned long page = (unsigned long)dst & PAGE_MASK;
 
@@ -160,7 +156,7 @@ static bool ih_sane_prologue(const u32 *insn)
 
 /* Build the trampoline for `entry`: replay the two instructions we overwrite,
  * then ldr x16, #8 / ret x16 into entry+8.  Returns the page or NULL. */
-static void *ih_build_tramp(unsigned long entry, const u32 *orig)
+static __nocfi void *ih_build_tramp(unsigned long entry, const u32 *orig)
 {
 	u32 *tr = pfn_module_alloc(IH_TRAMP_SIZE);
 
@@ -242,7 +238,7 @@ static void ih_run_selftest(void)
 
 	pr_info("ih_selftest: target %s @ %px\n", "ih_test_target", (void *)entry);
 
-	got = ih_test_call(5);
+	got = ih_test_target(5);
 	pr_info("ih_selftest: step 1 baseline target(5) = %ld (expect 22)\n", got);
 
 	rc = ih_patch(entry, ih_selftest_stub, false, saved, &tr,
@@ -253,18 +249,18 @@ static void ih_run_selftest(void)
 		return;
 
 	ih_selftest_hide = 0;
-	got = ih_test_call(5);
+	got = ih_test_target(5);
 	pr_info("ih_selftest: step 3 allow -> target(5) = %ld (expect 22, via trampoline)\n",
 		got);
 
 	ih_selftest_hide = 1;
-	got = ih_test_call(5);
+	got = ih_test_target(5);
 	pr_info("ih_selftest: step 4 hide  -> target(5) = %ld (expect -2), decide saw %ld\n",
 		got, ih_selftest_arg);
 
 	ih_selftest_hide = 0;
 	ih_unpatch(entry, saved, false, &ih_selftest_tramp);
-	got = ih_test_call(5);
+	got = ih_test_target(5);
 	pr_info("ih_selftest: step 5 restored target(5) = %ld (expect 22)\n", got);
 }
 
@@ -289,7 +285,7 @@ static int ih_hook_openat(void)
 	return 0;
 }
 
-static int __init ih_hook_init(void)
+static __nocfi int __init ih_hook_init(void)
 {
 	pr_info("ih_hook: inline-hook test (selftest=%d hook_syscall=%d)\n",
 		selftest, hook_syscall);
@@ -316,7 +312,7 @@ static int __init ih_hook_init(void)
 	return 0;
 }
 
-static void __exit ih_hook_exit(void)
+static __nocfi void __exit ih_hook_exit(void)
 {
 	if (ih_openat_installed) {
 		ih_unpatch(ih_openat_entry, ih_openat_orig, true, &ih_openat_tramp);
