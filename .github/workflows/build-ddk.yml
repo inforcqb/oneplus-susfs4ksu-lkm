@@ -94,4 +94,5 @@ jobs:
             kernel/selinux_probe_test.ko
             kernel/selinux_hide_probe.ko
             test_sc
+            test_compat_open
           if-no-files-found: error
