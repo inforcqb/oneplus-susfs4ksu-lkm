@@ -54,6 +54,7 @@
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact, for optional compat probes */
+#include "susfs_inline_hook.h"	/* entry patching, replaces the hot kprobes */
 #include "lsm_hook.h"
 
 #define DIRENT_BUF_SIZE 65536  /* getdents usually returns <= 32-64KB */
@@ -850,6 +851,253 @@ static void sus_path_path_unregister(void)
     }
 }
 
+/* Every hook below the LSM layer is only worth its cost once something is
+ * actually registered: kprobe/kretprobe entry costs a brk trap per hit, and the
+ * getdents64 tracepoint sits on every syscall exit.  With no rules there is
+ * nothing to answer, so they are armed on the first rule and torn down when the
+ * module goes - the same "no rules, no cost" effect as nop'ing a patched call
+ * site, but through the kernel's own register/unregister paths (unregistering a
+ * kprobe restores the original instruction) instead of hand-written text
+ * patching.
+ *
+ * The LSM hooks are exempt: they are pointer swaps, already cost-free. */
+static bool path_registered;
+static bool hooks_armed;
+
+/* The tracepoint callback and the filter it drives are defined below. */
+static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret);
+
+/* Inline hooks are defined further down; armed from sus_path_hooks_arm(). */
+static int sus_path_ih_register(void);
+static void sus_path_ih_unregister(void);
+
+static void sus_path_tracepoint_register(void)
+{
+    int rc = register_trace_sys_exit(sus_path_sys_exit, NULL);
+
+    if (rc) {
+        pr_warn("register_trace_sys_exit(getdents64) failed %d\n", rc);
+        return;
+    }
+    path_registered = true;
+    pr_info("sus_path: getdents64 filter armed\n");
+}
+
+static void sus_path_hooks_arm(void)
+{
+    if (hooks_armed || !READ_ONCE(sus_path_count))
+        return;
+
+    hooks_armed = true;
+    sus_path_tracepoint_register();
+
+    /* Entry-decision and onLeave hooks: patch the entries if we can, otherwise
+     * probe them.  Never both - a kprobe owns the first instruction of its
+     * target.  getname is in the patched set too now: its stub returns to
+     * itself after the original ran, which is what the kretprobe used to do. */
+    if (sus_path_ih_register())
+        pr_info("sus_path: syscall/path/getname use inline hooks\n");
+    else {
+        sus_path_syscall_register();
+        sus_path_path_register();
+        sus_path_getname_register();
+    }
+    pr_info("sus_path: hooks armed (first rule registered)\n");
+}
+
+/* ---- inline hooks ----
+ *
+ * The entry points below are the ones where a decision can be made at the
+ * ENTRY: read the caller's path, answer ENOENT, or let the call run.  They are
+ * patched instead of kprobed, because arm64 kprobe is a brk trap on every hit
+ * while this is a branch (see INLINE_HOOK.md).
+ *
+ * Entries that need to run the original function and inspect its RESULT
+ * (getname's struct filename, vfs_getattr's kstat, the getdents64 tracepoint)
+ * keep their probe: that is an onLeave hook, not an entry decision.
+ *
+ * A kprobe and an inline hook cannot share an entry - the kprobe replaces the
+ * first instruction with brk - so if inline hooking fails for any entry, all of
+ * them are rolled back and the kprobes are used instead.
+ */
+extern void susfs_ih_stub_openat(void);
+extern void susfs_ih_stub_openat2(void);
+extern void susfs_ih_stub_newfstatat(void);
+extern void susfs_ih_stub_statx(void);
+extern void susfs_ih_stub_faccessat(void);
+extern void susfs_ih_stub_faccessat2(void);
+extern void susfs_ih_stub_readlinkat(void);
+extern void susfs_ih_stub_execve(void);
+extern void susfs_ih_stub_filename_lookup(void);
+extern void susfs_ih_stub_do_filp_open(void);
+extern void susfs_ih_stub_user_path_at_empty(void);
+extern void susfs_ih_stub_getname(void);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/* onLeave handler for getname(): the stub calls this after the original ran, with
+ * the original arguments and its return value (in x2).  Returning a different
+ * value replaces it - which is how a kretprobe's job is done with a patched
+ * entry.
+ *
+ * On a hit the freshly allocated struct filename must be released first
+ * (putname), otherwise it leaks; every caller already checks IS_ERR. */
+__attribute__((visibility("hidden"))) u64 susfs_ih_after_getname(u64 a0, u64 a1, u64 ret)
+{
+	struct filename *f = (struct filename *)ret;
+
+	if (IS_ERR_OR_NULL(f) || !f->name)
+		return ret;
+	if (!sus_path_match_path(f->name))
+		return ret;
+
+	pr_info_ratelimited("sus_path: getname hit '%s' (uid=%u)\n",
+			    f->name, current_uid().val);
+	putname(f);
+	return (u64)(unsigned long)ERR_PTR(-ENOENT);
+}
+
+/* Called from the syscall stubs: x0 is the wrapper's pt_regs, argno the register
+ * holding the pathname. */
+__attribute__((visibility("hidden"))) int susfs_ih_decide(u64 uregs_arg, int argno)
+{
+	const struct pt_regs *uregs = (const struct pt_regs *)uregs_arg;
+	const char __user *up;
+	char buf[SUS_PATH_LEN];
+	long n;
+
+	if (!uregs || argno < 0 || argno > 5)
+		return 0;
+	if (!sus_path_gate_uid_ok())
+		return 0;
+
+	up = (const char __user *)uregs->regs[argno];
+	if (is_compat_task()) {
+#ifdef CONFIG_COMPAT
+		up = compat_ptr((u32)uregs->regs[argno]);
+#else
+		return 0;
+#endif
+	}
+	if (!up)
+		return 0;
+
+	n = strncpy_from_user(buf, up, sizeof(buf) - 1);
+	if (n <= 0)
+		return 0;
+	buf[n] = '\0';
+	return sus_path_match_path(buf) ? 1 : 0;
+}
+
+/* Called from the name-taking stubs: mode 0 = struct filename (already copied
+ * into kernel memory, so no uaccess at all), mode 1 = __user pointer. */
+__attribute__((visibility("hidden"))) int susfs_ih_decide_name(u64 p, int mode)
+{
+	char buf[SUS_PATH_LEN];
+	long n;
+
+	if (!p || !sus_path_gate_uid_ok())
+		return 0;
+
+	if (mode == 0) {
+		const struct filename *f = (const struct filename *)p;
+
+		if (!f->name)
+			return 0;
+		return sus_path_match_path(f->name) ? 1 : 0;
+	}
+
+	n = strncpy_from_user(buf, (const char __user *)p, sizeof(buf) - 1);
+	if (n <= 0)
+		return 0;
+	buf[n] = '\0';
+	return sus_path_match_path(buf) ? 1 : 0;
+}
+
+static int ih_enabled = 1;
+module_param(ih_enabled, int, 0644);
+
+static struct {
+	const char *sym;
+	void *stub;
+	u64 *tramp;
+} ih_table[] = {
+	{ "__arm64_sys_openat",        susfs_ih_stub_openat,        NULL },
+	{ "__arm64_sys_openat2",       susfs_ih_stub_openat2,       NULL },
+	{ "__arm64_sys_newfstatat",    susfs_ih_stub_newfstatat,    NULL },
+	{ "__arm64_sys_statx",         susfs_ih_stub_statx,         NULL },
+	{ "__arm64_sys_faccessat",     susfs_ih_stub_faccessat,     NULL },
+	{ "__arm64_sys_faccessat2",    susfs_ih_stub_faccessat2,    NULL },
+	{ "__arm64_sys_readlinkat",    susfs_ih_stub_readlinkat,    NULL },
+	{ "__arm64_sys_execve",        susfs_ih_stub_execve,        NULL },
+	{ "filename_lookup",           susfs_ih_stub_filename_lookup, NULL },
+	{ "do_filp_open",              susfs_ih_stub_do_filp_open,  NULL },
+	{ "user_path_at_empty",        susfs_ih_stub_user_path_at_empty, NULL },
+	{ "getname",                   susfs_ih_stub_getname,       NULL },
+};
+
+#define N_IH_HOOKS ARRAY_SIZE(ih_table)
+static struct susfs_ih_hook ih_hooks[N_IH_HOOKS];
+
+/* The stubs cannot take a module symbol address themselves - the assembler folds
+ * adrp/add (and :got:) into movz/movk, which cannot hold an address the loader
+ * has not chosen yet.  So they call in with their index and the C compiler emits
+ * the addressing.  Must be the first stub helper: the .S order matches ih_table. */
+__attribute__((visibility("hidden"))) u64 susfs_ih_get_tramp(int idx)
+{
+	if (idx < 0 || idx >= (int)N_IH_HOOKS)
+		return 0;
+	return (u64)(unsigned long)ih_hooks[idx].tramp;
+}
+
+/* Returns the number installed, or 0 if inline hooking is unavailable/disabled. */
+static int sus_path_ih_register(void)
+{
+	int i, n = 0;
+
+	if (!ih_enabled)
+		return 0;
+	if (susfs_ih_init())
+		return 0;
+
+	for (i = 0; i < N_IH_HOOKS; i++) {
+		if (susfs_ih_install(&ih_hooks[i], ih_table[i].sym, ih_table[i].stub,
+				     ih_table[i].tramp))
+			break;
+		n++;
+	}
+
+	if (n != N_IH_HOOKS) {
+		pr_warn("sus_path: inline hooks incomplete (%d/%d), rolling back to kprobes\n",
+			n, (int)N_IH_HOOKS);
+		while (n-- > 0)
+			susfs_ih_uninstall(&ih_hooks[n]);
+		return 0;
+	}
+
+	pr_info("sus_path: inline hooks armed (%d entries patched)\n", n);
+	return n;
+}
+
+static void sus_path_ih_unregister(void)
+{
+	int i;
+
+	for (i = 0; i < N_IH_HOOKS; i++)
+		susfs_ih_uninstall(&ih_hooks[i]);
+}
+
 /* compact the dirent chain in-place; returns the new byte count */
 static long sus_path_filter(unsigned long buf, long count)
 {
@@ -1006,8 +1254,6 @@ static const struct kernel_param_ops sus_path_list_ops = {
  * looking for.  (A raw inode pointer used to be printed here too; removed.) */
 module_param_cb(hide_list, &sus_path_list_ops, NULL, 0400);
 
-static bool path_registered;
-
 /* Add a path to the hidden set from kernel code, bypassing the supercall.
  * Used by susfs_init() to self-hide the /proc control nodes.
  *
@@ -1070,6 +1316,7 @@ int sus_path_add_hidden(const char *path)
 	spin_unlock(&sus_path_lock);
 
 	pr_info("sus_path: hidden (built-in) '%s'\n", path);
+	sus_path_hooks_arm();
 	return 0;
 }
 
@@ -1090,13 +1337,11 @@ int sus_path_init(void)
         return -ENOMEM;
     }
 
-    rc = register_trace_sys_exit(sus_path_sys_exit, NULL);
-    if (rc)
-        pr_warn("register_trace_sys_exit(getdents64) failed %d\n", rc);
-    else {
-        path_registered = true;
-        pr_info("sus_path: getdents64 filter armed\n");
-    }
+    /* The getdents64 tracepoint (it sits on every syscall exit), the syscall
+     * probes and the getname hooks are armed by sus_path_hooks_arm() once a
+     * rule exists: with nothing registered there is nothing to answer, so they
+     * cost nothing until then. */
+    pr_info("sus_path: hooks deferred until the first rule\n");
 
     /* LSM hooks: reject path-based access to registered inodes outright. */
     rc = ksu_register_lsm_hook(&sus_path_getattr_hook);
@@ -1114,16 +1359,10 @@ int sus_path_init(void)
                 sus_path_perm_hook.original);
 
     /* And the DAC layer, without which a caller DAC denies gets EACCES instead
-     * of ENOENT (see the note above it). */
+     * of ENOENT (see the note above it).  Registered eagerly because it is the
+     * layer that would otherwise answer EACCES, and it has never been observed
+     * to fire on this kernel anyway. */
     sus_path_dac_register();
-
-    /* Plus the entry-point layer: the probes above register but never fire on
-     * this kernel (LTO inlines them), and this is the layer that actually
-     * answers ENOENT before the DAC check on a hidden directory can answer
-     * EACCES. */
-    sus_path_path_register();
-    sus_path_syscall_register();
-    sus_path_getname_register();
 
     return 0;
 }
@@ -1136,6 +1375,7 @@ void sus_path_exit(void)
     /* Unregister the hooks FIRST: after this nothing can match, so the entries
      * (and their inode references) can be torn down safely. */
     sus_path_getname_unregister();
+    sus_path_ih_unregister();
     sus_path_syscall_unregister();
     sus_path_path_unregister();
     sus_path_dac_unregister();
@@ -1265,14 +1505,10 @@ void sus_path_supercall(void __user **arg)
             goto out;
         }
     }
-    if (!path_registered) {
-        rc = register_trace_sys_exit(sus_path_sys_exit, NULL);
-        if (rc) {
-            info.err = rc;
-            goto out;
-        }
-        path_registered = true;
-    }
+
+    /* First rule: arm the tracepoint, the syscall probes and the getname
+     * hooks.  Idempotent, and safe to call with a rule already in the list. */
+    sus_path_hooks_arm();
 
     info.err = 0;
     pr_info("sus_path: hide '%s' (dev=%llu ino=%llu)\n",
