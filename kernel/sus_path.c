@@ -860,7 +860,11 @@ static void sus_path_path_unregister(void)
  * patching.
  *
  * The LSM hooks are exempt: they are pointer swaps, already cost-free. */
+static bool path_registered;
 static bool hooks_armed;
+
+/* The tracepoint callback and the filter it drives are defined below. */
+static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret);
 
 static void sus_path_tracepoint_register(void)
 {
