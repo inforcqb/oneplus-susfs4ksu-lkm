@@ -50,7 +50,7 @@
 
 /* allow path: ask C for this entry's trampoline, then leave for it */
 #define IH_TAIL(idx)						\
-	mov	w0, #idx;					\
+	mov	w0, idx;					\
 	bl	susfs_ih_get_tramp;				\
 	mov	x16, x0;					\
 	IH_RESTORE_ARGS();					\
@@ -78,7 +78,7 @@
 	.type	susfs_ih_stub_##n, %function;			\
 susfs_ih_stub_##n:;						\
 	IH_SAVE();						\
-	mov	w1, #argno;					\
+	mov	w1, argno;					\
 	bl	susfs_ih_decide;				\
 	cbz	x0, 8f;						\
 	IH_HIDE();						\
@@ -95,7 +95,7 @@ susfs_ih_stub_##n:;						\
 susfs_ih_stub_##n:;						\
 	IH_SAVE();						\
 	mov	x0, x1;						\
-	mov	w1, #mode;					\
+	mov	w1, mode;					\
 	bl	susfs_ih_decide_name;				\
 	cbz	x0, 8f;						\
 	IH_HIDE();						\
@@ -120,7 +120,7 @@ susfs_ih_stub_##n:;						\
 	IH_SAVE();						\
 	adr	x9, 9f;						\
 	str	x9, [sp, #152];					\
-	mov	w0, #idx;					\
+	mov	w0, idx;					\
 	bl	susfs_ih_get_tramp;				\
 	mov	x16, x0;					\
 	ldr	x30, [sp, #152];				\
