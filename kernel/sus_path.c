@@ -54,6 +54,7 @@
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact, for optional compat probes */
+#include "susfs_inline_hook.h"	/* entry patching, replaces the hot kprobes */
 #include "lsm_hook.h"
 
 #define DIRENT_BUF_SIZE 65536  /* getdents usually returns <= 32-64KB */
@@ -885,10 +886,174 @@ static void sus_path_hooks_arm(void)
 
     hooks_armed = true;
     sus_path_tracepoint_register();
-    sus_path_syscall_register();
     sus_path_getname_register();
-    sus_path_path_register();
+
+    /* Entry-decision hooks: patch the entries if we can, otherwise probe them.
+     * Never both - a kprobe owns the first instruction of its target. */
+    if (sus_path_ih_register())
+        pr_info("sus_path: syscall/path entries use inline hooks\n");
+    else {
+        sus_path_syscall_register();
+        sus_path_path_register();
+    }
     pr_info("sus_path: hooks armed (first rule registered)\n");
+}
+
+/* ---- inline hooks ----
+ *
+ * The entry points below are the ones where a decision can be made at the
+ * ENTRY: read the caller's path, answer ENOENT, or let the call run.  They are
+ * patched instead of kprobed, because arm64 kprobe is a brk trap on every hit
+ * while this is a branch (see INLINE_HOOK.md).
+ *
+ * Entries that need to run the original function and inspect its RESULT
+ * (getname's struct filename, vfs_getattr's kstat, the getdents64 tracepoint)
+ * keep their probe: that is an onLeave hook, not an entry decision.
+ *
+ * A kprobe and an inline hook cannot share an entry - the kprobe replaces the
+ * first instruction with brk - so if inline hooking fails for any entry, all of
+ * them are rolled back and the kprobes are used instead.
+ */
+extern void susfs_ih_stub_openat(void);
+extern void susfs_ih_stub_openat2(void);
+extern void susfs_ih_stub_newfstatat(void);
+extern void susfs_ih_stub_statx(void);
+extern void susfs_ih_stub_faccessat(void);
+extern void susfs_ih_stub_faccessat2(void);
+extern void susfs_ih_stub_readlinkat(void);
+extern void susfs_ih_stub_execve(void);
+extern void susfs_ih_stub_filename_lookup(void);
+extern void susfs_ih_stub_do_filp_open(void);
+extern void susfs_ih_stub_user_path_at_empty(void);
+
+extern u64 susfs_ih_tramp_openat;
+extern u64 susfs_ih_tramp_openat2;
+extern u64 susfs_ih_tramp_newfstatat;
+extern u64 susfs_ih_tramp_statx;
+extern u64 susfs_ih_tramp_faccessat;
+extern u64 susfs_ih_tramp_faccessat2;
+extern u64 susfs_ih_tramp_readlinkat;
+extern u64 susfs_ih_tramp_execve;
+extern u64 susfs_ih_tramp_filename_lookup;
+extern u64 susfs_ih_tramp_do_filp_open;
+extern u64 susfs_ih_tramp_user_path_at_empty;
+
+/* Called from the syscall stubs: x0 is the wrapper's pt_regs, argno the register
+ * holding the pathname. */
+int susfs_ih_decide(u64 uregs_arg, int argno)
+{
+	const struct pt_regs *uregs = (const struct pt_regs *)uregs_arg;
+	const char __user *up;
+	char buf[SUS_PATH_LEN];
+	long n;
+
+	if (!uregs || argno < 0 || argno > 5)
+		return 0;
+	if (!sus_path_gate_uid_ok())
+		return 0;
+
+	up = (const char __user *)uregs->regs[argno];
+	if (is_compat_task()) {
+#ifdef CONFIG_COMPAT
+		up = compat_ptr((u32)uregs->regs[argno]);
+#else
+		return 0;
+#endif
+	}
+	if (!up)
+		return 0;
+
+	n = strncpy_from_user(buf, up, sizeof(buf) - 1);
+	if (n <= 0)
+		return 0;
+	buf[n] = '\0';
+	return sus_path_match_path(buf) ? 1 : 0;
+}
+
+/* Called from the name-taking stubs: mode 0 = struct filename (already copied
+ * into kernel memory, so no uaccess at all), mode 1 = __user pointer. */
+int susfs_ih_decide_name(u64 p, int mode)
+{
+	char buf[SUS_PATH_LEN];
+	long n;
+
+	if (!p || !sus_path_gate_uid_ok())
+		return 0;
+
+	if (mode == 0) {
+		const struct filename *f = (const struct filename *)p;
+
+		if (!f->name)
+			return 0;
+		return sus_path_match_path(f->name) ? 1 : 0;
+	}
+
+	n = strncpy_from_user(buf, (const char __user *)p, sizeof(buf) - 1);
+	if (n <= 0)
+		return 0;
+	buf[n] = '\0';
+	return sus_path_match_path(buf) ? 1 : 0;
+}
+
+static int ih_enabled = 1;
+module_param(ih_enabled, int, 0644);
+
+static struct {
+	const char *sym;
+	void *stub;
+	u64 *tramp;
+} ih_table[] = {
+	{ "__arm64_sys_openat",        susfs_ih_stub_openat,        &susfs_ih_tramp_openat },
+	{ "__arm64_sys_openat2",       susfs_ih_stub_openat2,       &susfs_ih_tramp_openat2 },
+	{ "__arm64_sys_newfstatat",    susfs_ih_stub_newfstatat,    &susfs_ih_tramp_newfstatat },
+	{ "__arm64_sys_statx",         susfs_ih_stub_statx,         &susfs_ih_tramp_statx },
+	{ "__arm64_sys_faccessat",     susfs_ih_stub_faccessat,     &susfs_ih_tramp_faccessat },
+	{ "__arm64_sys_faccessat2",    susfs_ih_stub_faccessat2,    &susfs_ih_tramp_faccessat2 },
+	{ "__arm64_sys_readlinkat",    susfs_ih_stub_readlinkat,    &susfs_ih_tramp_readlinkat },
+	{ "__arm64_sys_execve",        susfs_ih_stub_execve,        &susfs_ih_tramp_execve },
+	{ "filename_lookup",           susfs_ih_stub_filename_lookup, &susfs_ih_tramp_filename_lookup },
+	{ "do_filp_open",              susfs_ih_stub_do_filp_open,  &susfs_ih_tramp_do_filp_open },
+	{ "user_path_at_empty",        susfs_ih_stub_user_path_at_empty, &susfs_ih_tramp_user_path_at_empty },
+};
+
+#define N_IH_HOOKS ARRAY_SIZE(ih_table)
+static struct susfs_ih_hook ih_hooks[N_IH_HOOKS];
+
+/* Returns the number installed, or 0 if inline hooking is unavailable/disabled. */
+static int sus_path_ih_register(void)
+{
+	int i, n = 0;
+
+	if (!ih_enabled)
+		return 0;
+	if (susfs_ih_init())
+		return 0;
+
+	for (i = 0; i < N_IH_HOOKS; i++) {
+		if (susfs_ih_install(&ih_hooks[i], ih_table[i].sym, ih_table[i].stub,
+				     ih_table[i].tramp))
+			break;
+		n++;
+	}
+
+	if (n != N_IH_HOOKS) {
+		pr_warn("sus_path: inline hooks incomplete (%d/%d), rolling back to kprobes\n",
+			n, (int)N_IH_HOOKS);
+		while (n-- > 0)
+			susfs_ih_uninstall(&ih_hooks[n]);
+		return 0;
+	}
+
+	pr_info("sus_path: inline hooks armed (%d entries patched)\n", n);
+	return n;
+}
+
+static void sus_path_ih_unregister(void)
+{
+	int i;
+
+	for (i = 0; i < N_IH_HOOKS; i++)
+		susfs_ih_uninstall(&ih_hooks[i]);
 }
 
 /* compact the dirent chain in-place; returns the new byte count */
@@ -1168,6 +1333,7 @@ void sus_path_exit(void)
     /* Unregister the hooks FIRST: after this nothing can match, so the entries
      * (and their inode references) can be torn down safely. */
     sus_path_getname_unregister();
+    sus_path_ih_unregister();
     sus_path_syscall_unregister();
     sus_path_path_unregister();
     sus_path_dac_unregister();
