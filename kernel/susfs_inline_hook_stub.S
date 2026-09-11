@@ -82,7 +82,7 @@ susfs_ih_stub_##n:;						\
 	IH_SAVE();						\
 	mov	w1, argno;					\
 	bl	susfs_ih_decide;				\
-	cbz	x0, 8f;						\
+	cbz	w0, 8f;						\
 	IH_HIDE();						\
 8:;								\
 	IH_TAIL(n);						\
@@ -99,7 +99,7 @@ susfs_ih_stub_##n:;						\
 	mov	x0, x1;						\
 	mov	w1, mode;					\
 	bl	susfs_ih_decide_name;				\
-	cbz	x0, 8f;						\
+	cbz	w0, 8f;						\
 	IH_HIDE();						\
 8:;								\
 	IH_TAIL(n);						\
