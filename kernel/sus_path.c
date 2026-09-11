@@ -1043,12 +1043,15 @@ __attribute__((visibility("hidden"))) int susfs_ih_decide_name(u64 p, int mode)
 	return sus_path_match_path(buf) ? 1 : 0;
 }
 
-/* Off by default.  With all the other layers present (LSM replacement, the
- * getdents64 tracepoint, the DAC probes) the patched syscall entries froze the
- * device without panicking, and that has not been narrowed down yet.  The
- * standalone test module, which has none of those layers, works fine.  Set
- * ih_enabled=1 to arm them for debugging. */
-static int ih_enabled;
+/* On by default: the patched entries replace the kprobes for the syscalls whose
+ * decision can be made at ENTRY.  The freeze that kept this off was the allow
+ * path losing the caller's LR (see INLINE_HOOK.md 5.8): every hooked call went
+ * through the trampoline with a PAC signed over the C helper's return address,
+ * which is why an entry as hot as __arm64_sys_openat took the box down
+ * immediately while the standalone test module looked fine.  With x30 restored
+ * all eight entries install, answer, restore and unload cleanly.  Set
+ * ih_enabled=0 to force the kprobe path. */
+static int ih_enabled = 1;
 /* Bisect knob: install only the n-th entry (1-based): 0 = none, -1 = all,
  * anything else implies enabled. */
 static int ih_only = -1;

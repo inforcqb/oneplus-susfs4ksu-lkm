@@ -174,6 +174,28 @@ STAGE A: PASS
 | rmmod 后 | 恢复 `EACCES` |
 | 模块自身 dmesg | 只有 `hooked` / `answered ENOENT` / `restored`，**零 BUG/WARNING** |
 
+**Stage C：主模块 `susfs_guard_lkm`，修掉 5.8 的 LR 之后（SM8550 / 5.15.180 GKI）**
+
+先逐条隔离（`ih_only=n ih_secs=12 no_extra=0`，其余层全在），`su 10123` 侧检查：
+八条全部 `survived`，uptime 连续、`cpus=8` 全程不变，`/dev/ptmx` 始终 `PTMX_OK`。
+
+再按生产形状一次装八条（`ih_enabled=1 ih_secs=25 no_extra=0`）：
+
+| 检查 | 结果 |
+|---|---|
+| 安装 | `inline hooks armed (8 entries patched)`，八条 `hooked` 全成功 |
+| app `cat`（openat） | `No such file or directory` |
+| app `ls -l` / `stat`（newfstatat、statx） | `No such file or directory` |
+| app `test -r`（faccessat） | `NOPE` |
+| app 执行该文件（execve） | `inaccessible or not found` |
+| app `/dev/ptmx` | `PTMX_OK`（放行路径正常，5.8 的直接反证） |
+| root 四个 syscall | 全部正常可见（`7 -rw-------`） |
+| 存活 | 8 CPU 全程在线，uptime 连续，无 BUG/WARNING |
+| 25 s 定时回滚 | 八条依次 `restored`，随后 openat 回落到 LSM 层给 `Permission denied`（分层协作正确） |
+| `rmmod` | 干净，app 回到 `Permission denied`，root 正常 |
+
+脚本：`t_ihA.sh`（no_extra=1 的最小验证）、`t_ihAll.sh`（逐条 `1..8`）、`t_ihFull.sh`（八条一起）。
+
 ---
 
 ## 7. 复现方式
@@ -198,11 +220,14 @@ ksud insmod /data/local/tmp/ih_hook_test.ko selftest=0 hook_syscall=1   # 真 ho
 ## 8. 未做 / 下一步
 
 * **与 kprobe 互斥**：kprobe 会把入口首指令换成 `brk`，同一入口不能既挂 kprobe 又 inline hook。
-  搬迁时必须同时摘掉对应的 kprobe。
-* 把 syscall 层（8 个 `__arm64_sys_*`）从 kprobe 换成 inline hook；`getname` 与 getdents64 的
-  过滤需要 **onLeave**（stub 先调 trampoline 进原函数、返回后再处理），比入口决策复杂。
+  搬迁时必须同时摘掉对应的 kprobe。主模块里的做法：`sus_path_ih_register()` 只要有一条装不上，
+  就整体回滚并改走 kprobe（`sus_path_hooks_arm()`）。
+* **这批已经搬完**：8 个 `__arm64_sys_*`（openat / openat2 / newfstatat / statx / faccessat /
+  faccessat2 / readlinkat / execve）现在默认走 inline hook（`ih_enabled=1`）。
+* **还没搬**：`getname` 的 onLeave（stub 先经 trampoline 跑完原函数再回到自己处理结果）、
+  以及 `filename_lookup` / `do_filp_open` / `user_path_at_empty` 三个内核内部入口 ——
+  它们的 stub 已经写好，但没有进 `ih_table[]`，需要各自单独上机验证。
 * 性能对比：有/无 hook 的基准（kprobe 的实际开销尚未量化）。
-* 主模块 `susfs_guard_lkm` 目前**尚未**使用 inline hook，保持 kprobe + 懒注册。
 ### 5.6 cpp 会把宏参数字符串化（本来只是 mov 的立即数）
 
 IH_TAIL(idx) / SUSFS_IH_SYS_STUB(n, idx, argno) 展开后，汇编器报
@@ -231,3 +256,43 @@ adb 报 `failed to create pty master: No such file or directory`，注意是 ENO
 **教训**：汇编 stub 判断 C 的语言级返回值时，寄存器宽度必须与类型匹配（int → w0，指针 → x0）。
 这一条与 5.6 是同一类问题：**在汇编与 C 的边界上，寄存器宽度和 cpp 语义都要显式对齐，不能靠
 "通常没问题"**。
+
+### 5.8 放行路径丢了调用者的 LR（设备"装完就死"的真正原因）
+
+这是主模块上一版**装完立刻卡死**的根因。`IH_SAVE()` 把原始 LR 存到了 `[sp, #160]`：
+
+```
+str x30, [sp, #160]
+```
+
+但放行路径的 `IH_TAIL()` 只调用了 `IH_RESTORE_ARGS()`（恢复 x0–x18 + NZCV），**没有恢复 x30**。
+于是：
+
+```
+stub: bl susfs_ih_decide      -> x30 被改成 decide 的返回地址
+      IH_TAIL: br x16         -> 进 trampoline 时 x30 还是那个返回地址
+tramp: orig[0] = paciasp       -> 用错误的 LR + 当前 SP 做签名，压回栈
+```
+
+目标函数最后用**它自己的** `paciasp` 配对 `autiasp` 恢复 LR：进 trampoline 时 replay 的
+`paciasp` 已经写好了签名值（签的是 `decide` 的返回地址），第二次 `paciasp` 再覆盖一次，
+函数返回时 `autiasp` 校验的是"最后一次入栈的签名 LR"—— 栈上那条对应的是 192 字节帧下的
+旧 SP，与函数内部的 SP 不一致，**校验必然失败**；即使不 panic，返回地址也已经不是调用者的
+LR。命中隐藏的路径**没事**，因为 `IH_HIDE()` 一直都恢复了 x30 再 `ret`。
+
+为什么测试模块从来没暴露：
+
+* 测试模块 hook 的是自己模块内的 `ih_test_target`，只有显式调用时才走 stub；
+* `__arm64_sys_openat` 是**全系统最热的入口之一**，`add_sus_path` 触发的安装刚返回，
+  下一个毫秒就有别的进程走进 allow 路径 —— 所以现象是"install 日志打印完就死"，
+  而不是"调用隐藏路径才死"。这也解释了为什么失败现场总是在离 openat 很远的地方
+  （proc/tracepoint 注册路径）。
+
+**教训**：
+
+* "保存了"不等于"恢复了"。`IH_SAVE` 存 x0–x18 **和** x30、NZCV 共 20 个值，
+  `IH_RESTORE_ARGS` 只负责 x0–x18 + NZCV，**每个消费点都要自己把 x30 取回来**；
+  更稳的写法是把"必须恢复"的清单写在宏旁边，改 `IH_SAVE` 时同步核对。
+* **热入口会把任何微小错误放大成崩溃**。同样一段 stub 挂在只调用一次的模块内函数上跑一万遍
+  也不会有事，挂在 openat 上第一个毫秒就炸 —— 所以冷路径自测通过**不能**作为热路径可用的证据，
+  隔离测试必须用真的热入口（`ih_only=1` 就是为此而留）。
