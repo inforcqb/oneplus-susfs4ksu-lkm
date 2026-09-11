@@ -29,6 +29,44 @@
 > `/proc/self/maps` 里 `libc.so` 行数 4 → **0**（总行数仍 87，证明是丢行不是读不到），
 > root 仍为 4，`rmmod` 后 app 恢复 4 行。
 >
+> **`82f78f5` 追加：sus_path 的 EACCES → ENOENT 修复（重要）**
+>
+> 真机报告：app `ls /data/adb/service.d` 得到 **EACCES** 而不是 ENOENT。
+> 根因链与实测结论（都在这台设备上量过，不是推断）：
+>
+> 1. `inode_permission()` 里 DAC 检查（`do_inode_permission`）**先于**
+>    `security_inode_permission()`，所以 DAC 拒绝的 inode，我们的 LSM 层根本
+>    不会被调用 → EACCES，而 EACCES 等于告诉对方"这东西存在"。之前所有测试都用
+>    0755 的 `/data/local/tmp`，DAC 放行，恰好把洞盖住了。
+> 2. **GKI 的 full LTO 把这些函数全部内联**：`inode_permission`、
+>    `generic_permission`、`walk_component`、`lookup_dcache`、`__lookup_slow`
+>    五个探针**注册全部成功、命中数为零**（kallsyms 里的符号只是留给模块引用的
+>    副本）。因此"直接 jmp / inline hook 这些函数"同样无效 —— 会改到没人执行的
+>    代码。
+> 3. 在这台设备上**真正会命中的钩子点**都是「ABI 入口」或「跨编译单元调用」：
+>    `vfs_open` ✓、`vfs_getattr` ✓、`show_map_vma` ✓（函数指针调用）、
+>    `__arm64_sys_reboot` ✓、`filename_lookup` ✓（部分）、`do_filp_open` ✗
+>    （被同文件的 `do_sys_openat2` 内联）、8 个 `__arm64_sys_*` wrapper ✓。
+> 4. 最终方案：**syscall 入口层**按路径字符串判定，命中即 `-ENOENT` 并跳过
+>    wrapper。挂：`openat/openat2/newfstatat/statx/faccessat/faccessat2/readlinkat/execve`；
+>    另加 `filename_lookup/do_filp_open/user_path_at_empty` 作为入口层保险。
+>
+> 真机验证（app uid 10123 / root 对照）：
+>
+> | 场景 | 修复前 | 修复后 |
+> |---|---|---|
+> | `cat` 已注册的 0600 root 文件 | EACCES | **ENOENT** |
+> | `cat` 已注册的 0700 目录下的文件 | EACCES | **ENOENT** |
+> | `ls /data/adb/service.d`（父目录 0700 未注册） | EACCES | **ENOENT** |
+> | `stat` / `ls` 隐藏项 | ENOENT | ENOENT |
+> | root 读同一路径 | 正常 | 正常（门控只对 uid>=10000） |
+> | rmmod 后 | — | 恢复 EACCES |
+>
+> 已知局限（与上游 builtin 的差异）：匹配是**路径字符串**（绝对路径、完全相等或
+> `/` 前缀），上游按 inode 判定，所以上游还能覆盖符号链接写法与相对路径；
+> 这里相对路径跳过、`/sdcard` 与 `/storage/emulated/0` 这类等价写法不匹配。
+> 32 位 compat 的 syscall wrapper 未覆盖。
+>
 > **未修**（按优先级见 C 节）：P2 其余（sus_mount 域门控与阈值、sus_map 门控、
 > open_redirect 反向伪装与 scheme 1-4、`_LOOP` 语义）、P3 细节。
 >
