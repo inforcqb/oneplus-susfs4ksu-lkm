@@ -26,6 +26,7 @@
 .hidden susfs_ih_decide
 .hidden susfs_ih_decide_name
 .hidden susfs_ih_decide_inode
+.hidden susfs_ih_decide_nd
 .hidden susfs_ih_after_getname
 
 #define IH_SAVE()						\
@@ -132,6 +133,26 @@ susfs_ih_stub_##n:;						\
 	IH_TAIL(n);						\
 	.size	susfs_ih_stub_##n, . - susfs_ih_stub_##n
 
+/* nameidata-taking entries: x0 is already the struct nameidata *, so unlike the
+ * inode stub there is nothing to move - the decider reads nd->path (the parent
+ * directory) and nd->last (the component being looked up).
+ *
+ * walk_component() returns a const char * (the symlink target) or an ERR_PTR, so
+ * IH_HIDE()'s x0 = -2 is ERR_PTR(-ENOENT): the caller's `if (IS_ERR(link))
+ * return PTR_ERR(link);` turns it into the ENOENT we want, before may_lookup()
+ * and therefore before the DAC check. */
+#define SUSFS_IH_ND_STUB(n, decide_fn)				\
+	.globl	susfs_ih_stub_##n;				\
+	.type	susfs_ih_stub_##n, %function;			\
+susfs_ih_stub_##n:;						\
+	IH_SAVE();						\
+	bl	decide_fn;					\
+	cbz	w0, 8f;						\
+	IH_HIDE();						\
+8:;								\
+	IH_TAIL(n);						\
+	.size	susfs_ih_stub_##n, . - susfs_ih_stub_##n
+
 /* onLeave: the stub hands the frame back to itself.
  *
  * The caller's real LR goes in a spare slot, the target's LR is pointed at the
@@ -192,6 +213,10 @@ susfs_ih_stub_##n:;						\
 	SUSFS_IH_INODE_STUB(inode_permission, susfs_ih_decide_inode)
 	SUSFS_IH_INODE_STUB(generic_permission, susfs_ih_decide_inode)
 
+	/* Judged by (parent inode, component name) while the component is still a
+	 * name - the only point that covers every spelling of a path. */
+	SUSFS_IH_ND_STUB(walk_component, susfs_ih_decide_nd)
+
 	.bss
 	.align	3
 #define SUSFS_IH_TRAMP(n)					\
@@ -213,3 +238,4 @@ susfs_ih_tramp_##n:;						\
 	SUSFS_IH_TRAMP(getname)
 	SUSFS_IH_TRAMP(inode_permission)
 	SUSFS_IH_TRAMP(generic_permission)
+	SUSFS_IH_TRAMP(walk_component)

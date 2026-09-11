@@ -133,6 +133,19 @@ struct sus_path_entry {
      * it from every non-root caller, not only from apps - see
      * sus_path_entry_gate(). */
     bool self_protect;
+    /* The directory this rule's name sits in, as plain numbers.
+     *
+     * walk_component() is where a rule can be matched while the current path
+     * component is still just a name and the DAC check has not run yet: at its
+     * entry nd->path is the parent directory and nd->last is the component being
+     * looked up (fs/namei.c:2275-2303 sets it right before the call).  Matching
+     * on (parent dev, parent ino, name) is the inode-level identity of the rule
+     * without holding a second inode reference - and because every component of
+     * every path goes through walk_component, it covers the spellings the
+     * string-matching entry hooks cannot see (relative paths, symlinks, dotdot),
+     * and it runs before may_lookup()/inode_permission(). */
+    u64 parent_dev;
+    u64 parent_ino;
 };
 
 static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path);
@@ -345,6 +358,60 @@ static inline bool sus_path_entry_gate_inode(const struct sus_path_entry *e,
     return sus_path_gate_ok(inode);
 }
 
+/* Is this component, sitting in this parent directory, a hidden rule?
+ *
+ * The key is (parent dev, parent ino, component name) - see the comment on the
+ * entry struct.  The name is NOT NUL-terminated here: it is the qstr
+ * walk_component() was handed, so the length is authoritative and the stored
+ * name must not be longer than it. */
+static bool sus_path_parent_hit(u64 dev, u64 ino, const unsigned char *name,
+                                unsigned int len)
+{
+    struct sus_path_entry *e;
+    bool hit = false;
+
+    if (!len || len > NAME_MAX)
+        return false;
+    if (sus_path_is_resolver())
+        return false;
+    if (!READ_ONCE(sus_path_count))
+        return false;
+
+    spin_lock(&sus_path_lock);
+    list_for_each_entry(e, &sus_path_list, list) {
+        if (e->parent_dev != dev || e->parent_ino != ino)
+            continue;
+        if (strncmp(e->name, (const char *)name, len))
+            continue;
+        if (e->name[len] != '\0')       /* stored name is longer */
+            continue;
+        if (!sus_path_entry_gate(e))
+            continue;
+        hit = true;
+        break;
+    }
+    spin_unlock(&sus_path_lock);
+
+    return hit;
+}
+
+/* Record the directory a rule's name lives in.  Called wherever a rule acquires
+ * an inode (registration and pending resolution), because walk_component()'s
+ * decision keys on (parent dev, parent ino, name).
+ *
+ * dget_parent() rather than dentry->d_parent: the parent pointer is only stable
+ * under RCU otherwise, and this runs in process context. */
+static void sus_path_entry_set_parent(struct sus_path_entry *e,
+                                      struct dentry *dentry)
+{
+    struct dentry *parent = dget_parent(dentry);
+    struct inode *pino = d_inode(parent);
+
+    e->parent_dev = pino ? (u64)pino->i_sb->s_dev : 0;
+    e->parent_ino = pino ? (u64)pino->i_ino : 0;
+    dput(parent);
+}
+
 static bool sus_path_is_hidden(u64 ino, const char *name)
 {
     struct sus_path_entry *e;
@@ -460,6 +527,7 @@ static int sus_path_resolve_pending(void)
         struct path p;
         char name[NAME_MAX + 1];
         bool published = false;
+        u64 pdev = 0, pino_v = 0;
         int rc;
 
         path[0] = '\0';
@@ -494,7 +562,20 @@ static int sus_path_resolve_pending(void)
             atomic_inc(&sus_path_pend_walks);
             inode = d_inode(p.dentry);
             if (inode) {
+                struct dentry *parent;
+
                 strscpy(name, p.dentry->d_name.name, sizeof(name));
+                /* Same key walk_component() matches on, computed here because the
+                 * publish below happens under the spinlock and dget_parent()
+                 * should not be called from there. */
+                parent = dget_parent(p.dentry);
+                {
+                    struct inode *pino = d_inode(parent);
+
+                    pdev = pino ? (u64)pino->i_sb->s_dev : 0;
+                    pino_v = pino ? (u64)pino->i_ino : 0;
+                }
+                dput(parent);
                 /* Hold it before path_put() can drop the last dentry reference
                  * and evict it; the pointer is published only afterwards. */
                 ihold(inode);
@@ -526,6 +607,8 @@ static int sus_path_resolve_pending(void)
             slot->dev = (u64)inode->i_sb->s_dev;
             slot->ino = (u64)inode->i_ino;
             strscpy(slot->name, name, sizeof(slot->name));
+            slot->parent_dev = pdev;
+            slot->parent_ino = pino_v;
             slot->inode = inode;
             inode = NULL;               /* the table holds the reference now */
             atomic_dec(&sus_path_n_pending);
@@ -1537,6 +1620,7 @@ extern void susfs_ih_stub_user_path_at_empty(void);
 extern void susfs_ih_stub_getname(void);
 extern void susfs_ih_stub_inode_permission(void);
 extern void susfs_ih_stub_generic_permission(void);
+extern void susfs_ih_stub_walk_component(void);
 extern u64 susfs_ih_tramp_openat;
 extern u64 susfs_ih_tramp_openat2;
 extern u64 susfs_ih_tramp_newfstatat;
@@ -1551,6 +1635,7 @@ extern u64 susfs_ih_tramp_user_path_at_empty;
 extern u64 susfs_ih_tramp_getname;
 extern u64 susfs_ih_tramp_inode_permission;
 extern u64 susfs_ih_tramp_generic_permission;
+extern u64 susfs_ih_tramp_walk_component;
 
 
 
@@ -1633,6 +1718,44 @@ __attribute__((visibility("hidden"))) int susfs_ih_decide(u64 uregs_arg, int arg
 	pr_info_ratelimited("sus_path: path hit (openat family) '%s' (uid=%u) [ih]\n",
 			    buf, current_uid().val);
 	return 1;
+}
+
+/* Called from walk_component()'s stub: x0 is the struct nameidata *.
+ *
+ * Only the first two members of struct nameidata are read - path and last - and
+ * the mirror below relies on that order (fs/namei.c:565).  It is a mirror rather
+ * than a header include because the real struct is private to fs/namei.c; the
+ * order is safe here only because CONFIG_RANDSTRUCT is not set on this kernel
+ * (checked on device: only RANDOMIZE_BASE, which is KASLR and unrelated), so
+ * __randomize_layout is a no-op.
+ *
+ * At this point nd->path is the directory being searched and nd->last is the
+ * component name about to be looked up - so a hit can be answered with
+ * ERR_PTR(-ENOENT), which is exactly what walk_component()'s callers expect from
+ * a failed component and what makes the path look absent rather than forbidden.
+ * It is also earlier than may_lookup()/inode_permission(), i.e. earlier than the
+ * DAC check that the LSM layer can never precede. */
+struct susfs_nd_mirror {
+	struct path path;	/* offset 0 in the real struct */
+	struct qstr last;	/* and this one follows it */
+};
+
+__attribute__((visibility("hidden"))) int susfs_ih_decide_nd(u64 nd_ptr)
+{
+	const struct susfs_nd_mirror *nd = (const struct susfs_nd_mirror *)nd_ptr;
+	struct inode *parent;
+
+	if (IS_ERR_OR_NULL((void *)nd_ptr) || !nd->path.dentry)
+		return 0;
+	if (!current_uid().val)		/* root is never hidden */
+		return 0;
+
+	parent = d_inode(nd->path.dentry);
+	if (!parent)
+		return 0;
+
+	return sus_path_parent_hit((u64)parent->i_sb->s_dev, (u64)parent->i_ino,
+				   nd->last.name, nd->last.len) ? 1 : 0;
 }
 
 /* Called from the inode-taking stubs: x0 is the inode the function was given.
@@ -1751,6 +1874,19 @@ static struct {
 	 * 6729 and 1165 times respectively during one round of path walks. */
 	{ "inode_permission",          susfs_ih_stub_inode_permission,   &susfs_ih_tramp_inode_permission },
 	{ "generic_permission",        susfs_ih_stub_generic_permission, &susfs_ih_tramp_generic_permission },
+	/* The one that matches EVERY spelling of a path.
+	 *
+	 * The entry hooks above match the caller's path string, so a relative path, a
+	 * symlink, a ..-path or a /proc/self/root prefix all slip past them; the LSM
+	 * layer matches the inode but runs after the DAC check, so where DAC denies
+	 * the caller it cannot answer at all and the caller sees EACCES.  Path
+	 * walking resolves one component at a time through walk_component(), with the
+	 * parent directory in nd->path and the component name in nd->last, before
+	 * may_lookup()/inode_permission() - so a rule can be matched there by
+	 * (parent dev, parent ino, name) and answered with ERR_PTR(-ENOENT), whatever
+	 * the caller's spelling was.  Measured reachable: 4165 calls per round of
+	 * path walks. */
+	{ "walk_component",            susfs_ih_stub_walk_component,     &susfs_ih_tramp_walk_component },
 };
 
 #define N_IH_HOOKS ARRAY_SIZE(ih_table)
@@ -2111,6 +2247,7 @@ static int sus_path_add_hidden_ex(const char *path, bool self_protect)
 	e->inode = inode;
 	e->pass = 0;
 	e->self_protect = self_protect;
+	sus_path_entry_set_parent(e, p.dentry);
 	ihold(inode);
 	strscpy(e->name, p.dentry->d_name.name, sizeof(e->name));
 	sus_path_entry_set_path(e, path);
@@ -2349,6 +2486,8 @@ void sus_path_supercall(void __user **arg)
          * evict it and let the address be reused. */
         ihold(inode);
         strscpy(e->name, path.dentry->d_name.name, sizeof(e->name));
+        /* The walk_component() key: parent directory identity + that name. */
+        sus_path_entry_set_parent(e, path.dentry);
     }
     sus_path_entry_set_path(e, info.target_pathname);
     if (!inode)
