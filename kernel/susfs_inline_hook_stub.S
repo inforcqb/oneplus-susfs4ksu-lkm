@@ -64,6 +64,7 @@
 /* allow path: pick up this entry's trampoline and leave for it */
 #define IH_TAIL(n)						\
 	IH_RESTORE_ARGS();					\
+	ldr	x30, [sp, #160];				\
 	IH_TRAMP_ADDR(n);					\
 	add	sp, sp, #192;\
 	br	x16
