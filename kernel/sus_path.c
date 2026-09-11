@@ -601,21 +601,9 @@ static int kp_sys_path_answer(struct pt_regs *regs, int argno)
     }
 
     n = strncpy_from_user(buf, (const char __user *)up, sizeof(buf) - 1);
-    /* Diagnostic for the 32-bit path: without it, "the wrapper never ran" and
-     * "it ran but the path could not be read" look identical from outside. */
-    if (is_compat_task()) {
-        char probe[16];
-        unsigned char first = 0;
-        int rc_copy = copy_from_user(probe, up, sizeof(probe));
-        int rc_byte = get_user(first, (unsigned char __user *)up);
-
-        pr_info_ratelimited("sus_path: compat r0=%#lx r1=%#lx r2=%#lx r3=%#lx up=%#lx copy=%d get_user=%d byte=%#x strncpy=%ld\n",
-                            (unsigned long)uregs->regs[0],
-                            (unsigned long)uregs->regs[1],
-                            (unsigned long)uregs->regs[2],
-                            (unsigned long)uregs->regs[3],
-                            (unsigned long)up, rc_copy, rc_byte, first, n);
-    }
+    if (n <= 0 && is_compat_task())
+        pr_info_ratelimited("sus_path: compat pathname unreadable (reg=%#lx) - the getname layer covers this\n",
+                            reg);
     if (n <= 0)
         return 0;
     buf[n] = '\0';
@@ -732,6 +720,93 @@ static void sus_path_syscall_unregister(void)
             continue;
         unregister_kprobe(sys_path_probes[i]);
         sys_path_probes_registered[i] = false;
+    }
+}
+
+/* ---- getname layer ----
+ *
+ * The syscall-entry layer reads the caller's pathname itself.  That works for
+ * 64-bit callers, but not for 32-bit ones: measured, in that probe context
+ * copy_from_user, get_user and strncpy_from_user all answered -EFAULT for a
+ * pointer the kernel read without any trouble a moment later (the argument
+ * registers were right: r0=0xffffff9c AT_FDCWD, r1=0x100f4, r2=0).
+ *
+ * getname() is where the kernel has just copied that pathname into kernel
+ * memory, and it returns it as struct filename.  Hooking its return touches no
+ * user memory at all and covers both ABIs, so this is where the decision is
+ * really made; the syscall layer stays as the earlier, cheaper answer for
+ * 64-bit callers and for anything that never goes through getname.
+ *
+ * Rewriting the return to ERR_PTR(-ENOENT) is what callers already handle
+ * (IS_ERR is checked at every call site), but the filename just allocated would
+ * then leak, so the original is released with putname() first.  When getname()
+ * merely forwards getname_flags()' result, the inner probe has already done
+ * this and the outer one sees ERR_PTR and stops. */
+static int kr_getname_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct filename *f = (struct filename *)regs_return_value(regs);
+
+    if (IS_ERR_OR_NULL(f) || !f->name)
+        return 0;
+    if (!sus_path_match_path(f->name))
+        return 0;
+
+    atomic_inc(&n_enoent_path);
+    pr_info_ratelimited("sus_path: getname hit '%s' (uid=%u)\n",
+                        f->name, current_uid().val);
+    putname(f);
+    regs_set_return_value(regs, (unsigned long)ERR_PTR(-ENOENT));
+    return 0;
+}
+
+static struct kretprobe krp_getname = {
+    .kp.symbol_name = "getname",
+    .handler = kr_getname_ret,
+    .maxactive = 64,
+};
+
+static struct kretprobe krp_getname_flags = {
+    .kp.symbol_name = "getname_flags",
+    .handler = kr_getname_ret,
+    .maxactive = 64,
+};
+
+static struct kretprobe *getname_krps[] = {
+    &krp_getname,
+    &krp_getname_flags,
+};
+
+#define N_GETNAME_KRPS ARRAY_SIZE(getname_krps)
+static bool getname_registered[N_GETNAME_KRPS];
+
+static void sus_path_getname_register(void)
+{
+    int i, n = 0;
+
+    for (i = 0; i < N_GETNAME_KRPS; i++) {
+        if (!find_kernel_symbol_exact(getname_krps[i]->kp.symbol_name))
+            continue;       /* same sharing story as the compat wrappers */
+        if (register_kretprobe(getname_krps[i])) {
+            pr_warn("sus_path: kretprobe(%s) failed\n",
+                    getname_krps[i]->kp.symbol_name);
+            continue;
+        }
+        getname_registered[i] = true;
+        n++;
+    }
+    pr_info("sus_path: getname layer armed (%d/%d probes)\n", n,
+            (int)N_GETNAME_KRPS);
+}
+
+static void sus_path_getname_unregister(void)
+{
+    int i;
+
+    for (i = 0; i < N_GETNAME_KRPS; i++) {
+        if (!getname_registered[i])
+            continue;
+        unregister_kretprobe(getname_krps[i]);
+        getname_registered[i] = false;
     }
 }
 
@@ -1048,6 +1123,7 @@ int sus_path_init(void)
      * EACCES. */
     sus_path_path_register();
     sus_path_syscall_register();
+    sus_path_getname_register();
 
     return 0;
 }
@@ -1059,6 +1135,7 @@ void sus_path_exit(void)
 
     /* Unregister the hooks FIRST: after this nothing can match, so the entries
      * (and their inode references) can be torn down safely. */
+    sus_path_getname_unregister();
     sus_path_syscall_unregister();
     sus_path_path_unregister();
     sus_path_dac_unregister();
