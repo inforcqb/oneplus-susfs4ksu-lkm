@@ -1392,6 +1392,94 @@ static struct kprobe *path_probes[] = {
 #define N_PATH_PROBES ARRAY_SIZE(path_probes)
 static bool path_probes_registered[N_PATH_PROBES];
 
+/* ---- candidate scan (diagnostic) ----
+ *
+ * Upstream checks the inode INSIDE path walking - in walk_component() and
+ * friends, where the dentry is resolved and d_inode is available, but before
+ * may_lookup()/inode_permission() run.  That is the one place a hidden path can
+ * be answered with ENOENT *and* matched by inode rather than by the caller's
+ * spelling; both of our reachable layers have to give one of the two up.
+ *
+ * Whether we can use such a place on this kernel depends entirely on LTO: the
+ * same functions that are a real out-of-line call here are inlined copies there,
+ * and a kprobe on a copy that never runs registers fine and reports zero hits
+ * (measured: inode_permission, generic_permission, walk_component,
+ * lookup_dcache, __lookup_slow all did exactly that).
+ *
+ * So scan them, with probes that only COUNT and never look at the arguments -
+ * the signature of a candidate is exactly what is not known in advance, and
+ * dereferencing the wrong register is how this module crashed a device before.
+ * cand_probe=1 arms them; the hit counts show which ones are reachable. */
+
+#define N_CAND 14
+static const char *const cand_syms[N_CAND] = {
+	"walk_component",	/* what upstream uses */
+	"link_path_walk",
+	"step_into",
+	"handle_mounts",
+	"lookup_fast",
+	"lookup_slow",
+	"__lookup_slow",
+	"may_lookup",
+	"path_lookupat",
+	"path_openat",
+	"open_last_lookups",
+	"filename_parentat",
+	"__filename_parentat",
+	"vfs_open",		/* known reachable, but after the DAC check */
+};
+
+static struct kprobe cand_kps[N_CAND];
+static atomic_t cand_hits[N_CAND];
+static bool cand_registered[N_CAND];
+static int cand_probe;
+module_param(cand_probe, int, 0644);
+
+static int sus_path_cand_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	int i;
+
+	for (i = 0; i < N_CAND; i++) {
+		if (kp->symbol_name != cand_syms[i])
+			continue;
+		if (atomic_inc_return(&cand_hits[i]) <= 3)
+			pr_info("sus_path: cand %s hit (x0=%px x1=%px)\n",
+				cand_syms[i], (void *)regs->regs[0],
+				(void *)regs->regs[1]);
+		return 0;	/* observe only - never changes behaviour */
+	}
+	return 0;
+}
+
+static void sus_path_cand_register(void)
+{
+	int i;
+
+	if (!cand_probe)
+		return;
+	for (i = 0; i < N_CAND; i++) {
+		cand_kps[i].symbol_name = cand_syms[i];
+		cand_kps[i].pre_handler = sus_path_cand_pre;
+		if (register_kprobe(&cand_kps[i]))
+			pr_info("sus_path: cand %s not available\n", cand_syms[i]);
+		else
+			cand_registered[i] = true;
+	}
+	pr_info("sus_path: candidate scan armed (cand_probe=1) - see hide_list\n");
+}
+
+static void sus_path_cand_unregister(void)
+{
+	int i;
+
+	for (i = 0; i < N_CAND; i++) {
+		if (!cand_registered[i])
+			continue;
+		unregister_kprobe(&cand_kps[i]);
+		cand_registered[i] = false;
+	}
+}
+
 static void sus_path_path_register(void)
 {
     int i;
@@ -1491,6 +1579,9 @@ static void sus_path_hooks_arm(void)
         sus_path_path_register();
         sus_path_getname_register();
     }
+    /* Diagnostic only, and independent of any rule: it is about which path
+     * walkers this kernel actually executes. */
+    sus_path_cand_register();
     pr_info("sus_path: hooks armed (first rule registered)\n");
     mutex_unlock(&sus_path_arm_lock);
 }
@@ -1972,6 +2063,7 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
 {
     struct sus_path_entry *e;
     int n = 0;
+    int i;
 
     n += scnprintf(buf + n, PAGE_SIZE - n,
                    "hide_from_apps=%d  enoent: getattr=%d perm=%d dac=%d gper=%d path=%d\n",
@@ -1983,6 +2075,13 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
                    atomic_read(&n_dirent_rewrite_fail),
                    atomic_read(&n_dirent_all_hidden),
                    atomic_read(&sus_path_n_pending));
+    if (cand_probe) {
+        n += scnprintf(buf + n, PAGE_SIZE - n, "cand:");
+        for (i = 0; i < N_CAND; i++)
+            n += scnprintf(buf + n, PAGE_SIZE - n, " %s=%d",
+                           cand_syms[i], atomic_read(&cand_hits[i]));
+        n += scnprintf(buf + n, PAGE_SIZE - n, "\n");
+    }
     /* Everything the pending machinery did, so that "still pending" can be read
      * for what it is: passes/ticks == 0 means the retry never ran at all, walks
      * > 0 with pending > 0 means the walk kept failing (last-rc says how), and
@@ -2170,6 +2269,7 @@ void sus_path_exit(void)
     /* No walk can be in flight now, so the borrowed creds are ours to release. */
     sus_path_drop_caller_cred();
 	sus_path_ih_unregister();
+    sus_path_cand_unregister();
     sus_path_syscall_unregister();
     sus_path_path_unregister();
     sus_path_dac_unregister();
