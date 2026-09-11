@@ -65,7 +65,15 @@
 > 已知局限（与上游 builtin 的差异）：匹配是**路径字符串**（绝对路径、完全相等或
 > `/` 前缀），上游按 inode 判定，所以上游还能覆盖符号链接写法与相对路径；
 > 这里相对路径跳过、`/sdcard` 与 `/storage/emulated/0` 这类等价写法不匹配。
-> 32 位 compat 的 syscall wrapper 未覆盖。
+>
+> **32 位（compat）覆盖**：只有 3 个 `__arm64_compat_sys_*` 符号存在
+> （`openat`/`execve`/`execveat`），其余 32 位表项共享 `__arm64_sys_*`，所以本来
+> 大部分已覆盖。但实测发现：在 syscall 入口探针里读 32 位任务的用户指针，
+> `copy_from_user` / `get_user` / `strncpy_from_user` **三种方式全部 -EFAULT**
+> （参数本身正确：r0=0xffffff9c AT_FDCWD、r1=0x100f4、r2=0；64 位任务无此问题）。
+> 解法：改到 **`getname()` / `getname_flags()` 返回处**判定 —— 内核此时已把路径
+> 拷进内核内存，不碰 uaccess，两个 ABI 通吃；命中则 `putname()` 释放刚分配的
+> `struct filename` 并返回 `ERR_PTR(-ENOENT)`。真机：32 位 `openat` → **ENOENT** ✓
 >
 > **未修**（按优先级见 C 节）：P2 其余（sus_mount 域门控与阈值、sus_map 门控、
 > open_redirect 反向伪装与 scheme 1-4、`_LOOP` 语义）、P3 细节。
