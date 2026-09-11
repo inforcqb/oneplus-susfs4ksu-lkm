@@ -212,15 +212,15 @@ static inline bool sus_path_is_resolver(void)
  * saved (a reference is held) and the walk borrows those: that process is by
  * definition one that can reach the path, since it is the one being told to hide
  * it.  Exactly one stored reference, released on unload. */
-static struct cred *sus_path_pending_cred;
+static const struct cred *sus_path_pending_cred;
 static DEFINE_MUTEX(sus_path_cred_lock);
 static atomic_t sus_path_used_caller_cred = ATOMIC_INIT(0);
 
 /* Called from the supercall (process context) when a rule is registered pending. */
 static void sus_path_save_caller_cred(void)
 {
-    struct cred *new = get_cred(current_cred());
-    struct cred *old;
+    const struct cred *new = get_cred(current_cred());
+    const struct cred *old;
 
     mutex_lock(&sus_path_cred_lock);
     old = sus_path_pending_cred;
@@ -232,7 +232,7 @@ static void sus_path_save_caller_cred(void)
 
 static const struct cred *sus_path_override_creds(void)
 {
-    struct cred *cred;
+    const struct cred *cred;
 
     mutex_lock(&sus_path_cred_lock);
     cred = sus_path_pending_cred;
@@ -254,7 +254,7 @@ static void sus_path_revert_creds(const struct cred *saved)
 
 static void sus_path_drop_caller_cred(void)
 {
-    struct cred *old;
+    const struct cred *old;
 
     mutex_lock(&sus_path_cred_lock);
     old = sus_path_pending_cred;
