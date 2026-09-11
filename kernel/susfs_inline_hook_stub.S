@@ -43,10 +43,12 @@
 	ldp	x14, x15, [sp, #112];				\
 	ldr	x18, [sp, #144]
 
+/* Taking a module symbol's address has to go through the GOT: a plain
+ * adrp/add pair gets folded into movz/movk by the assembler, which cannot hold
+ * an address the loader has not chosen yet ("invalid fixup for movz/movk"). */
 #define IH_TRAMP_ADDR(n)					\
-	adrp	x16, susfs_ih_tramp_##n;			\
-	add	x16, x16, :lo12:susfs_ih_tramp_##n;		\
-	ldr	x16, [x16]
+	adrp	x16, :got:susfs_ih_tramp_##n;			\
+	ldr	x16, [x16, :got_lo12:susfs_ih_tramp_##n]
 
 /* allow path: restore the arguments, then leave for the trampoline */
 #define IH_TAIL(n)						\
