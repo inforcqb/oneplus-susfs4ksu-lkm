@@ -39,7 +39,9 @@
 	stp	x14, x15, [sp, #112];				\
 	stp	x16, x17, [sp, #128];				\
 	str	x18, [sp, #144];				\
-	str	x30, [sp, #160]
+	str	x30, [sp, #160];					\
+	mrs	x9, nzcv;					\
+	str	x9, [sp, #168]
 
 #define IH_RESTORE_ARGS()					\
 	ldp	x0,  x1,  [sp, #0];				\
@@ -50,7 +52,9 @@
 	ldp	x10, x11, [sp, #80];				\
 	ldp	x12, x13, [sp, #96];				\
 	ldp	x14, x15, [sp, #112];				\
-	ldr	x18, [sp, #144]
+	ldr	x18, [sp, #144];					\
+	ldr	x17, [sp, #168];				\
+	msr	nzcv, x17
 
 #define IH_TRAMP_ADDR(n)					\
 	adrp	x16, susfs_ih_tramp_##n;			\
