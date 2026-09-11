@@ -115,8 +115,38 @@
 > sus_mount 基线（改动前，同一台设备）：启用后 **root 与 app 的 `/proc/mounts` 都是 238 行、
 > `/data/adb` 都还是 1 行** —— 实测确认 P2-13"阈值恒假、功能 100% 不生效"。
 >
-> **未修**（按优先级见 C 节）：P2 其余（sus_mount 域门控与阈值、sus_map 门控、
-> open_redirect 反向伪装与 scheme 1-4、`_LOOP` 语义）、P3 细节。
+> **P2 收尾（本轮，逐项真机验证）**
+>
+> | 项 | 结果 |
+> |---|---|
+> | P2-12/13 sus_mount | 域门控（`su_ctx` 解析 SID，默认 `u:r:ksu:s0`）+ 从**真实 `mnt_id_ida`** 分配标记。真机：把 `su_ctx` 指到一个没人所在的域后，root/app/u1000 的 `/data/adb` 行数 **2→0**、总行数 239→**237**（正好少 2 行）、mountinfo 同样 0；改回默认（su 域）→ 仍见 2 行（豁免生效）；`umount` 一个被标记的挂载 → **无 `ida_free` WARN**（旧的自造 id 方案必然触发它） |
+> | P2-15 sus_map | 只对 `uid>=10000` 隐藏：app 的 libc 行 **4→0**、总行数只少 4（丢行而非读不到）、root/system/shell 保持 4 行 |
+> | P2-16 sus_path `_LOOP` | 登记时**不解析**不存在的路径（pending），后台有界重试。真机：`pending=1` → 创建后 ≤2s `pending=0` 且 `dev/ino` 就位，app 的 `cat`/`stat` ENOENT、**`ls` 不再列出该条目**，root 正常 |
+> | P2-18 open_redirect | 5 档 `uid_scheme` 全部实现（3/4 在本机因 `TIF_PROC_UMOUNTED` 永不置位而退化同一判定）+ 反向伪装 + FUSE 路径按上游拒绝。真机：反向面 `rev hits: dpath=2`、`statfs=1`，app 对 `/dev/t2` 的 `stat -f` 得到 target 的 **f2fs** 而 root 得到 **tmpfs** |
+> | P3 kstat / supercall | 空表早退（省掉两次 `copy_from_user`）；未识别命令不再被接管 → 真机 `susfs_sc 0x99999` 得到 **-22 (-EINVAL)**（= 上游），已识别命令全部不受影响 |
+>
+> **两条必须知道的机制事实**
+>
+> 1. `find_kernel_symbol_exact()` **故意拒绝模块符号**（`symbol_resolver.c:77-80`，`ignore symbol %s of module %s`）。
+>    KernelSU 的 `ksu_cred` 在 `kernelsu` 模块里（`b ksu_cred [kernelsu]`），所以上游那句
+>    `override_creds(ksu_cred)` **在本机无法照搬** —— 这也正是 `sus_path` 的 pending walk 拿到 `-EACCES`
+>    （`pend: last-rc=-13`）的原因：kworker 是 uid 0 但域是 `kernel`，进不了 `/data/...`。
+>    改用"保存**发起者**的凭据"（`get_cred(current_cred())`，卸载时 `put_cred`），不依赖任何 KernelSU 符号。
+> 2. **命名空间缺口（实测）**：普通 app 进程在自己的 mount ns 里、`/data/adb` 行数为 **0**（KernelSU 已在该 ns
+>    umount），所以它们本来就看不到 KSU 挂载；**zygote 的克隆 ns 里能看到**（1 行）但那是小号 id →
+>    我们的标记不传播到 `clone_mnt` 出来的副本。结论：对 app 不可观测，对 zygote 一类进程可观测，
+>    要彻底覆盖需要在 `clone_mnt`/`vfs_create_mount` 上补标（未做）。
+>
+> **尚未覆盖（记录在案）**：`show_vma_header_prefix`（maps 的 dev:ino 两列）被 LTO 内联 → hook 注册成功但
+> 命中计数恒 0；`/proc/<pid>/fdinfo/N` 的 mnt_id/ino 没有可拦的函数；open_redirect 反向面因此是 2/3。
+> 另外 `vfs_open` 覆盖过宽、`O_TMPFILE` 无法重定向等既有跨范围限制见 `OPEN_REDIRECT_SUS_MAP_DIFF.md` §A5。
+>
+> **设备遗留状态**：meta-overlayfs 的 `mnt_id` 已被**早期版本**（自造 id 那一版）标成 `2000000000`，
+> 重启一次即随挂载重建而清除；未清除时 `umount` 那个挂载会触发一条 `ida_free` WARN。新版本不再有这个问题。
+>
+> **未修**：P3 里剩下的细节（`fstat`/`statx`/compat 变体不在 tracepoint 白名单、每条目永久 `ihold`、
+> FUSE 下 `d_ino` 与 `i_ino` 是否一致未实测、`clone_mnt` 补标、`show_vma_header_prefix` 的替代注入点）。
+> 这些都属于"不影响隐藏效果、但会扩大覆盖面"的项，见 C 节 P3 表。
 >
 > **已确认无法在 LKM 内复刻**：`TIF_PROC_UMOUNTED`。上游由 KernelSU 的
 > setuid hook 设置（`kernel_umount.c:75-109`：`ksu_module_mounted` &&
