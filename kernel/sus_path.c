@@ -953,7 +953,7 @@ extern void susfs_ih_stub_getname(void);
  *
  * On a hit the freshly allocated struct filename must be released first
  * (putname), otherwise it leaks; every caller already checks IS_ERR. */
-__hidden u64 susfs_ih_after_getname(u64 a0, u64 a1, u64 ret)
+__attribute__((visibility("hidden"))) u64 susfs_ih_after_getname(u64 a0, u64 a1, u64 ret)
 {
 	struct filename *f = (struct filename *)ret;
 
@@ -970,7 +970,7 @@ __hidden u64 susfs_ih_after_getname(u64 a0, u64 a1, u64 ret)
 
 /* Called from the syscall stubs: x0 is the wrapper's pt_regs, argno the register
  * holding the pathname. */
-__hidden int susfs_ih_decide(u64 uregs_arg, int argno)
+__attribute__((visibility("hidden"))) int susfs_ih_decide(u64 uregs_arg, int argno)
 {
 	const struct pt_regs *uregs = (const struct pt_regs *)uregs_arg;
 	const char __user *up;
@@ -1002,7 +1002,7 @@ __hidden int susfs_ih_decide(u64 uregs_arg, int argno)
 
 /* Called from the name-taking stubs: mode 0 = struct filename (already copied
  * into kernel memory, so no uaccess at all), mode 1 = __user pointer. */
-__hidden int susfs_ih_decide_name(u64 p, int mode)
+__attribute__((visibility("hidden"))) int susfs_ih_decide_name(u64 p, int mode)
 {
 	char buf[SUS_PATH_LEN];
 	long n;
@@ -1054,7 +1054,7 @@ static struct susfs_ih_hook ih_hooks[N_IH_HOOKS];
  * adrp/add (and :got:) into movz/movk, which cannot hold an address the loader
  * has not chosen yet.  So they call in with their index and the C compiler emits
  * the addressing.  Must be the first stub helper: the .S order matches ih_table. */
-__hidden u64 susfs_ih_get_tramp(int idx)
+__attribute__((visibility("hidden"))) u64 susfs_ih_get_tramp(int idx)
 {
 	if (idx < 0 || idx >= (int)N_IH_HOOKS)
 		return 0;
