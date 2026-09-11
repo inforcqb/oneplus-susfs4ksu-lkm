@@ -46,7 +46,8 @@
 #include <linux/fs.h>
 #include <linux/err.h>
 #include <linux/kprobes.h>
-#include <linux/compat.h>	/* compat_ptr(), for 32-bit callers */
+#include <linux/compat.h>
+#include <linux/workqueue.h>	/* compat_ptr(), for 32-bit callers */
 #include <linux/limits.h>
 #include <linux/cred.h>
 #include <linux/atomic.h>
@@ -1047,6 +1048,14 @@ static int ih_enabled;
  * anything else implies enabled. */
 static int ih_only = -1;
 module_param(ih_only, int, 0644);
+/* Kernel-side timed rollback: restore the entries after n seconds and stop
+ * hooking altogether.  Unlike a test script this keeps running when the
+ * triggering process is wedged, and if only part of the box is stuck the worker
+ * on another CPU still gets the entries back, so no reboot is needed. */
+static int ih_secs;
+module_param(ih_secs, int, 0644);
+static void ih_restore_work(struct work_struct *w);
+static DECLARE_DELAYED_WORK(ih_restore_wq, ih_restore_work);
 
 module_param(ih_enabled, int, 0644);
 
@@ -1108,7 +1117,19 @@ static int sus_path_ih_register(void)
 	}
 
 	pr_info("sus_path: inline hooks armed (%d entries patched)\n", n);
+
+	if (ih_secs > 0) {
+		pr_info("susfs_ih: restoring in %d s (diagnostic)\n", ih_secs);
+		schedule_delayed_work(&ih_restore_wq, ih_secs * HZ);
+	}
 	return n;
+}
+
+static void ih_restore_work(struct work_struct *w)
+{
+	pr_info("susfs_ih: %d s elapsed - entries restored, no longer hooking\n",
+		ih_secs);
+	sus_path_ih_unregister();
 }
 
 static void sus_path_ih_unregister(void)
@@ -1396,7 +1417,8 @@ void sus_path_exit(void)
     /* Unregister the hooks FIRST: after this nothing can match, so the entries
      * (and their inode references) can be torn down safely. */
     sus_path_getname_unregister();
-    sus_path_ih_unregister();
+    cancel_delayed_work_sync(&ih_restore_wq);
+	sus_path_ih_unregister();
     sus_path_syscall_unregister();
     sus_path_path_unregister();
     sus_path_dac_unregister();
