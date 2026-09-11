@@ -1130,9 +1130,14 @@ static struct {
 	{ "__arm64_sys_faccessat2",    susfs_ih_stub_faccessat2,    &susfs_ih_tramp_faccessat2 },
 	{ "__arm64_sys_readlinkat",    susfs_ih_stub_readlinkat,    &susfs_ih_tramp_readlinkat },
 	{ "__arm64_sys_execve",        susfs_ih_stub_execve,        &susfs_ih_tramp_execve },
-	/* onLeave: getname gets no entry decision - the stub lets the original run
-	 * and inspects the struct filename it returned (INLINE_HOOK.md 5.9). */
-	{ "getname",                   susfs_ih_stub_getname,       &susfs_ih_tramp_getname },
+	/* onLeave: getname_flags gets no entry decision - the stub lets the original
+	 * run and inspects the struct filename it returned (INLINE_HOOK.md 5.9).
+	 *
+	 * The symbol is getname_flags, not getname: getname() only forwards to it
+	 * and LTO inlines that away, so patching getname installed cleanly and then
+	 * never ran - measured, the after-handler counted zero hits while the
+	 * kretprobe on getname_flags had been answering all along. */
+	{ "getname_flags",             susfs_ih_stub_getname,       &susfs_ih_tramp_getname },
 };
 
 #define N_IH_HOOKS ARRAY_SIZE(ih_table)
