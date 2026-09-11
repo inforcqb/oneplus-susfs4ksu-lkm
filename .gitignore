@@ -32,3 +32,9 @@ abi_layout_check/
 t_*.sh
 art/
 art2/
+
+# internal working documents: audit findings, subagent reports, implementation
+# notes.  Publishing them would describe exactly how the module hides itself and
+# what it is checked against - the opposite of the point.  They stay on disk.
+*.md
+!README.md
