@@ -12,11 +12,14 @@
  * save/restore, which is the first of the four faults recorded in
  * INLINE_HOOK.md.
  *
- * Both exits use `ret x16`, exempt from the BTI check where `br` is not.
+ * Entering the trampoline uses `br`, which does not touch the return-address
+ * stack, whereas a `ret` would pop it and guarantee a return misprediction for
+ * every hooked call.  Resuming the target at entry+8 still has to use `ret`: it
+ * is mid-function, so BTI rejects br/blr there and only ret is exempt.
  */
 
 #define IH_SAVE()						\
-	sub	sp, sp, #160;					\
+	sub	sp, sp, #192;					\
 	stp	x0,  x1,  [sp, #0];				\
 	stp	x2,  x3,  [sp, #16];				\
 	stp	x4,  x5,  [sp, #32];				\
@@ -26,9 +29,10 @@
 	stp	x12, x13, [sp, #96];				\
 	stp	x14, x15, [sp, #112];				\
 	stp	x16, x17, [sp, #128];				\
-	stp	x18, x30, [sp, #144]
+	str	x18, [sp, #144];				\
+	str	x30, [sp, #160]
 
-#define IH_RESTORE()						\
+#define IH_RESTORE_ARGS()					\
 	ldp	x0,  x1,  [sp, #0];				\
 	ldp	x2,  x3,  [sp, #16];				\
 	ldp	x4,  x5,  [sp, #32];				\
@@ -37,19 +41,24 @@
 	ldp	x10, x11, [sp, #80];				\
 	ldp	x12, x13, [sp, #96];				\
 	ldp	x14, x15, [sp, #112];				\
-	ldp	x16, x17, [sp, #128];				\
-	ldp	x18, x30, [sp, #144];				\
-	add	sp, sp, #160
+	ldr	x18, [sp, #144]
 
+#define IH_TRAMP_ADDR(n)					\
+	adrp	x16, susfs_ih_tramp_##n;			\
+	add	x16, x16, :lo12:susfs_ih_tramp_##n;		\
+	ldr	x16, [x16]
+
+/* allow path: restore the arguments, then leave for the trampoline */
 #define IH_TAIL(n)						\
-	IH_RESTORE();						\
-	adrp	x16, susfs_ih_tramp_##n;			
-	add	x16, x16, :lo12:susfs_ih_tramp_##n;			\
-	ldr	x16, [x16];					\
+	IH_RESTORE_ARGS();					\
+	IH_TRAMP_ADDR(n);					\
 	br	x16
 
+/* hit path: leave with ENOENT instead of running the original */
 #define IH_HIDE()						\
-	IH_RESTORE();						\
+	IH_RESTORE_ARGS();					\
+	ldr	x30, [sp, #160];				\
+	add	sp, sp, #192;					\
 	mov	x0, #-2;	/* -ENOENT */			\
 	ret
 
@@ -64,14 +73,15 @@ susfs_ih_stub_##n:;						\
 	IH_SAVE();						\
 	mov	w1, #argno;					\
 	bl	susfs_ih_decide;				\
-	cbz	x0, 9f;						\
+	cbz	x0, 8f;						\
 	IH_HIDE();						\
-9:;								\
+8:;								\
 	IH_TAIL(n);						\
 	.size	susfs_ih_stub_##n, . - susfs_ih_stub_##n
 
 /* name-taking entries (filename_lookup, do_filp_open, user_path_at_empty): the
- * name is in x1, and w1 carries the mode (0 = struct filename, 1 = user ptr). */
+ * name is in x1, and w1 carries the mode (0 = struct filename, already in
+ * kernel memory, 1 = user pointer). */
 #define SUSFS_IH_NAME_STUB(n, mode)				\
 	.globl	susfs_ih_stub_##n;				\
 	.type	susfs_ih_stub_##n, %function;			\
@@ -80,20 +90,19 @@ susfs_ih_stub_##n:;						\
 	mov	x0, x1;						\
 	mov	w1, #mode;					\
 	bl	susfs_ih_decide_name;				\
-	cbz	x0, 9f;						\
+	cbz	x0, 8f;						\
 	IH_HIDE();						\
-9:;								\
+8:;								\
 	IH_TAIL(n);						\
 	.size	susfs_ih_stub_##n, . - susfs_ih_stub_##n
 
-/* onLeave hook: the same patch, but the stub hands the frame back to itself.
+/* onLeave: the stub hands the frame back to itself.
  *
- * It stores the caller's real LR in a spare slot, points the target's LR at the
- * label after the trampoline jump, and enters the original function.  The
- * target's own prologue (paciasp and friends) then signs THAT LR, so its
- * epilogue restores and authenticates it happily - and control lands back here
- * with x0 holding the target's return value.  We then call the C after-handler
- * and leave with the real LR, so this can rewrite a return value.
+ * The caller's real LR goes in a spare slot, the target's LR is pointed at the
+ * label after the trampoline jump, and the original runs.  Its own prologue
+ * (paciasp and friends) then signs THAT LR, so its epilogue restores and
+ * authenticates it happily - and control lands back here with x0 holding the
+ * result, which the C after-handler may replace.
  *
  * Layout: [0..144] x0-x18, [152] LR for the target, [160] real LR,
  *         [168] the target's return value. */
@@ -101,42 +110,22 @@ susfs_ih_stub_##n:;						\
 	.globl	susfs_ih_stub_##n;				\
 	.type	susfs_ih_stub_##n, %function;			\
 susfs_ih_stub_##n:;						\
-	sub	sp, sp, #192;					\
-	stp	x0,  x1,  [sp, #0];				\
-	stp	x2,  x3,  [sp, #16];				\
-	stp	x4,  x5,  [sp, #32];				\
-	stp	x6,  x7,  [sp, #48];				\
-	stp	x8,  x9,  [sp, #64];				\
-	stp	x10, x11, [sp, #80];				\
-	stp	x12, x13, [sp, #96];				\
-	stp	x14, x15, [sp, #112];				\
-	stp	x16, x17, [sp, #128];				\
-	str	x18, [sp, #144];				\
-	str	x30, [sp, #160];	/* real LR */		\
+	IH_SAVE();						\
 	adr	x9, 9f;						\
-	str	x9,  [sp, #152];	/* LR for target */	\
+	str	x9, [sp, #152];					\
 	mov	x30, x9;					\
-	ldp	x0,  x1,  [sp, #0];				\
-	ldp	x2,  x3,  [sp, #16];				\
-	ldp	x4,  x5,  [sp, #32];				\
-	ldp	x6,  x7,  [sp, #48];				\
-	ldp	x8,  x9,  [sp, #64];				\
-	ldp	x10, x11, [sp, #80];				\
-	ldp	x12, x13, [sp, #96];				\
-	ldp	x14, x15, [sp, #112];				\
-	ldr	x18, [sp, #144];				\
-	adrp	x16, susfs_ih_tramp_##n;			
-	add	x16, x16, :lo12:susfs_ih_tramp_##n;			\
-	ldr	x16, [x16];					\
+	IH_RESTORE_ARGS();					\
+	IH_TRAMP_ADDR(n);					\
 	br	x16;						\
-9:;	/* x0 = target's return value */			\
+9:;								\
 	str	x0, [sp, #168];					\
-	ldp	x0,  x1,  [sp, #0];	/* original args */	\
-	ldr	x2,  [sp, #168];	/* return value */	\
+	ldp	x0, x1, [sp, #0];				\
+	ldr	x2, [sp, #168];					\
 	bl	after_fn;					\
 	ldr	x30, [sp, #160];				\
 	add	sp, sp, #192;					\
-	ret
+	ret;							\
+	.size	susfs_ih_stub_##n, . - susfs_ih_stub_##n
 
 	SUSFS_IH_SYS_STUB(openat, 1)
 	SUSFS_IH_SYS_STUB(openat2, 1)
@@ -151,7 +140,6 @@ susfs_ih_stub_##n:;						\
 	SUSFS_IH_NAME_STUB(do_filp_open, 0)
 	SUSFS_IH_NAME_STUB(user_path_at_empty, 1)
 
-	/* onLeave: needs the result of the original call */
 	SUSFS_IH_LEAVE_STUB(getname, susfs_ih_after_getname)
 
 	.bss
