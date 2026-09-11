@@ -1007,6 +1007,17 @@ __attribute__((visibility("hidden"))) u64 susfs_ih_after_getname(u64 a0, u64 a1,
 {
 	struct filename *f = (struct filename *)ret;
 
+	/* Diagnostic: proves whether the patched entry is reached at all on this
+	 * kernel.  The first few calls are logged in full, the rest are silent. */
+	{
+		static atomic_t calls = ATOMIC_INIT(0);
+
+		if (atomic_inc_return(&calls) <= 10)
+			pr_info("sus_path: getname_flags returned %px (name=%s)\n",
+				(void *)f, (!IS_ERR_OR_NULL(f) && f->name) ?
+				f->name : "-");
+	}
+
 	if (IS_ERR_OR_NULL(f) || !f->name)
 		return ret;
 	if (!sus_path_match_path(f->name))
