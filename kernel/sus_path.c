@@ -314,6 +314,10 @@ static int kp_dac_hit(struct pt_regs *regs, atomic_t *counter)
         return 0;
 
     atomic_inc(counter);
+    /* Says whether this probe is reached at all: on this kernel both DAC
+     * symbols look inlined, and only a hit proves otherwise. */
+    pr_info_ratelimited("sus_path: DAC hit on ino=%lu (uid=%u)\n",
+                        inode->i_ino, current_uid().val);
     /* Answer "no such file" and skip the whole function: the DAC check inside
      * it is what would otherwise answer EACCES. */
     regs_set_return_value(regs, (unsigned long)-ENOENT);
@@ -393,6 +397,136 @@ static void sus_path_dac_unregister(void)
             continue;
         unregister_kprobe(dac_probes[i]);
         dac_registered[i] = false;
+    }
+}
+
+/* ---- lookup layer ----
+ *
+ * The DAC probes above turn out not to fire on this kernel: a registered 0600
+ * root file still answers EACCES on read, which only happens if neither
+ * inode_permission() nor generic_permission() is reached - GKI's LTO inlines
+ * them into their callers, so the kallsyms entries are just the copies kept for
+ * module references.  (That also answers "why not patch a jump instead of using
+ * a kprobe": patching those entries would rewrite code nothing executes.)
+ *
+ * So the answer has to be produced where upstream produces it - at lookup time,
+ * before the target inode is permission-checked at all.  Upstream patches
+ * fs/namei.c; an LKM cannot, but it can watch the lookup helpers, and unlike the
+ * DAC helpers these are big enough that LTO leaves them alone (each has a symbol
+ * and a .cfi_jt entry, verified on the device).
+ *
+ * A hit is rewritten into -ENOENT:
+ *   - walk_component()  every component of the path walk, i.e. also the
+ *                       directory whose MAY_EXEC check would answer EACCES;
+ *   - lookup_dcache()   open's last component;
+ *   - __lookup_slow()   the cache-miss path.
+ *
+ * struct nameidata is defined inside fs/namei.c, not in a header, so it cannot
+ * be declared here.  It is not needed either: the only field used is the first
+ * one, and nameidata has always started with `struct path path`.  Reading that
+ * prefix is what keeps this compilable. */
+struct sus_path_nd_prefix {
+    struct path path;
+};
+
+struct sus_path_walk_args {
+    struct sus_path_nd_prefix *nd;
+};
+
+static int kr_walk_component_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct sus_path_walk_args *a = (struct sus_path_walk_args *)ri->data;
+
+    a->nd = (struct sus_path_nd_prefix *)regs->regs[0];
+    return 0;
+}
+
+/* walk_component() returns 1 with nd->path already moved to the component it
+ * resolved, so rewriting that into -ENOENT makes the walk stop here - before
+ * the caller's inode_permission() on the parent can answer EACCES. */
+static int kr_walk_component_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct sus_path_walk_args *a = (struct sus_path_walk_args *)ri->data;
+    struct dentry *d;
+
+    if ((long)regs_return_value(regs) <= 0 || !a->nd)
+        return 0;
+
+    d = READ_ONCE(a->nd->path.dentry);
+    if (d && sus_path_lookup_hit(READ_ONCE(d->d_inode)))
+        regs_set_return_value(regs, (unsigned long)-ENOENT);
+    return 0;
+}
+
+/* lookup_dcache() and __lookup_slow() return struct dentry *, so they take the
+ * ERR_PTR form. */
+static int kr_lookup_dcache_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct dentry *d = (struct dentry *)regs_return_value(regs);
+
+    if (IS_ERR_OR_NULL(d))
+        return 0;
+    if (sus_path_lookup_hit(READ_ONCE(d->d_inode)))
+        regs_set_return_value(regs, (unsigned long)ERR_PTR(-ENOENT));
+    return 0;
+}
+
+static struct kretprobe krp_walk_component = {
+    .kp.symbol_name = "walk_component",
+    .entry_handler = kr_walk_component_entry,
+    .handler = kr_walk_component_ret,
+    .data_size = sizeof(struct sus_path_walk_args),
+    .maxactive = 64,
+};
+
+static struct kretprobe krp_lookup_dcache = {
+    .kp.symbol_name = "lookup_dcache",
+    .handler = kr_lookup_dcache_ret,
+    .maxactive = 64,
+};
+
+static struct kretprobe krp_lookup_slow = {
+    .kp.symbol_name = "__lookup_slow",
+    .handler = kr_lookup_dcache_ret,     /* same return-value rewrite */
+    .maxactive = 64,
+};
+
+static struct kretprobe *lookup_krps[] = {
+    &krp_walk_component,
+    &krp_lookup_dcache,
+    &krp_lookup_slow,
+};
+
+#define N_LOOKUP_KRPS ARRAY_SIZE(lookup_krps)
+static bool lookup_registered[N_LOOKUP_KRPS];
+
+static void sus_path_lookup_register(void)
+{
+    int i;
+
+    for (i = 0; i < N_LOOKUP_KRPS; i++) {
+        int rc = register_kretprobe(lookup_krps[i]);
+
+        if (rc) {
+            pr_warn("sus_path: kretprobe(%s) failed %d\n",
+                    lookup_krps[i]->kp.symbol_name, rc);
+            continue;
+        }
+        lookup_registered[i] = true;
+    }
+    pr_info("sus_path: lookup layer armed (walk_component=%d lookup_dcache=%d __lookup_slow=%d)\n",
+            lookup_registered[0], lookup_registered[1], lookup_registered[2]);
+}
+
+static void sus_path_lookup_unregister(void)
+{
+    int i;
+
+    for (i = 0; i < N_LOOKUP_KRPS; i++) {
+        if (!lookup_registered[i])
+            continue;
+        unregister_kretprobe(lookup_krps[i]);
+        lookup_registered[i] = false;
     }
 }
 
@@ -662,6 +796,11 @@ int sus_path_init(void)
      * of ENOENT (see the note above it). */
     sus_path_dac_register();
 
+    /* Plus the lookup layer: the DAC probes above do not fire on this kernel,
+     * and this is the layer that actually answers ENOENT before the DAC check
+     * on a hidden directory can answer EACCES. */
+    sus_path_lookup_register();
+
     return 0;
 }
 
@@ -672,6 +811,7 @@ void sus_path_exit(void)
 
     /* Unregister the hooks FIRST: after this nothing can match, so the entries
      * (and their inode references) can be torn down safely. */
+    sus_path_lookup_unregister();
     sus_path_dac_unregister();
     if (sus_path_perm_hook.entry)
         ksu_unregister_lsm_hook(&sus_path_perm_hook);
