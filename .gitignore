@@ -24,3 +24,11 @@ test_*.sh
 
 # local ABI-layout verification scaffolding (uses stub <linux/*> shims)
 abi_layout_check/
+
+# device test scripts (t_*.sh): they hardcode /data/local/tmp paths and are
+# hardware-specific scaffolding, not part of the module.  Earlier revisions
+# tracked them; this keeps new ones out.  (tools/ is NOT ignored - CI builds
+# tools/susfs_sc.c into the supercall client.)
+t_*.sh
+art/
+art2/
