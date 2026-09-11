@@ -374,7 +374,7 @@ static int sus_mount_mark_ksu_mounts(void)
             dp = sus_mount_d_path(&mnt_path, buf, PATH_MAX);
             /* Diagnostic while the matching rule is being validated: the first
              * few mounts show what d_path() actually renders for them. */
-            if (scan_logged < 12) {
+            if (scan_logged < 400) {
                 scan_logged++;
                 pr_info("sus_mount: scan %s -> %s\n", r->mnt_devname,
                         IS_ERR_OR_NULL(dp) ? "(d_path failed)" : dp);
