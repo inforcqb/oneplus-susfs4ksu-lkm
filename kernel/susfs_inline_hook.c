@@ -209,6 +209,51 @@ static __nocfi int susfs_ih_write(unsigned long entry, const void *src,
 	return 0;
 }
 
+/*
+ * The entry is two words and each write is atomic, but the PAIR is not: a CPU
+ * can be stopped between them and resume with a mix of old and new.  So the
+ * order matters, and it is not the same in both directions.
+ *
+ * The first instruction of every one of these entries is paciasp (measured), so
+ * "new word0 + old word1" would run the second instruction of the prologue
+ * WITHOUT the signing instruction - the function's own epilogue would then fail
+ * its autiasp and take the box down.  The safe intermediate state is the other
+ * one: the original first instruction followed by the branch, because a call
+ * that runs the real prologue and then lands in the stub is exactly what the
+ * stub is built to handle (the trampoline replays that prologue again, and a
+ * repeated paciasp writes the same signature to the same slot).
+ *
+ * install:   word1 = b <stub>, then word0 = bti c
+ * uninstall: word0 = orig[0], then word1 = orig[1]
+ */
+static __nocfi int susfs_ih_patch_entry(unsigned long entry, const u32 *orig,
+					const u32 *patch)
+{
+	int rc = susfs_ih_write(entry + 4, &patch[1], sizeof(u32), true);
+
+	if (rc)
+		return rc;
+	rc = susfs_ih_write(entry, &patch[0], sizeof(u32), true);
+	if (rc) {
+		/* Halfway: entry[0] is still the original instruction and
+		 * entry[1] is the branch, which is the safe state.  Put the
+		 * original second word back so the entry is pristine again. */
+		pr_err("susfs_ih: entry %px left half patched, undoing\n",
+		       (void *)entry);
+		susfs_ih_write(entry + 4, &orig[1], sizeof(u32), true);
+	}
+	return rc;
+}
+
+static __nocfi int susfs_ih_restore_entry(unsigned long entry, const u32 *orig)
+{
+	int rc = susfs_ih_write(entry, &orig[0], sizeof(u32), true);
+
+	if (rc)
+		return rc;
+	return susfs_ih_write(entry + 4, &orig[1], sizeof(u32), true);
+}
+
 static __nocfi int susfs_ih_install_impl(struct susfs_ih_hook *h,
 					 const char *sym, void *stub,
 					 u64 *tramp_var)
@@ -259,14 +304,10 @@ static __nocfi int susfs_ih_install_impl(struct susfs_ih_hook *h,
 	patch[0] = 0xd503245fu;					/* bti c */
 	patch[1] = 0x14000000u | (((u32)(delta >> 2)) & 0x03ffffffu);
 
-	if (susfs_ih_write(h->entry, patch, sizeof(patch), true)) {
+	if (susfs_ih_patch_entry(h->entry, h->orig, patch)) {
 		pr_err("susfs_ih: could not patch %s\n", sym);
-		/* A partially committed write may have left the entry inconsistent
-		 * (the first word is written separately from the second), so put the
-		 * original instructions back.  Do NOT clear *tramp_var and do NOT
-		 * free the trampoline: if even one byte of the branch landed, some
-		 * core may already be inside the stub and needs both. */
-		susfs_ih_write(h->entry, h->orig, sizeof(h->orig), true);
+		/* Keep *tramp_var and the trampoline: if even one word landed,
+		 * some core may already be inside the stub and needs both. */
 		return -EIO;
 	}
 
@@ -287,7 +328,7 @@ static __nocfi void susfs_ih_uninstall_impl(struct susfs_ih_hook *h)
 	if (!h->installed)
 		return;
 
-	if (susfs_ih_write(h->entry, h->orig, sizeof(h->orig), true))
+	if (susfs_ih_restore_entry(h->entry, h->orig))
 		pr_err("susfs_ih: could not restore %px\n", (void *)h->entry);
 	else
 		pr_info("susfs_ih: restored %px\n", (void *)h->entry);
