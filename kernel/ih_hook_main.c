@@ -1,28 +1,28 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * ih_hook_main.c - stage 1 of the inline-hook plan, as a throwaway test module.
+ * ih_hook_main.c - inline-hook test module.
  *
- * Hooks exactly one entry point, __arm64_sys_openat, and answers -ENOENT for one
- * hard-coded path when the caller is an app.  Everything else must keep working,
- * which is the real test: it exercises the trampoline.
+ * Two modes, so that a bug never has to be found on a system hot path again:
  *
- * Why this shape (all of it measured with ih_probe_test first):
- *   - every candidate entry starts with paciasp, which doubles as the BTI
- *     landing pad, so a patch that overwrites it must supply its own: this one
- *     writes `bti c` first;
- *   - no instruction in the first 20 bytes is PC-relative, so the two we clobber
- *     can be replayed verbatim from a trampoline;
- *   - the module sits 79-89MB from core text, inside B's +/-128MB, so an 8-byte
- *     patch (bti c ; b stub) is enough - and the distance is checked at runtime,
- *     not assumed;
- *   - the trampoline lives in a page from module_alloc(), because the kernel's
- *     text-patch helper converts addresses with __pa() and that is meaningless
- *     for vmalloc memory: this page is written while still writable, then
- *     sealed read-only and executable.
+ *   selftest=1 (default) points the machinery at ih_test_target(), a function in
+ *   this module, and checks the three outcomes that matter: unchanged result
+ *   through the trampoline, the hooked answer, and restore.  A failure here
+ *   crashes this module's own call, not every openat in the system.
  *
- * Unloading restores the entry but deliberately leaks the trampoline page rather
- * than vfree()ing memory a CPU might still be executing (the same reasoning as
- * the open_redirect retirement).
+ *   hook_syscall=1 additionally patches __arm64_sys_openat for real.
+ *
+ * Mechanics (all measured with ih_probe_test first):
+ *   - entries start with paciasp, which doubles as the BTI landing pad, so the
+ *     patch supplies its own 'bti c';
+ *   - no PC-relative instruction in the window, so the two clobbered
+ *     instructions replay verbatim;
+ *   - 79-89MB to module text, inside B's reach, checked at runtime;
+ *   - the trampoline lives in a module_alloc() page because ksu_patch_text
+ *     converts addresses with __pa(), which is meaningless for vmalloc memory.
+ *
+ * The one bug the first version had is worth recording: the stub called a C
+ * function without saving x0-x18, so the allow path handed the trampoline a
+ * clobbered argument register.  See ih_hook_stub.S.
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -40,21 +40,50 @@
 #define IH_HIDDEN	"/data/local/tmp/dac_probe/f600"
 #define IH_TRAMP_SIZE	64
 
-/* Defined in ih_hook_stub.S. */
 extern u64 ih_openat_tramp;
+extern u64 ih_selftest_tramp;
 extern void ih_openat_stub(void);
+extern void ih_selftest_stub(void);
 
 static void *(*pfn_module_alloc)(unsigned long size);
 static int (*pfn_set_memory_ro)(unsigned long addr, int numpages);
+static int (*pfn_set_memory_rw)(unsigned long addr, int numpages);
 static int (*pfn_set_memory_x)(unsigned long addr, int numpages);
 
-static unsigned long ih_entry;
-static u32 ih_orig[2];
-static void *ih_tramp_mem;
-static bool ih_installed;
+static bool ih_openat_installed;
+static unsigned long ih_openat_entry;
+static u32 ih_openat_orig[2];
+static void *ih_openat_tramp_mem;
 
-/* Called from the stub with the wrapper's argument untouched in x0.  Returns 1
- * to hide the path, 0 to let the call run normally. */
+static int selftest = 1;
+module_param(selftest, int, 0444);
+static int hook_syscall;
+module_param(hook_syscall, int, 0444);
+
+/* ------------------------------------------------------------------ */
+/* self-test target: a real function in this module, so the whole path can be
+ * exercised without touching anything the system depends on. */
+
+static noinline long ih_test_target(long x)
+{
+	return x * 3 + 7;
+}
+
+static long (*volatile ih_test_call)(long) = ih_test_target;
+
+static long ih_selftest_arg;
+static int ih_selftest_hide;
+
+/* Called from ih_selftest_stub with the target's arguments still in place. */
+int ih_selftest_decide(long x)
+{
+	ih_selftest_arg = x;
+	return ih_selftest_hide;
+}
+
+/* ------------------------------------------------------------------ */
+/* the real decision: only apps, only one path */
+
 int ih_openat_decide(const struct pt_regs *uregs)
 {
 	const char __user *uname;
@@ -88,139 +117,218 @@ static void ih_flush_icache(void *addr, unsigned long len)
 #endif
 }
 
-static int ih_install(void)
+/* Patch either core text (ksu_patch_text, which knows how to get at read-only
+ * kernel text) or this module's own read-only text (unlock, write, re-lock). */
+static int ih_write_text(void *dst, const void *src, size_t len, bool core_text)
 {
-	u32 *entry, patch[2];
-	long delta;
-	u32 *tr;
-	int rc;
+	unsigned long page = (unsigned long)dst & PAGE_MASK;
 
-	ih_entry = find_kernel_symbol_exact(IH_TARGET);
-	if (!ih_entry) {
-		pr_err("ih_hook: %s not found\n", IH_TARGET);
-		return -ENOENT;
-	}
+	if (core_text)
+		return ksu_patch_text(dst, (void *)src, len,
+				      KSU_PATCH_TEXT_FLUSH_ICACHE |
+				      KSU_PATCH_TEXT_FLUSH_DCACHE);
 
-	entry = (u32 *)ih_entry;
-	ih_orig[0] = entry[0];
-	ih_orig[1] = entry[1];
-
-	pr_info("ih_hook: entry %px: %08x %08x\n", (void *)ih_entry, ih_orig[0],
-		ih_orig[1]);
-
-	/* Refuse anything we cannot reason about. */
-	if ((ih_orig[0] & 0x1f000000u) == 0x10000000u ||
-	    (ih_orig[1] & 0x1f000000u) == 0x10000000u ||
-	    (ih_orig[0] & 0x7c000000u) == 0x14000000u ||
-	    (ih_orig[1] & 0x7c000000u) == 0x14000000u) {
-		pr_err("ih_hook: entry is not a recognised prologue, refusing\n");
+	if (pfn_set_memory_rw(page, 1))
 		return -EPERM;
-	}
+	memcpy(dst, src, len);
+	ih_flush_icache(dst, len);
+	if (pfn_set_memory_ro(page, 1))
+		return -EPERM;
+	return 0;
+}
 
-	delta = (long)(unsigned long)ih_openat_stub - (long)(ih_entry + 4);
-	if (delta < -(124L << 20) || delta > (124L << 20)) {
-		pr_err("ih_hook: stub is %ldMB away, outside B's reach\n",
-		       delta >> 20);
-		return -ERANGE;
-	}
+static bool ih_sane_prologue(const u32 *insn)
+{
+	int i;
 
-	tr = pfn_module_alloc(IH_TRAMP_SIZE);
-	if (!tr) {
-		pr_err("ih_hook: module_alloc failed\n");
-		return -ENOMEM;
+	for (i = 0; i < 2; i++) {
+		if ((insn[i] & 0x1f000000u) == 0x10000000u)	/* adr/adrp  */
+			return false;
+		if ((insn[i] & 0x3b000000u) == 0x18000000u)	/* ldr lit   */
+			return false;
+		if ((insn[i] & 0x7c000000u) == 0x14000000u)	/* b/bl      */
+			return false;
+		if ((insn[i] & 0xff000010u) == 0x54000000u)	/* b.cond    */
+			return false;
+		if ((insn[i] & 0x7f000000u) == 0x34000000u)	/* cbz/cbnz  */
+			return false;
+		if ((insn[i] & 0x7f000000u) == 0x36000000u)	/* tbz/tbnz  */
+			return false;
 	}
-	ih_tramp_mem = tr;
+	return true;
+}
 
-	tr[0] = ih_orig[0];			/* paciasp            */
-	tr[1] = ih_orig[1];			/* sub sp, sp, #imm   */
-	tr[2] = 0x58000050u;			/* ldr x16, #8        */
+/* Build the trampoline for `entry`: replay the two instructions we overwrite,
+ * then ldr x16, #8 / ret x16 into entry+8.  Returns the page or NULL. */
+static void *ih_build_tramp(unsigned long entry, const u32 *orig)
+{
+	u32 *tr = pfn_module_alloc(IH_TRAMP_SIZE);
+
+	if (!tr)
+		return NULL;
+
+	tr[0] = orig[0];
+	tr[1] = orig[1];
+	tr[2] = 0x58000050u;			/* ldr x16, #8         */
 	tr[3] = 0xd65f0200u;			/* ret x16 (BTI-exempt) */
-	*(u64 *)(tr + 4) = ih_entry + 8;	/* -> entry + 8       */
+	*(u64 *)(tr + 4) = entry + 8;
 
 	ih_flush_icache(tr, IH_TRAMP_SIZE);
 
 	if (pfn_set_memory_ro((unsigned long)tr, 1) ||
 	    pfn_set_memory_x((unsigned long)tr, 1)) {
-		pr_err("ih_hook: could not seal the trampoline executable\n");
+		pr_err("ih_hook: cannot seal trampoline %px executable\n", tr);
 		vfree(tr);
-		ih_tramp_mem = NULL;
+		return NULL;
+	}
+	return tr;
+}
+
+static int ih_patch(unsigned long entry, void *stub, bool core_text,
+		    u32 *saved, void **tramp_slot, u64 *tramp_var)
+{
+	u32 patch[2];
+	long delta;
+	void *tr;
+
+	if (!ih_sane_prologue((const u32 *)entry)) {
+		pr_err("ih_hook: %px prologue not understood, refusing\n",
+		       (void *)entry);
 		return -EPERM;
 	}
 
-	ih_openat_tramp = (u64)(unsigned long)tr;
+	delta = (long)(unsigned long)stub - (long)(entry + 4);
+	if (delta < -(124L << 20) || delta > (124L << 20)) {
+		pr_err("ih_hook: stub %ldMB away, outside B's reach\n", delta >> 20);
+		return -ERANGE;
+	}
+
+	saved[0] = ((u32 *)entry)[0];
+	saved[1] = ((u32 *)entry)[1];
+
+	tr = ih_build_tramp(entry, saved);
+	if (!tr)
+		return -ENOMEM;
+	*tramp_slot = tr;
+	*tramp_var = (u64)(unsigned long)tr;
 
 	patch[0] = 0xd503245fu;					/* bti c */
 	patch[1] = 0x14000000u | (((u32)(delta >> 2)) & 0x03ffffffu);
 
-	rc = ksu_patch_text((void *)ih_entry, patch, sizeof(patch),
-			    KSU_PATCH_TEXT_FLUSH_ICACHE | KSU_PATCH_TEXT_FLUSH_DCACHE);
-	if (rc) {
-		pr_err("ih_hook: patch_text failed %d\n", rc);
-		ih_openat_tramp = 0;
-		vfree(tr);
-		ih_tramp_mem = NULL;
-		return rc;
+	if (ih_write_text((void *)entry, patch, sizeof(patch), core_text)) {
+		pr_err("ih_hook: could not patch %px\n", (void *)entry);
+		*tramp_var = 0;
+		return -EIO;
 	}
-
-	ih_installed = true;
-	pr_info("ih_hook: %s hooked: tramp=%px patch=%08x %08x\n", IH_TARGET,
-		tr, patch[0], patch[1]);
 	return 0;
 }
 
-static void ih_remove(void)
+static void ih_unpatch(unsigned long entry, const u32 *saved, bool core_text,
+		       u64 *tramp_var)
 {
-	if (!ih_installed)
+	if (ih_write_text((void *)entry, saved, sizeof(u32) * 2, core_text))
+		pr_err("ih_hook: could not restore %px\n", (void *)entry);
+	*tramp_var = 0;
+}
+
+/* ------------------------------------------------------------------ */
+static void ih_run_selftest(void)
+{
+	unsigned long entry = (unsigned long)ih_test_target;
+	u32 saved[2];
+	void *tr = NULL;
+	long got;
+	int rc;
+
+	pr_info("ih_selftest: target %s @ %px\n", "ih_test_target", (void *)entry);
+
+	got = ih_test_call(5);
+	pr_info("ih_selftest: step 1 baseline target(5) = %ld (expect 22)\n", got);
+
+	rc = ih_patch(entry, ih_selftest_stub, false, saved, &tr,
+		      &ih_selftest_tramp);
+	pr_info("ih_selftest: step 2 patch rc=%d tramp=%px saved=%08x %08x\n",
+		rc, tr, saved[0], saved[1]);
+	if (rc)
 		return;
 
-	if (ksu_patch_text((void *)ih_entry, ih_orig, sizeof(ih_orig),
-			   KSU_PATCH_TEXT_FLUSH_ICACHE | KSU_PATCH_TEXT_FLUSH_DCACHE))
-		pr_err("ih_hook: failed to restore the entry\n");
-	else
-		pr_info("ih_hook: entry restored\n");
+	ih_selftest_hide = 0;
+	got = ih_test_call(5);
+	pr_info("ih_selftest: step 3 allow -> target(5) = %ld (expect 22, via trampoline)\n",
+		got);
 
-	ih_installed = false;
-	ih_openat_tramp = 0;
+	ih_selftest_hide = 1;
+	got = ih_test_call(5);
+	pr_info("ih_selftest: step 4 hide  -> target(5) = %ld (expect -2), decide saw %ld\n",
+		got, ih_selftest_arg);
 
-	/* Deliberately not freed: a CPU may still be inside it.  This is a test
-	 * module, one page, and the retirement trick is the safe answer. */
-	pr_info("ih_hook: trampoline page %px retired (not freed)\n", ih_tramp_mem);
-	ih_tramp_mem = NULL;
+	ih_selftest_hide = 0;
+	ih_unpatch(entry, saved, false, &ih_selftest_tramp);
+	got = ih_test_call(5);
+	pr_info("ih_selftest: step 5 restored target(5) = %ld (expect 22)\n", got);
+}
+
+static int ih_hook_openat(void)
+{
+	int rc;
+
+	ih_openat_entry = find_kernel_symbol_exact(IH_TARGET);
+	if (!ih_openat_entry) {
+		pr_err("ih_hook: %s not found\n", IH_TARGET);
+		return -ENOENT;
+	}
+
+	rc = ih_patch(ih_openat_entry, ih_openat_stub, true, ih_openat_orig,
+		      &ih_openat_tramp_mem, &ih_openat_tramp);
+	if (rc)
+		return rc;
+
+	ih_openat_installed = true;
+	pr_info("ih_hook: %s hooked (entry %px, tramp %px)\n", IH_TARGET,
+		(void *)ih_openat_entry, ih_openat_tramp_mem);
+	return 0;
 }
 
 static int __init ih_hook_init(void)
 {
-	int rc;
-
-	pr_info("ih_hook: stage-1 inline hook test\n");
+	pr_info("ih_hook: inline-hook test (selftest=%d hook_syscall=%d)\n",
+		selftest, hook_syscall);
 	ksu_init_symbol_resolver();
 
 	pfn_module_alloc = (void *)find_kernel_symbol_exact("module_alloc");
 	pfn_set_memory_ro = (void *)find_kernel_symbol_exact("set_memory_ro");
+	pfn_set_memory_rw = (void *)find_kernel_symbol_exact("set_memory_rw");
 	pfn_set_memory_x = (void *)find_kernel_symbol_exact("set_memory_x");
-	if (!pfn_module_alloc || !pfn_set_memory_ro || !pfn_set_memory_x) {
-		pr_err("ih_hook: helpers missing (module_alloc=%d ro=%d x=%d)\n",
-		       !!pfn_module_alloc, !!pfn_set_memory_ro, !!pfn_set_memory_x);
+	if (!pfn_module_alloc || !pfn_set_memory_ro || !pfn_set_memory_rw ||
+	    !pfn_set_memory_x) {
+		pr_err("ih_hook: helpers missing (alloc=%d ro=%d rw=%d x=%d)\n",
+		       !!pfn_module_alloc, !!pfn_set_memory_ro,
+		       !!pfn_set_memory_rw, !!pfn_set_memory_x);
 		return -ENOENT;
 	}
 
-	rc = ih_install();
-	if (rc) {
-		pr_err("ih_hook: install failed %d\n", rc);
-		return rc;
-	}
+	if (selftest)
+		ih_run_selftest();
 
-	pr_info("ih_hook: armed; hidden path for apps: %s\n", IH_HIDDEN);
+	if (hook_syscall)
+		ih_hook_openat();
+
 	return 0;
 }
 
 static void __exit ih_hook_exit(void)
 {
-	ih_remove();
+	if (ih_openat_installed) {
+		ih_unpatch(ih_openat_entry, ih_openat_orig, true, &ih_openat_tramp);
+		ih_openat_installed = false;
+		pr_info("ih_hook: %s restored\n", IH_TARGET);
+	}
+	/* Trampoline pages are retired, not freed: a CPU may still be running
+	 * one, and this is a test module. */
 	pr_info("ih_hook: unloaded\n");
 }
 
 module_init(ih_hook_init);
 module_exit(ih_hook_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("stage-1 inline hook test (__arm64_sys_openat)");
+MODULE_DESCRIPTION("inline hook test module (self-test + optional syscall hook)");
