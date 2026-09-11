@@ -42,6 +42,7 @@
 
 /* Defined in ih_hook_stub.S. */
 extern u64 ih_openat_tramp;
+extern void ih_openat_stub(void);
 
 static void *(*pfn_module_alloc)(unsigned long size);
 static int (*pfn_set_memory_ro)(unsigned long addr, int numpages);
