@@ -133,19 +133,6 @@ struct sus_path_entry {
      * it from every non-root caller, not only from apps - see
      * sus_path_entry_gate(). */
     bool self_protect;
-    /* The directory this rule's name sits in, as plain numbers.
-     *
-     * walk_component() is where a rule can be matched while the current path
-     * component is still just a name and the DAC check has not run yet: at its
-     * entry nd->path is the parent directory and nd->last is the component being
-     * looked up (fs/namei.c:2275-2303 sets it right before the call).  Matching
-     * on (parent dev, parent ino, name) is the inode-level identity of the rule
-     * without holding a second inode reference - and because every component of
-     * every path goes through walk_component, it covers the spellings the
-     * string-matching entry hooks cannot see (relative paths, symlinks, dotdot),
-     * and it runs before may_lookup()/inode_permission(). */
-    u64 parent_dev;
-    u64 parent_ino;
 };
 
 static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path);
@@ -358,60 +345,6 @@ static inline bool sus_path_entry_gate_inode(const struct sus_path_entry *e,
     return sus_path_gate_ok(inode);
 }
 
-/* Is this component, sitting in this parent directory, a hidden rule?
- *
- * The key is (parent dev, parent ino, component name) - see the comment on the
- * entry struct.  The name is NOT NUL-terminated here: it is the qstr
- * walk_component() was handed, so the length is authoritative and the stored
- * name must not be longer than it. */
-static bool sus_path_parent_hit(u64 dev, u64 ino, const unsigned char *name,
-                                unsigned int len)
-{
-    struct sus_path_entry *e;
-    bool hit = false;
-
-    if (!len || len > NAME_MAX)
-        return false;
-    if (sus_path_is_resolver())
-        return false;
-    if (!READ_ONCE(sus_path_count))
-        return false;
-
-    spin_lock(&sus_path_lock);
-    list_for_each_entry(e, &sus_path_list, list) {
-        if (e->parent_dev != dev || e->parent_ino != ino)
-            continue;
-        if (strncmp(e->name, (const char *)name, len))
-            continue;
-        if (e->name[len] != '\0')       /* stored name is longer */
-            continue;
-        if (!sus_path_entry_gate(e))
-            continue;
-        hit = true;
-        break;
-    }
-    spin_unlock(&sus_path_lock);
-
-    return hit;
-}
-
-/* Record the directory a rule's name lives in.  Called wherever a rule acquires
- * an inode (registration and pending resolution), because walk_component()'s
- * decision keys on (parent dev, parent ino, name).
- *
- * dget_parent() rather than dentry->d_parent: the parent pointer is only stable
- * under RCU otherwise, and this runs in process context. */
-static void sus_path_entry_set_parent(struct sus_path_entry *e,
-                                      struct dentry *dentry)
-{
-    struct dentry *parent = dget_parent(dentry);
-    struct inode *pino = d_inode(parent);
-
-    e->parent_dev = pino ? (u64)pino->i_sb->s_dev : 0;
-    e->parent_ino = pino ? (u64)pino->i_ino : 0;
-    dput(parent);
-}
-
 static bool sus_path_is_hidden(u64 ino, const char *name)
 {
     struct sus_path_entry *e;
@@ -527,7 +460,6 @@ static int sus_path_resolve_pending(void)
         struct path p;
         char name[NAME_MAX + 1];
         bool published = false;
-        u64 pdev = 0, pino_v = 0;
         int rc;
 
         path[0] = '\0';
@@ -562,20 +494,7 @@ static int sus_path_resolve_pending(void)
             atomic_inc(&sus_path_pend_walks);
             inode = d_inode(p.dentry);
             if (inode) {
-                struct dentry *parent;
-
                 strscpy(name, p.dentry->d_name.name, sizeof(name));
-                /* Same key walk_component() matches on, computed here because the
-                 * publish below happens under the spinlock and dget_parent()
-                 * should not be called from there. */
-                parent = dget_parent(p.dentry);
-                {
-                    struct inode *pino = d_inode(parent);
-
-                    pdev = pino ? (u64)pino->i_sb->s_dev : 0;
-                    pino_v = pino ? (u64)pino->i_ino : 0;
-                }
-                dput(parent);
                 /* Hold it before path_put() can drop the last dentry reference
                  * and evict it; the pointer is published only afterwards. */
                 ihold(inode);
@@ -607,8 +526,6 @@ static int sus_path_resolve_pending(void)
             slot->dev = (u64)inode->i_sb->s_dev;
             slot->ino = (u64)inode->i_ino;
             strscpy(slot->name, name, sizeof(slot->name));
-            slot->parent_dev = pdev;
-            slot->parent_ino = pino_v;
             slot->inode = inode;
             inode = NULL;               /* the table holds the reference now */
             atomic_dec(&sus_path_n_pending);
@@ -880,26 +797,113 @@ static int sus_path_inode_permission(struct inode *inode, int mask)
  * caller and is not itself registered still answers EACCES, because the walk
  * cannot reach the child's lookup at all.  Upstream behaves the same way -
  * register the directory. */
-static atomic_t n_enoent_dac = ATOMIC_INIT(0);      /* retired: was the DAC kprobe layer */
-static atomic_t n_nd_calls = ATOMIC_INIT(0);        /* walk_component hook invocations */
+static atomic_t n_enoent_dac = ATOMIC_INIT(0);      /* inode_permission */
+static atomic_t n_enoent_gper = ATOMIC_INIT(0);     /* generic_permission */
 
-/* ---- the DAC layer used to live here, as a kprobe ----
+/* The other layers' decision, reused so every layer agrees. */
+static bool sus_path_lookup_hit(struct inode *inode)
+{
+    if (!inode)
+        return false;
+    return sus_path_inode_hidden(inode);
+}
+
+/* 5.15 signature: inode_permission(struct user_namespace *mnt_userns,
+ * struct inode *inode, int mask) - the inode is argument 2, i.e. x1.  If that
+ * ever changes the lookup simply misses and nothing else is affected. */
+static int kp_dac_hit(struct pt_regs *regs, atomic_t *counter)
+{
+    struct inode *inode = (struct inode *)regs->regs[1];
+
+    if (!sus_path_lookup_hit(inode))
+        return 0;
+
+    atomic_inc(counter);
+    /* Says whether this probe is reached at all: on this kernel both DAC
+     * symbols look inlined, and only a hit proves otherwise. */
+    pr_info_ratelimited("sus_path: DAC hit on ino=%lu (uid=%u)\n",
+                        inode->i_ino, current_uid().val);
+    /* Answer "no such file" and skip the whole function: the DAC check inside
+     * it is what would otherwise answer EACCES. */
+    regs_set_return_value(regs, (unsigned long)-ENOENT);
+    regs->pc = regs->regs[30];
+    return 1;
+}
+
+static int kp_inode_permission_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+    return kp_dac_hit(regs, &n_enoent_dac);
+}
+
+/* inode_permission() itself turns out to be a dead end on this kernel: the
+ * 0600-file test (DAC denies the app, so the LSM layer can never be reached)
+ * still answered EACCES, i.e. the kprobe never fired - GKI's LTO inlines the
+ * function into its callers and the kallsyms entry is just the copy kept for
+ * module references.  Patching its entry would be equally pointless.
  *
- * It is gone: inode_permission() and generic_permission() are now patched
- * entries in ih_table[], and a kprobe on the same entry would collide (the kprobe
- * owns the first instruction, and the installer refuses an entry whose prologue
- * is a BRK).
- *
- * The old comment here claimed both symbols were inlined into their callers, on
- * the evidence that a 0600-file test kept answering EACCES.  That was wrong: a
- * count-only probe scan measured 1165 hits on inode_permission and 6729 on
- * generic_permission during one round of path walks - they execute.  What the
- * old layer really never did was answer, because it decided through a gate that
- * refused before it looked at the inode.  The inline hooks decide through
- * sus_path_inode_hidden(), which applies the per-rule gate, so the property the
- * layer was written for (ENOENT instead of EACCES on a DAC-denied hidden file)
- * is the one thing an entry decision can deliver and the LSM layer cannot: it
- * runs BEFORE the DAC check inside inode_permission(). */
+ * generic_permission() is where that DAC decision actually lands for any
+ * filesystem without its own ->permission(), and it is NOT inlined (it has both
+ * a symbol and a .cfi_jt entry).  Same handler, same answer. */
+static int kp_generic_permission_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+    return kp_dac_hit(regs, &n_enoent_gper);
+}
+
+static struct kprobe kp_inode_permission = {
+    .symbol_name = "inode_permission",
+    .pre_handler = kp_inode_permission_pre,
+};
+
+static struct kprobe kp_generic_permission = {
+    .symbol_name = "generic_permission",
+    .pre_handler = kp_generic_permission_pre,
+};
+
+static struct kprobe *dac_probes[] = {
+    &kp_inode_permission,
+    &kp_generic_permission,
+};
+
+#define N_DAC_PROBES ARRAY_SIZE(dac_probes)
+static bool dac_registered[N_DAC_PROBES];
+
+/* Off means an app gets EACCES instead of ENOENT whenever the DAC check would
+ * have denied it - i.e. the layer this exists for. */
+static int hide_by_dac = 1;
+module_param_named(hide_by_dac, hide_by_dac, int, 0644);
+
+static void sus_path_dac_register(void)
+{
+    int i;
+
+    if (!hide_by_dac)
+        return;
+
+    for (i = 0; i < N_DAC_PROBES; i++) {
+        int rc = register_kprobe(dac_probes[i]);
+
+        if (rc) {
+            pr_warn("sus_path: kprobe(%s) failed %d\n",
+                    dac_probes[i]->symbol_name, rc);
+            continue;
+        }
+        dac_registered[i] = true;
+    }
+    pr_info("sus_path: DAC layer armed (inode_permission=%d generic_permission=%d)\n",
+            dac_registered[0], dac_registered[1]);
+}
+
+static void sus_path_dac_unregister(void)
+{
+    int i;
+
+    for (i = 0; i < N_DAC_PROBES; i++) {
+        if (!dac_registered[i])
+            continue;
+        unregister_kprobe(dac_probes[i]);
+        dac_registered[i] = false;
+    }
+}
 
 /* ---- path-string layer ----
  *
@@ -1619,9 +1623,6 @@ extern void susfs_ih_stub_filename_lookup(void);
 extern void susfs_ih_stub_do_filp_open(void);
 extern void susfs_ih_stub_user_path_at_empty(void);
 extern void susfs_ih_stub_getname(void);
-extern void susfs_ih_stub_inode_permission(void);
-extern void susfs_ih_stub_generic_permission(void);
-extern void susfs_ih_stub_walk_component(void);
 extern u64 susfs_ih_tramp_openat;
 extern u64 susfs_ih_tramp_openat2;
 extern u64 susfs_ih_tramp_newfstatat;
@@ -1634,9 +1635,6 @@ extern u64 susfs_ih_tramp_filename_lookup;
 extern u64 susfs_ih_tramp_do_filp_open;
 extern u64 susfs_ih_tramp_user_path_at_empty;
 extern u64 susfs_ih_tramp_getname;
-extern u64 susfs_ih_tramp_inode_permission;
-extern u64 susfs_ih_tramp_generic_permission;
-extern u64 susfs_ih_tramp_walk_component;
 
 
 
@@ -1721,88 +1719,6 @@ __attribute__((visibility("hidden"))) int susfs_ih_decide(u64 uregs_arg, int arg
 	return 1;
 }
 
-/* Called from walk_component()'s stub: x0 is the struct nameidata *.
- *
- * Only the first two members of struct nameidata are read - path and last - and
- * the mirror below relies on that order (fs/namei.c:565).  It is a mirror rather
- * than a header include because the real struct is private to fs/namei.c; the
- * order is safe here only because CONFIG_RANDSTRUCT is not set on this kernel
- * (checked on device: only RANDOMIZE_BASE, which is KASLR and unrelated), so
- * __randomize_layout is a no-op.
- *
- * At this point nd->path is the directory being searched and nd->last is the
- * component name about to be looked up - so a hit can be answered with
- * ERR_PTR(-ENOENT), which is exactly what walk_component()'s callers expect from
- * a failed component and what makes the path look absent rather than forbidden.
- * It is also earlier than may_lookup()/inode_permission(), i.e. earlier than the
- * DAC check that the LSM layer can never precede. */
-struct susfs_nd_mirror {
-	struct path path;	/* offset 0 in the real struct */
-	struct qstr last;	/* and this one follows it */
-};
-
-__attribute__((visibility("hidden"))) int susfs_ih_decide_nd(u64 nd_ptr)
-{
-	const struct susfs_nd_mirror *nd = (const struct susfs_nd_mirror *)nd_ptr;
-	struct inode *parent;
-
-	atomic_inc(&n_nd_calls);
-
-	if (IS_ERR_OR_NULL((void *)nd_ptr) || !nd->path.dentry)
-		return 0;
-	if (!current_uid().val)		/* root is never hidden */
-		return 0;
-
-	parent = d_inode(nd->path.dentry);
-	if (!parent)
-		return 0;
-
-	/* Always report a component whose NAME matches a rule, whatever its parent
-	 * says: it separates "this hook never sees our paths" (an inlined copy is
-	 * doing the walking) from "it sees them and the parent key differs". */
-	{
-		struct sus_path_entry *e;
-
-		spin_lock(&sus_path_lock);
-		list_for_each_entry(e, &sus_path_list, list) {
-			if (strncmp(e->name, (const char *)nd->last.name, nd->last.len))
-				continue;
-			if (e->name[nd->last.len] != '\0')
-				continue;
-			pr_info_ratelimited("sus_path: walk_component saw '%s' with parent %llu/%llu; the rule says %llu/%llu\n",
-				e->name,
-				(unsigned long long)parent->i_sb->s_dev,
-				(unsigned long long)parent->i_ino,
-				(unsigned long long)e->parent_dev,
-				(unsigned long long)e->parent_ino);
-			break;
-		}
-		spin_unlock(&sus_path_lock);
-	}
-
-	return sus_path_parent_hit((u64)parent->i_sb->s_dev, (u64)parent->i_ino,
-				   nd->last.name, nd->last.len) ? 1 : 0;
-}
-
-/* Called from the inode-taking stubs: x0 is the inode the function was given.
- *
- * This is the one hook that judges by INODE and still runs before the DAC check,
- * because inode_permission() does its DAC test inside the function we patched.
- * So a hit here answers ENOENT - the file does not appear to exist - where the
- * LSM layer, running after that DAC test, could only have said EACCES on a file
- * the caller may not read.  sus_path_inode_hidden() already applies the per-rule
- * gate, so the module's own control nodes are covered too. */
-__attribute__((visibility("hidden"))) int susfs_ih_decide_inode(u64 p)
-{
-	struct inode *inode = (struct inode *)p;
-
-	if (IS_ERR_OR_NULL(inode))
-		return 0;
-	if (!current_uid().val)		/* root is never hidden */
-		return 0;
-	return sus_path_inode_hidden(inode) ? 1 : 0;
-}
-
 /* Called from the name-taking stubs: mode 0 = struct filename (already copied
  * into kernel memory, so no uaccess at all), mode 1 = __user pointer. */
 __attribute__((visibility("hidden"))) int susfs_ih_decide_name(u64 p, int mode)
@@ -1884,42 +1800,6 @@ static struct {
 	 * never ran - measured, the after-handler counted zero hits while the
 	 * kretprobe on getname_flags had been answering all along. */
 	{ "getname_flags",             susfs_ih_stub_getname,       &susfs_ih_tramp_getname },
-	/* THE one that judges by inode and still beats the DAC check.
-	 *
-	 * inode_permission() runs do_inode_permission() (DAC) and only then
-	 * security_inode_permission() (the LSM layer we replace), so the LSM layer
-	 * cannot turn a DAC denial into ENOENT - it never runs.  Patching the
-	 * function's own entry means our decision happens first, with the inode as
-	 * argument 2, so a hit is answered with ENOENT for every spelling of the
-	 * path and every caller that reaches inode_permission at all - the property
-	 * the entry-level hooks (which match the caller's string, not the inode)
-	 * cannot have.
-	 *
-	 * generic_permission() is the same signature and the same position for the
-	 * callers that go there directly (some filesystems do); measured reachable
-	 * 6729 and 1165 times respectively during one round of path walks. */
-	{ "inode_permission",          susfs_ih_stub_inode_permission,   &susfs_ih_tramp_inode_permission },
-	{ "generic_permission",        susfs_ih_stub_generic_permission, &susfs_ih_tramp_generic_permission },
-	/* walk_component is deliberately NOT installed, and that is a measured
-	 * decision rather than an oversight.
-	 *
-	 * It is the right place in principle: nd->path is the resolved parent,
-	 * nd->last is the component being looked up (fs/namei.c:2275-2303 sets it
-	 * immediately before the call) and it all happens before
-	 * may_lookup()/inode_permission(), so a hit could answer ERR_PTR(-ENOENT) for
-	 * EVERY spelling of a path - which is the one thing the entry hooks (string)
-	 * and the LSM layer (after DAC) cannot both do.
-	 *
-	 * It also installs cleanly and its decider is reached: with only this hook
-	 * armed the counter moved.  But the calls that matter never arrive - the
-	 * call site in link_path_walk is inlined, and the copy that still has a
-	 * symbol is only reached from other callers.  Measured end to end: a cat of a
-	 * hidden 0600 file still answered EACCES, and the diagnostic that logs a
-	 * component name matching a rule printed nothing for it.
-	 *
-	 * Installing it would therefore cost a stub on every component of every path
-	 * walk while never seeing ours.  The decider and the parent key stay in the
-	 * tree for a kernel where that call site survives LTO. */
 };
 
 #define N_IH_HOOKS ARRAY_SIZE(ih_table)
@@ -2196,10 +2076,10 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
     int i;
 
     n += scnprintf(buf + n, PAGE_SIZE - n,
-                   "hide_from_apps=%d  enoent: getattr=%d perm=%d inode_hook=%d path=%d\n",
+                   "hide_from_apps=%d  enoent: getattr=%d perm=%d dac=%d gper=%d path=%d\n",
                    hide_from_apps, atomic_read(&n_enoent_getattr),
                    atomic_read(&n_enoent_perm), atomic_read(&n_enoent_dac),
-                   atomic_read(&n_enoent_path));
+                   atomic_read(&n_enoent_gper), atomic_read(&n_enoent_path));
     n += scnprintf(buf + n, PAGE_SIZE - n,
                    "dirent: rewrite-fail=%d  all-hidden=%d  pending=%d\n",
                    atomic_read(&n_dirent_rewrite_fail),
@@ -2228,8 +2108,8 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
     spin_lock(&sus_path_lock);
     list_for_each_entry(e, &sus_path_list, list)
         n += scnprintf(buf + n, PAGE_SIZE - n,
-                       "dev=%llu ino=%llu parent=%llu/%llu name=%s%s\n",
-                       e->dev, e->ino, e->parent_dev, e->parent_ino, e->name,
+                       "dev=%llu ino=%llu name=%s%s\n",
+                       e->dev, e->ino, e->name,
                        e->inode ? "" : " (pending: no inode yet)");
     spin_unlock(&sus_path_lock);
 
@@ -2280,7 +2160,6 @@ static int sus_path_add_hidden_ex(const char *path, bool self_protect)
 	e->inode = inode;
 	e->pass = 0;
 	e->self_protect = self_protect;
-	sus_path_entry_set_parent(e, p.dentry);
 	ihold(inode);
 	strscpy(e->name, p.dentry->d_name.name, sizeof(e->name));
 	sus_path_entry_set_path(e, path);
@@ -2372,9 +2251,11 @@ int sus_path_init(void)
         pr_info("sus_path: perm hook armed, orig=%ps\n",
                 sus_path_perm_hook.original);
 
-    /* The DAC layer that used to be registered here is now an inline hook on
-     * inode_permission/generic_permission (see ih_table), which answers before
-     * the DAC check inside those functions instead of after it. */
+    /* And the DAC layer, without which a caller DAC denies gets EACCES instead
+     * of ENOENT (see the note above it).  Registered eagerly because it is the
+     * layer that would otherwise answer EACCES, and it has never been observed
+     * to fire on this kernel anyway. */
+    sus_path_dac_register();
 
     return 0;
 }
@@ -2401,6 +2282,7 @@ void sus_path_exit(void)
     sus_path_cand_unregister();
     sus_path_syscall_unregister();
     sus_path_path_unregister();
+    sus_path_dac_unregister();
     if (sus_path_perm_hook.entry)
         ksu_unregister_lsm_hook(&sus_path_perm_hook);
     if (sus_path_getattr_hook.entry)
@@ -2519,8 +2401,6 @@ void sus_path_supercall(void __user **arg)
          * evict it and let the address be reused. */
         ihold(inode);
         strscpy(e->name, path.dentry->d_name.name, sizeof(e->name));
-        /* The walk_component() key: parent directory identity + that name. */
-        sus_path_entry_set_parent(e, path.dentry);
     }
     sus_path_entry_set_path(e, info.target_pathname);
     if (!inode)
