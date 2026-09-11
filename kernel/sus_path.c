@@ -1042,7 +1042,12 @@ __attribute__((visibility("hidden"))) int susfs_ih_decide_name(u64 p, int mode)
  * device without panicking, and that has not been narrowed down yet.  The
  * standalone test module, which has none of those layers, works fine.  Set
  * ih_enabled=1 to arm them for debugging. */
-static int ih_enabled;	/* 0: patched entries off - see INLINE_HOOK.md */
+static int ih_enabled;
+/* Bisect knob: install only the n-th entry (1-based): 0 = none, -1 = all,
+ * anything else implies enabled. */
+static int ih_only = -1;
+module_param(ih_only, int, 0644);
+
 module_param(ih_enabled, int, 0644);
 
 static struct {
@@ -1079,19 +1084,22 @@ static int sus_path_ih_register(void)
 {
 	int i, n = 0;
 
-	if (!ih_enabled)
+	if (!ih_enabled && ih_only <= 0)
 		return 0;
 	if (susfs_ih_init())
 		return 0;
 
 	for (i = 0; i < N_IH_HOOKS; i++) {
+		if (ih_only > 0 && i != ih_only - 1)
+			continue;
+		pr_info("susfs_ih: trying #%d/%d %s", i + 1, (int)N_IH_HOOKS, ih_table[i].sym);
 		if (susfs_ih_install(&ih_hooks[i], ih_table[i].sym, ih_table[i].stub,
 				     ih_table[i].tramp))
 			break;
 		n++;
 	}
 
-	if (n != N_IH_HOOKS) {
+	if (n != (ih_only > 0 ? 1 : (int)N_IH_HOOKS)) {
 		pr_warn("sus_path: inline hooks incomplete (%d/%d), rolling back to kprobes\n",
 			n, (int)N_IH_HOOKS);
 		while (n-- > 0)
