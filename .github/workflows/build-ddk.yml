@@ -43,49 +43,11 @@ jobs:
       - name: Build susfs_guard_lkm.ko (DDK way)
         run: |
           set -e
-          make -C $KDIR M=$PWD/kernel \
-               ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+          make -C $KDIR M=$PWD/kernel 
+               ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 
                modules -j$(nproc) 2>&1 | tail -50
           ls -la kernel/susfs_guard_lkm.ko
-          ls -la kernel/syscall_test.ko
-          ls -la kernel/kstat_probe_test.ko
           file kernel/susfs_guard_lkm.ko
-          file kernel/syscall_test.ko
-          file kernel/kstat_probe_test.ko
-
-      - name: Build supercall test binary (arm64, no libc)
-        run: |
-          set -e
-          clang --target=aarch64-linux-gnu -static -nostdlib \
-                -fuse-ld=lld -o test_sc test_sc.c
-          file test_sc
-          ls -la test_sc
-
-      - name: Build 32-bit compat test binary (armv7, no libc)
-        run: |
-          set -e
-          clang --target=armv7-linux-gnueabi -march=armv7-a -static -nostdlib \
-                -fuse-ld=lld -o test_compat_open test_compat_open.c
-          file test_compat_open
-          ls -la test_compat_open
-
-      - name: Dump the stub as the assembler really sees it
-        if: always()
-        run: |
-          set +e
-          # clang -E on a .S file runs the TRADITIONAL cpp, which does not expand
-          # function-like macros - the output is useless for this.  -save-temps
-          # keeps what the integrated assembler actually consumed.
-          clang --target=aarch64-linux-gnu -c -save-temps=obj \
-                -o /tmp/stub.o kernel/susfs_inline_hook_stub.S
-          echo "rc=\True"
-          ls -la /tmp/stub*.s kernel/*.s 2>/dev/null
-          S=\
-          echo "=== \ ==="
-          grep -n -e movz -e movk -e '\.plt' "\" | head -20
-          echo "=== first expanded stub ==="
-          sed -n '/susfs_ih_stub_openat:/,/susfs_ih_stub_openat2:/p' "\" | head -40
-          set -e
       - name: Verify sections (__versions / .BTF / cfi)
         run: |
           f=kernel/susfs_guard_lkm.ko
@@ -103,15 +65,4 @@ jobs:
           name: susfs_guard_lkm.ko-ddk
           path: |
             kernel/susfs_guard_lkm.ko
-            kernel/syscall_test.ko
-            kernel/kstat_probe_test.ko
-            kernel/open_probe_test.ko
-            kernel/inode_perm_probe_test.ko
-            kernel/enoent_probe_test.ko
-            kernel/selinux_probe_test.ko
-            kernel/selinux_hide_probe.ko
-            test_sc
-            test_compat_open
-            kernel/ih_probe_test.ko
-            kernel/ih_hook_test.ko
           if-no-files-found: error
