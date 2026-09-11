@@ -797,113 +797,25 @@ static int sus_path_inode_permission(struct inode *inode, int mask)
  * caller and is not itself registered still answers EACCES, because the walk
  * cannot reach the child's lookup at all.  Upstream behaves the same way -
  * register the directory. */
-static atomic_t n_enoent_dac = ATOMIC_INIT(0);      /* inode_permission */
-static atomic_t n_enoent_gper = ATOMIC_INIT(0);     /* generic_permission */
+static atomic_t n_enoent_dac = ATOMIC_INIT(0);      /* retired: was the DAC kprobe layer */
 
-/* The other layers' decision, reused so every layer agrees. */
-static bool sus_path_lookup_hit(struct inode *inode)
-{
-    if (!inode)
-        return false;
-    return sus_path_inode_hidden(inode);
-}
-
-/* 5.15 signature: inode_permission(struct user_namespace *mnt_userns,
- * struct inode *inode, int mask) - the inode is argument 2, i.e. x1.  If that
- * ever changes the lookup simply misses and nothing else is affected. */
-static int kp_dac_hit(struct pt_regs *regs, atomic_t *counter)
-{
-    struct inode *inode = (struct inode *)regs->regs[1];
-
-    if (!sus_path_lookup_hit(inode))
-        return 0;
-
-    atomic_inc(counter);
-    /* Says whether this probe is reached at all: on this kernel both DAC
-     * symbols look inlined, and only a hit proves otherwise. */
-    pr_info_ratelimited("sus_path: DAC hit on ino=%lu (uid=%u)\n",
-                        inode->i_ino, current_uid().val);
-    /* Answer "no such file" and skip the whole function: the DAC check inside
-     * it is what would otherwise answer EACCES. */
-    regs_set_return_value(regs, (unsigned long)-ENOENT);
-    regs->pc = regs->regs[30];
-    return 1;
-}
-
-static int kp_inode_permission_pre(struct kprobe *kp, struct pt_regs *regs)
-{
-    return kp_dac_hit(regs, &n_enoent_dac);
-}
-
-/* inode_permission() itself turns out to be a dead end on this kernel: the
- * 0600-file test (DAC denies the app, so the LSM layer can never be reached)
- * still answered EACCES, i.e. the kprobe never fired - GKI's LTO inlines the
- * function into its callers and the kallsyms entry is just the copy kept for
- * module references.  Patching its entry would be equally pointless.
+/* ---- the DAC layer used to live here, as a kprobe ----
  *
- * generic_permission() is where that DAC decision actually lands for any
- * filesystem without its own ->permission(), and it is NOT inlined (it has both
- * a symbol and a .cfi_jt entry).  Same handler, same answer. */
-static int kp_generic_permission_pre(struct kprobe *kp, struct pt_regs *regs)
-{
-    return kp_dac_hit(regs, &n_enoent_gper);
-}
-
-static struct kprobe kp_inode_permission = {
-    .symbol_name = "inode_permission",
-    .pre_handler = kp_inode_permission_pre,
-};
-
-static struct kprobe kp_generic_permission = {
-    .symbol_name = "generic_permission",
-    .pre_handler = kp_generic_permission_pre,
-};
-
-static struct kprobe *dac_probes[] = {
-    &kp_inode_permission,
-    &kp_generic_permission,
-};
-
-#define N_DAC_PROBES ARRAY_SIZE(dac_probes)
-static bool dac_registered[N_DAC_PROBES];
-
-/* Off means an app gets EACCES instead of ENOENT whenever the DAC check would
- * have denied it - i.e. the layer this exists for. */
-static int hide_by_dac = 1;
-module_param_named(hide_by_dac, hide_by_dac, int, 0644);
-
-static void sus_path_dac_register(void)
-{
-    int i;
-
-    if (!hide_by_dac)
-        return;
-
-    for (i = 0; i < N_DAC_PROBES; i++) {
-        int rc = register_kprobe(dac_probes[i]);
-
-        if (rc) {
-            pr_warn("sus_path: kprobe(%s) failed %d\n",
-                    dac_probes[i]->symbol_name, rc);
-            continue;
-        }
-        dac_registered[i] = true;
-    }
-    pr_info("sus_path: DAC layer armed (inode_permission=%d generic_permission=%d)\n",
-            dac_registered[0], dac_registered[1]);
-}
-
-static void sus_path_dac_unregister(void)
-{
-    int i;
-
-    for (i = 0; i < N_DAC_PROBES; i++) {
-        if (!dac_registered[i])
-            continue;
-        unregister_kprobe(dac_probes[i]);
-        dac_registered[i] = false;
-    }
-}
+ * It is gone: inode_permission() and generic_permission() are now patched
+ * entries in ih_table[], and a kprobe on the same entry would collide (the kprobe
+ * owns the first instruction, and the installer refuses an entry whose prologue
+ * is a BRK).
+ *
+ * The old comment here claimed both symbols were inlined into their callers, on
+ * the evidence that a 0600-file test kept answering EACCES.  That was wrong: a
+ * count-only probe scan measured 1165 hits on inode_permission and 6729 on
+ * generic_permission during one round of path walks - they execute.  What the
+ * old layer really never did was answer, because it decided through a gate that
+ * refused before it looked at the inode.  The inline hooks decide through
+ * sus_path_inode_hidden(), which applies the per-rule gate, so the property the
+ * layer was written for (ENOENT instead of EACCES on a DAC-denied hidden file)
+ * is the one thing an entry decision can deliver and the LSM layer cannot: it
+ * runs BEFORE the DAC check inside inode_permission(). */
 
 /* ---- path-string layer ----
  *
@@ -1623,6 +1535,8 @@ extern void susfs_ih_stub_filename_lookup(void);
 extern void susfs_ih_stub_do_filp_open(void);
 extern void susfs_ih_stub_user_path_at_empty(void);
 extern void susfs_ih_stub_getname(void);
+extern void susfs_ih_stub_inode_permission(void);
+extern void susfs_ih_stub_generic_permission(void);
 extern u64 susfs_ih_tramp_openat;
 extern u64 susfs_ih_tramp_openat2;
 extern u64 susfs_ih_tramp_newfstatat;
@@ -1635,6 +1549,8 @@ extern u64 susfs_ih_tramp_filename_lookup;
 extern u64 susfs_ih_tramp_do_filp_open;
 extern u64 susfs_ih_tramp_user_path_at_empty;
 extern u64 susfs_ih_tramp_getname;
+extern u64 susfs_ih_tramp_inode_permission;
+extern u64 susfs_ih_tramp_generic_permission;
 
 
 
@@ -1719,6 +1635,25 @@ __attribute__((visibility("hidden"))) int susfs_ih_decide(u64 uregs_arg, int arg
 	return 1;
 }
 
+/* Called from the inode-taking stubs: x0 is the inode the function was given.
+ *
+ * This is the one hook that judges by INODE and still runs before the DAC check,
+ * because inode_permission() does its DAC test inside the function we patched.
+ * So a hit here answers ENOENT - the file does not appear to exist - where the
+ * LSM layer, running after that DAC test, could only have said EACCES on a file
+ * the caller may not read.  sus_path_inode_hidden() already applies the per-rule
+ * gate, so the module's own control nodes are covered too. */
+__attribute__((visibility("hidden"))) int susfs_ih_decide_inode(u64 p)
+{
+	struct inode *inode = (struct inode *)p;
+
+	if (IS_ERR_OR_NULL(inode))
+		return 0;
+	if (!current_uid().val)		/* root is never hidden */
+		return 0;
+	return sus_path_inode_hidden(inode) ? 1 : 0;
+}
+
 /* Called from the name-taking stubs: mode 0 = struct filename (already copied
  * into kernel memory, so no uaccess at all), mode 1 = __user pointer. */
 __attribute__((visibility("hidden"))) int susfs_ih_decide_name(u64 p, int mode)
@@ -1800,6 +1735,22 @@ static struct {
 	 * never ran - measured, the after-handler counted zero hits while the
 	 * kretprobe on getname_flags had been answering all along. */
 	{ "getname_flags",             susfs_ih_stub_getname,       &susfs_ih_tramp_getname },
+	/* THE one that judges by inode and still beats the DAC check.
+	 *
+	 * inode_permission() runs do_inode_permission() (DAC) and only then
+	 * security_inode_permission() (the LSM layer we replace), so the LSM layer
+	 * cannot turn a DAC denial into ENOENT - it never runs.  Patching the
+	 * function's own entry means our decision happens first, with the inode as
+	 * argument 2, so a hit is answered with ENOENT for every spelling of the
+	 * path and every caller that reaches inode_permission at all - the property
+	 * the entry-level hooks (which match the caller's string, not the inode)
+	 * cannot have.
+	 *
+	 * generic_permission() is the same signature and the same position for the
+	 * callers that go there directly (some filesystems do); measured reachable
+	 * 6729 and 1165 times respectively during one round of path walks. */
+	{ "inode_permission",          susfs_ih_stub_inode_permission,   &susfs_ih_tramp_inode_permission },
+	{ "generic_permission",        susfs_ih_stub_generic_permission, &susfs_ih_tramp_generic_permission },
 };
 
 #define N_IH_HOOKS ARRAY_SIZE(ih_table)
@@ -2076,10 +2027,10 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
     int i;
 
     n += scnprintf(buf + n, PAGE_SIZE - n,
-                   "hide_from_apps=%d  enoent: getattr=%d perm=%d dac=%d gper=%d path=%d\n",
+                   "hide_from_apps=%d  enoent: getattr=%d perm=%d inode_hook=%d path=%d\n",
                    hide_from_apps, atomic_read(&n_enoent_getattr),
                    atomic_read(&n_enoent_perm), atomic_read(&n_enoent_dac),
-                   atomic_read(&n_enoent_gper), atomic_read(&n_enoent_path));
+                   atomic_read(&n_enoent_path));
     n += scnprintf(buf + n, PAGE_SIZE - n,
                    "dirent: rewrite-fail=%d  all-hidden=%d  pending=%d\n",
                    atomic_read(&n_dirent_rewrite_fail),
@@ -2251,11 +2202,9 @@ int sus_path_init(void)
         pr_info("sus_path: perm hook armed, orig=%ps\n",
                 sus_path_perm_hook.original);
 
-    /* And the DAC layer, without which a caller DAC denies gets EACCES instead
-     * of ENOENT (see the note above it).  Registered eagerly because it is the
-     * layer that would otherwise answer EACCES, and it has never been observed
-     * to fire on this kernel anyway. */
-    sus_path_dac_register();
+    /* The DAC layer that used to be registered here is now an inline hook on
+     * inode_permission/generic_permission (see ih_table), which answers before
+     * the DAC check inside those functions instead of after it. */
 
     return 0;
 }
@@ -2282,7 +2231,6 @@ void sus_path_exit(void)
     sus_path_cand_unregister();
     sus_path_syscall_unregister();
     sus_path_path_unregister();
-    sus_path_dac_unregister();
     if (sus_path_perm_hook.entry)
         ksu_unregister_lsm_hook(&sus_path_perm_hook);
     if (sus_path_getattr_hook.entry)

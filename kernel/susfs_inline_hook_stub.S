@@ -25,6 +25,7 @@
 
 .hidden susfs_ih_decide
 .hidden susfs_ih_decide_name
+.hidden susfs_ih_decide_inode
 .hidden susfs_ih_after_getname
 
 #define IH_SAVE()						\
@@ -111,6 +112,26 @@ susfs_ih_stub_##n:;						\
 	IH_TAIL(n);						\
 	.size	susfs_ih_stub_##n, . - susfs_ih_stub_##n
 
+/* inode-taking entries: the inode is in x1, and this is the one kind of hook that
+ * can match by inode while still running BEFORE the function's own DAC check.
+ *
+ * inode_permission(mnt_userns, inode, mask) is exactly that: a kprobe at its
+ * entry, or this stub, runs before the do_inode_permission() inside it, so a hit
+ * can be answered with ENOENT rather than letting DAC answer EACCES.  The stub
+ * hands x1 straight to the C decider. */
+#define SUSFS_IH_INODE_STUB(n, decide_fn)			\
+	.globl	susfs_ih_stub_##n;				\
+	.type	susfs_ih_stub_##n, %function;			\
+susfs_ih_stub_##n:;						\
+	IH_SAVE();						\
+	mov	x0, x1;						\
+	bl	decide_fn;					\
+	cbz	w0, 8f;						\
+	IH_HIDE();						\
+8:;								\
+	IH_TAIL(n);						\
+	.size	susfs_ih_stub_##n, . - susfs_ih_stub_##n
+
 /* onLeave: the stub hands the frame back to itself.
  *
  * The caller's real LR goes in a spare slot, the target's LR is pointed at the
@@ -167,6 +188,10 @@ susfs_ih_stub_##n:;						\
 
 	SUSFS_IH_LEAVE_STUB(getname, susfs_ih_after_getname)
 
+	/* Judged by inode, before the function's own DAC check. */
+	SUSFS_IH_INODE_STUB(inode_permission, susfs_ih_decide_inode)
+	SUSFS_IH_INODE_STUB(generic_permission, susfs_ih_decide_inode)
+
 	.bss
 	.align	3
 #define SUSFS_IH_TRAMP(n)					\
@@ -186,3 +211,5 @@ susfs_ih_tramp_##n:;						\
 	SUSFS_IH_TRAMP(do_filp_open)
 	SUSFS_IH_TRAMP(user_path_at_empty)
 	SUSFS_IH_TRAMP(getname)
+	SUSFS_IH_TRAMP(inode_permission)
+	SUSFS_IH_TRAMP(generic_permission)
