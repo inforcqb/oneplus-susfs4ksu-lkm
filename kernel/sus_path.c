@@ -1050,6 +1050,17 @@ static struct {
 #define N_IH_HOOKS ARRAY_SIZE(ih_table)
 static struct susfs_ih_hook ih_hooks[N_IH_HOOKS];
 
+/* The stubs cannot take a module symbol address themselves - the assembler folds
+ * adrp/add (and :got:) into movz/movk, which cannot hold an address the loader
+ * has not chosen yet.  So they call in with their index and the C compiler emits
+ * the addressing.  Must be the first stub helper: the .S order matches ih_table. */
+u64 susfs_ih_get_tramp(int idx)
+{
+	if (idx < 0 || idx >= (int)N_IH_HOOKS)
+		return 0;
+	return (u64)(unsigned long)ih_hooks[idx].tramp;
+}
+
 /* Returns the number installed, or 0 if inline hooking is unavailable/disabled. */
 static int sus_path_ih_register(void)
 {
