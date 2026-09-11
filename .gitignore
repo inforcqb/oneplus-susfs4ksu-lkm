@@ -38,3 +38,14 @@ art2/
 # what it is checked against - the opposite of the point.  They stay on disk.
 *.md
 !README.md
+
+# development-only scaffolding: the probe/test modules and C test programs used
+# while working the hooks out.  They are not built by kernel/Makefile and are not
+# part of the module; only tools/susfs_sc.c is, because CI compiles it.
+diag_or.sh
+test_*.c
+kernel/*_test.c
+kernel/*_test*.c
+kernel/*_probe_main.c
+kernel/ih_hook_main.c
+kernel/ih_hook_stub.S
