@@ -30,7 +30,13 @@
  *     /proc/self/root/...;
  *   - the gate is the upstream one: app processes only, and never a file owned
  *     by the caller (see sus_path_gate_ok; hide_from_apps=0 disables the gate
- *     for testing from a root shell).
+ *     for testing from a root shell);
+ *   - a path registered before it exists is kept and hidden once it appears,
+ *     which is upstream's CMD_SUSFS_ADD_SUS_PATH_LOOP / LH_SUS_PATH_LOOP
+ *     behaviour (see sus_path_resolve_pending()).
+ *
+ * Upstream's FUSE_SUPER_MAGIC branch (susfs.c:71-84, :151-166, :195-212) has no
+ * equivalent here on purpose - see the note above sus_path_inode_hidden().
  */
 #include <linux/module.h>
 #include <linux/tracepoint.h>
@@ -59,8 +65,21 @@
 #include "susfs_inline_hook.h"	/* entry patching, replaces the hot kprobes */
 #include "lsm_hook.h"
 
-#define DIRENT_BUF_SIZE 65536  /* getdents usually returns <= 32-64KB */
+/* Bounce buffer for the getdents64 rewrite.  One record at a time is moved
+ * through it, so the size of a LISTING is not a limit - only the size of a
+ * single record is.  A record that does not fit is left in place, i.e. not
+ * filtered, and the rewrite stops there; that is counted and logged. */
+#define DIRENT_BUF_SIZE 65536
 #define SUS_PATH_MAX_ENTRIES 8192
+/* Deferred resolution of rules whose path does not exist yet - upstream's
+ * CMD_SUSFS_ADD_SUS_PATH_LOOP semantics, see sus_path_resolve_pending().
+ * While at least one rule is unresolved: retry every SUS_PATH_PENDING_RETRY_S
+ * seconds, stop retrying on the timer after SUS_PATH_PENDING_TRIES attempts
+ * (the rule itself stays registered and keeps hiding the path), and never do
+ * more than SUS_PATH_PENDING_BUDGET lookups in one pass. */
+#define SUS_PATH_PENDING_RETRY_S 2
+#define SUS_PATH_PENDING_TRIES 60
+#define SUS_PATH_PENDING_BUDGET 128
 /* Longest registered path, for the string-level hooks.  256 matches the ABI's
  * target_pathname field. */
 #define SUS_PATH_LEN 256
@@ -92,7 +111,11 @@ struct linux_dirent64 {
  */
 struct sus_path_entry {
     struct list_head list;
-    struct inode *inode;    /* ihold'ed; NULL only if kern_path failed */
+    /* ihold'ed once the path resolved, NULL while the rule is PENDING, i.e.
+     * registered for a path that does not exist yet (upstream's _LOOP variant).
+     * A pending entry holds no inode and no struct path, so a path that never
+     * appears cannot pin anything. */
+    struct inode *inode;
     u64 dev;
     u64 ino;
     char name[NAME_MAX + 1];
@@ -101,6 +124,10 @@ struct sus_path_entry {
      * Stored without a trailing slash, path_len == strlen(path). */
     char path[SUS_PATH_LEN];
     unsigned int path_len;
+    /* Resolution pass that last tried this entry (0 = never).  It is what stops
+     * one pass from retrying the same unresolved rule over and over, without
+     * having to hold a pointer across the sleepable kern_path(). */
+    unsigned int pass;
 };
 
 static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path);
@@ -108,6 +135,18 @@ static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path);
 static LIST_HEAD(sus_path_list);
 static DEFINE_SPINLOCK(sus_path_lock);
 static unsigned int sus_path_count;
+
+/* Rules waiting for their path to appear.  Counted so that every fast path can
+ * bail out at once when there is nothing to resolve; guarded by sus_path_lock. */
+static atomic_t sus_path_n_pending = ATOMIC_INIT(0);
+static unsigned int sus_path_pass_gen;      /* guarded by sus_path_lock */
+static atomic_t sus_path_pending_tries = ATOMIC_INIT(0);
+/* One resolution pass at a time: the supercall and the retry timer would
+ * otherwise race on the same entries (and on the per-entry pass marker). */
+static DEFINE_MUTEX(sus_path_pending_lock);
+
+static void sus_path_pending_work(struct work_struct *w);
+static DECLARE_DELAYED_WORK(sus_path_pending_wq, sus_path_pending_work);
 
 /* legacy/debug: hide a single exact filename everywhere (empty = disabled) */
 static char hide_name[NAME_MAX + 1];
@@ -126,24 +165,211 @@ module_param(no_extra, int, 0644);
  * inside the traversal by sus_path_is_hidden(). */
 static DEFINE_SPINLOCK(sus_path_buf_lock);
 
+/* getdents64 rewrites that had to stop early (a record too large for the bounce
+ * buffer, or a uaccess fault while rewriting).  Both used to be silent; the
+ * counter and the ratelimited log are what makes "the listing did not get
+ * filtered" visible instead of just producing a longer listing. */
+static atomic_t n_dirent_rewrite_fail = ATOMIC_INIT(0);
+
 static bool sus_path_is_hidden(u64 ino, const char *name)
 {
     struct sus_path_entry *e;
     bool hidden = false;
 
-    spin_lock(&sus_path_lock);
-    list_for_each_entry(e, &sus_path_list, list) {
-        if (e->ino == ino && !strcmp(e->name, name)) {
-            hidden = true;
-            break;
+    /* A dirent is identified by (d_ino, name) and nothing else here - the
+     * sys_exit tracepoint has neither the fd nor the superblock.  A rule whose
+     * inode reports 0 therefore has no identity to match: d_ino 0 is what some
+     * filesystems use for "unknown", so matching it by name alone would hide
+     * unrelated entries.  Such a rule is hidden by the by-inode layers and by
+     * the path-string layer only - see the note in sus_path_supercall(). */
+    if (ino) {
+        spin_lock(&sus_path_lock);
+        list_for_each_entry(e, &sus_path_list, list) {
+            if (e->ino && e->ino == ino && !strcmp(e->name, name)) {
+                hidden = true;
+                break;
+            }
         }
+        spin_unlock(&sus_path_lock);
     }
-    spin_unlock(&sus_path_lock);
 
     if (!hidden && hide_name[0])
         hidden = !strcmp(name, hide_name);
 
     return hidden;
+}
+
+/* ---- deferred resolution: upstream's CMD_SUSFS_ADD_SUS_PATH_LOOP ----
+ *
+ * Upstream's _LOOP command does NOT resolve the path when the rule is added.
+ * susfs_add_sus_path_loop() (susfs.c:99-132) checks for an empty string only,
+ * strscpy()s the path into a st_susfs_sus_path_list node and puts it on
+ * LH_SUS_PATH_LOOP; the path is resolved much later by
+ * susfs_run_sus_path_loop() (susfs.c:134-172), which walks that list with
+ * kern_path(path, 0, ...) and sets AS_FLAGS_SUS_PATH on the inode it finds.
+ * Nothing triggers it from the kernel timer side: susfs_run_extra_works()
+ * (susfs.c:1451-1457) is scheduled by ksu_handle_extra_susfs_work()
+ * (KernelSU/10_enable_susfs_for_ksu.patch:1599-1607) each time zygote spawns an
+ * app that gets marked TIF_PROC_UMOUNTED (patch:1669, patch:1719), and the
+ * entries are never removed from the list, so every spawn retries all of them.
+ *
+ * The semantics that matter: "registered now, hidden as soon as the path shows
+ * up" - for /data/adb/modules/... at boot, or an inode that did not exist yet.
+ * There is no attempt limit and no timeout upstream; the trigger is an event.
+ *
+ * The LKM has no zygote hook, so the equivalent is:
+ *   - the rule is registered immediately with inode == NULL ("pending"), and
+ *     the path-string layer hides it from the first moment the path exists -
+ *     open/stat/exec/readlink already answer ENOENT, because that layer matches
+ *     the registered string, not an inode;
+ *   - sus_path_resolve_pending() retries the lookup in sleepable context: from
+ *     sus_path_supercall() (every add is a retry opportunity, which is what the
+ *     tool produces naturally when it registers a batch of rules) and from a
+ *     bounded retry timer.
+ *
+ * A rule that is still missing after the timer gives up keeps hiding the path
+ * through the string layer; what it loses is only the getdents64 filter and the
+ * by-inode layers, and the next add re-arms the timer.
+ */
+
+/* Basename of a registered path: what the getdents64 filter compares d_name
+ * against, and what the table shows while the inode is unknown.  Stored paths
+ * never have a trailing slash (sus_path_entry_set_path), so the text after the
+ * last '/' is the whole name. */
+static void sus_path_basename(const char *path, char *dst, size_t size)
+{
+    const char *slash = strrchr(path, '/');
+
+    if (slash && slash[1])
+        path = slash + 1;
+    strscpy(dst, path, size);
+}
+
+static int sus_path_resolve_pending(void)
+{
+    char path[SUS_PATH_LEN];
+    unsigned int gen;
+    int budget = SUS_PATH_PENDING_BUDGET;
+    int resolved = 0;
+
+    if (!atomic_read(&sus_path_n_pending))
+        return 0;
+    /* Whoever loses the race simply finds the work already done.  trylock, so
+     * the supercall never blocks behind a pass that is sleeping in kern_path(). */
+    if (!mutex_trylock(&sus_path_pending_lock))
+        return 0;
+
+    /* Pass marker.  0 means "never attempted", so generation 0 is skipped. */
+    spin_lock(&sus_path_lock);
+    gen = ++sus_path_pass_gen;
+    if (!gen)
+        gen = ++sus_path_pass_gen;
+    spin_unlock(&sus_path_lock);
+
+    while (budget-- > 0) {
+        struct sus_path_entry *e, *slot;
+        struct inode *inode = NULL;
+        struct path p;
+        char name[NAME_MAX + 1];
+
+        path[0] = '\0';
+        spin_lock(&sus_path_lock);
+        slot = NULL;
+        list_for_each_entry(e, &sus_path_list, list) {
+            if (!e->inode && e->pass != gen) {
+                memcpy(path, e->path, e->path_len + 1);
+                e->pass = gen;
+                slot = e;
+                break;
+            }
+        }
+        spin_unlock(&sus_path_lock);
+        if (!slot)
+            break;              /* every pending rule was attempted */
+
+        name[0] = '\0';
+        if (!kern_path(path, LOOKUP_FOLLOW, &p)) {
+            inode = d_inode(p.dentry);
+            if (inode) {
+                strscpy(name, p.dentry->d_name.name, sizeof(name));
+                /* Hold it before path_put() can drop the last dentry reference
+                 * and evict it; the pointer is published only afterwards. */
+                ihold(inode);
+            }
+            path_put(&p);
+        }
+
+        /* The entry is re-found rather than used across the sleep: the table can
+         * be changed while we are away (another add, or module exit tearing it
+         * all down), so the only thing carried over is the path string - and a
+         * pass marker that no other pass can have set on a fresh entry. */
+        spin_lock(&sus_path_lock);
+        slot = NULL;
+        list_for_each_entry(e, &sus_path_list, list) {
+            if (e->pass == gen && !e->inode && !strcmp(e->path, path)) {
+                slot = e;
+                break;
+            }
+        }
+        if (slot && inode) {
+            slot->dev = (u64)inode->i_sb->s_dev;
+            slot->ino = (u64)inode->i_ino;
+            strscpy(slot->name, name, sizeof(slot->name));
+            slot->inode = inode;
+            inode = NULL;               /* the table holds the reference now */
+            atomic_dec(&sus_path_n_pending);
+            resolved++;
+        }
+        spin_unlock(&sus_path_lock);
+
+        if (inode)
+            iput(inode);                /* the rule is gone, or already resolved */
+    }
+
+    if (resolved)
+        pr_info("sus_path: resolved %d pending rule(s), %d still unresolved\n",
+                resolved, atomic_read(&sus_path_n_pending));
+
+    mutex_unlock(&sus_path_pending_lock);
+    return resolved;
+}
+
+/* A rule was registered for a path that is not there yet.  Try once right away
+ * (the failing lookup was microseconds ago, but an earlier add in the same batch
+ * may be what made this rule necessary), then let the timer keep trying.
+ * Called from sus_path_supercall()'s task_work, i.e. process context. */
+static void sus_path_pending_arm(void)
+{
+    if (!atomic_read(&sus_path_n_pending))
+        return;
+
+    sus_path_resolve_pending();
+    if (!atomic_read(&sus_path_n_pending))
+        return;
+
+    atomic_set(&sus_path_pending_tries, 0);
+    schedule_delayed_work(&sus_path_pending_wq, SUS_PATH_PENDING_RETRY_S * HZ);
+}
+
+/* Retry timer.  Bounded on purpose: upstream's equivalent runs once per app
+ * spawn, which is a free trigger, while this one costs a periodic work item -
+ * and a rule whose path never appears must not keep it alive forever. */
+static void sus_path_pending_work(struct work_struct *w)
+{
+    int resolved = sus_path_resolve_pending();
+
+    if (!atomic_read(&sus_path_n_pending))
+        return;                 /* every rule has its inode now */
+
+    if (resolved > 0)
+        atomic_set(&sus_path_pending_tries, 0);     /* progress: keep trying */
+
+    if (atomic_inc_return(&sus_path_pending_tries) > SUS_PATH_PENDING_TRIES) {
+        pr_info("sus_path: %d rule(s) still pending after %d retries - retry timer stops; the path layer keeps hiding them, the next add tries again\n",
+                atomic_read(&sus_path_n_pending), SUS_PATH_PENDING_TRIES);
+        return;
+    }
+    schedule_delayed_work(&sus_path_pending_wq, SUS_PATH_PENDING_RETRY_S * HZ);
 }
 
 /* ---------------------------------------------------------------------------
@@ -215,6 +441,48 @@ static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path)
     e->path_len = (unsigned int)n;
 }
 
+/*
+ * Inode identity is the whole criterion here, and there is deliberately NO FUSE
+ * branch - do not "port" upstream's one (susfs.c:71-84 in add, :151-166 in
+ * susfs_run_sus_path_loop(), :195-212 in susfs_is_inode_sus_path()).
+ *
+ * What upstream does there: if the inode's superblock is FUSE_SUPER_MAGIC it
+ * takes fi = get_fuse_inode(inode) and sets AS_FLAGS_SUS_PATH on
+ * fi->inode.i_mapping->flags and on inode->i_mapping->flags - i.e. it writes the
+ * same word twice, because get_fuse_inode() is container_of(inode, struct
+ * fuse_inode, inode) (this tree: fs/fuse/fuse_i.h:973-976) over an inode that is
+ * embedded in that very struct (fuse_i.h:124-126), and upstream's `inode` comes
+ * from d_backing_inode(), which in 5.15 is literally `dentry->d_inode` (this
+ * tree: include/linux/dcache.h:560-565).  So &fi->inode == inode and
+ * fi->inode.i_mapping == inode->i_mapping: there is no wrapper inode and no
+ * second mapping to flag.  The branch's only remaining effects are the
+ * i_mapping NULL check (identical to the generic one two lines above it,
+ * susfs.c:65-69) and a log line with fi->nodeid.
+ *
+ * Why that is a no-op for this LKM: we do not store a bit in an inode's address
+ * space, we store the `struct inode *` itself and hold a reference to it
+ * (sus_path_inode_hidden() compares pointers).  Upstream's flag is just as
+ * object-scoped as our pointer is - inode->i_mapping is per inode object - and
+ * ihold() means the address can never be recycled into an unrelated inode.  For
+ * the same reason a FUSE passthrough mount needs nothing special: its dentries
+ * resolve to the FUSE inode (or, through /mnt/pass_through/..., to the backing
+ * inode), each spelling is the object it resolves to, and upstream flags exactly
+ * the same object for that spelling - it does not touch fi->backing_inode
+ * either.  What covers the OTHER spellings of the same file here is the
+ * path-string layer below, not the inode layer.
+ *
+ * The one FUSE property upstream's branch does not buy it either is the dirent
+ * filter: upstream maps a dirent's d_ino back to an inode with
+ * ilookup(buf->sb, ino), but a FUSE inode is hashed by nodeid (or by the backing
+ * inode pointer when CONFIG_FUSE_BPF=y passthrough is in use - fs/fuse/inode.c:
+ * 449-455, and this kernel's gki_defconfig sets CONFIG_FUSE_BPF=y) while
+ * inode->i_ino is the daemon's attr.ino (fs/fuse/inode.c:250) and the dirent's
+ * d_ino is whatever the daemon put in its readdir reply.  When those disagree,
+ * upstream finds no inode and skips the entry unfiltered (patch:1752-1760) -
+ * which is exactly the precondition our (d_ino, name) comparison has.  A shared
+ * limitation, not a gap this port opened, and a name-only fallback would hide
+ * same-named entries elsewhere in the same superblock, so none is added.
+ */
 static bool sus_path_inode_hidden(struct inode *inode)
 {
     struct sus_path_entry *e;
@@ -1206,13 +1474,37 @@ static void sus_path_ih_unregister(void)
 		susfs_ih_uninstall(&ih_hooks[i]);
 }
 
-/* compact the dirent chain in-place; returns the new byte count */
+/* Rewrite the dirent chain the kernel just produced, dropping the entries whose
+ * (d_ino, name) pair is registered; returns the byte count the caller may parse.
+ *
+ * Records are moved one at a time through dirent_tmp, from the read position
+ * `offset` to the write position `written`.  Since a record is only ever moved
+ * to an address at or before its own, the destination can never overwrite a
+ * record that has not been read yet, and the listing does not have to fit in the
+ * buffer at all - which is what makes a listing larger than DIRENT_BUF_SIZE work
+ * (the old code gave up and returned the untouched listing once the 64 KB
+ * scratch buffer was full).
+ *
+ * The returned value always describes what is really in the caller's buffer:
+ *
+ *   - rewrite completed -> the compacted length, i.e. 0 when every entry was
+ *     hidden and `count` when none was (in that case nothing was moved, since
+ *     written == offset all the way through);
+ *   - uaccess failure -> the bytes that were handed back whole, which is a valid
+ *     and complete record chain; the records beyond it are simply read again on
+ *     the caller's next getdents64 (a short read is normal there);
+ *   - uaccess failure before a single record was written back -> `count`, i.e.
+ *     "nothing was filtered", because the buffer still holds the kernel's chain.
+ *
+ * That last distinction is the fix for the old behaviour: a failed write-back
+ * returned `count` while the buffer already held a *partially* compacted chain,
+ * so the caller was told to parse bytes that were no longer records. */
 static long sus_path_filter(unsigned long buf, long count)
 {
-    long offset = 0;
-    long out = 0;
+    long offset = 0;        /* read position in the caller's chain */
+    long written = 0;       /* bytes of the compacted chain already handed back */
+    bool failed = false;
     char *tmp;
-    bool complete = true;
 
     spin_lock(&sus_path_buf_lock);
 
@@ -1230,33 +1522,33 @@ static long sus_path_filter(unsigned long buf, long count)
         bool hide;
 
         if (copy_from_user(&d, (void __user *)(buf + offset), sizeof(d))) {
-            complete = false;
+            failed = true;
             break;
         }
         reclen = d.d_reclen;
         /* d_reclen is filesystem-supplied: bound it before it is used as a
-         * copy length, as a step, and before out+reclen can leave the buffer. */
+         * copy length, as a step, and before the bounce buffer is indexed. */
         if (reclen < D_NAME_OFF + 1 ||
             offset + reclen > count ||
-            reclen > DIRENT_BUF_SIZE - out) {
-            complete = false;
+            reclen > DIRENT_BUF_SIZE) {
+            failed = true;
             break;
         }
 
         nlen = strnlen_user((void __user *)(buf + offset + D_NAME_OFF),
                             sizeof(name) - 1);
         if (nlen == 0) {            /* no readable NUL in the name field */
-            complete = false;
+            failed = true;
             break;
         }
         if (nlen >= sizeof(name))   /* longer than NAME_MAX: cannot match */
             nlen = sizeof(name) - 1;
         if (nlen > reclen - D_NAME_OFF) {
-            complete = false;
+            failed = true;
             break;
         }
         if (copy_from_user(name, (void __user *)(buf + offset + D_NAME_OFF), nlen)) {
-            complete = false;
+            failed = true;
             break;
         }
         name[nlen] = 0;
@@ -1267,30 +1559,40 @@ static long sus_path_filter(unsigned long buf, long count)
         if (hide && !sus_path_gate_uid_ok())
             hide = false;
 
-        if (!hide) {
-            if (copy_from_user(tmp + out, (void __user *)(buf + offset), reclen)) {
-                complete = false;
+        if (hide) {
+            /* Dropped.  Every record after it moves down by its length, so the
+             * remaining records can no longer stay where they are. */
+            offset += reclen;
+            continue;
+        }
+
+        /* A record only needs the bounce buffer once something ahead of it was
+         * dropped; until then written == offset and it is already in place. */
+        if (written != offset) {
+            if (copy_from_user(tmp, (void __user *)(buf + offset), reclen)) {
+                failed = true;
                 break;
             }
-            out += reclen;
+            if (copy_to_user((void __user *)(buf + written), tmp, reclen)) {
+                failed = true;
+                break;
+            }
         }
+        written += reclen;
         offset += reclen;
     }
 
-    /* A partial compaction would silently drop every record after the failure
-     * point (the old code returned the partial count), so on any failure hand
-     * the listing back exactly as the kernel wrote it and filter nothing. */
-    if (!complete) {
-        spin_unlock(&sus_path_buf_lock);
-        return count;
+    spin_unlock(&sus_path_buf_lock);
+
+    if (failed) {
+        atomic_inc(&n_dirent_rewrite_fail);
+        pr_warn_ratelimited("sus_path: getdents64 rewrite stopped at %ld/%ld bytes (returned %ld)\n",
+                            offset, count, written ? written : count);
+        if (!written)
+            return count;       /* nothing was written back: claim no filtering */
     }
 
-    if (out != count)   /* out == count means nothing was hidden */
-        if (copy_to_user((void __user *)buf, tmp, out))
-            out = count;   /* failed to write back: leave untouched */
-
-    spin_unlock(&sus_path_buf_lock);
-    return out;
+    return written;
 }
 
 static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret)
@@ -1337,16 +1639,21 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
     int n = 0;
 
     n += scnprintf(buf + n, PAGE_SIZE - n,
-                   "hide_from_apps=%d  enoent: getattr=%d perm=%d dac=%d gper=%d\n",
+                   "hide_from_apps=%d  enoent: getattr=%d perm=%d dac=%d gper=%d path=%d\n",
                    hide_from_apps, atomic_read(&n_enoent_getattr),
                    atomic_read(&n_enoent_perm), atomic_read(&n_enoent_dac),
-                   atomic_read(&n_enoent_gper));
+                   atomic_read(&n_enoent_gper), atomic_read(&n_enoent_path));
+    n += scnprintf(buf + n, PAGE_SIZE - n,
+                   "dirent: rewrite-fail=%d  pending=%d\n",
+                   atomic_read(&n_dirent_rewrite_fail),
+                   atomic_read(&sus_path_n_pending));
 
     spin_lock(&sus_path_lock);
     list_for_each_entry(e, &sus_path_list, list)
         n += scnprintf(buf + n, PAGE_SIZE - n,
-                       "dev=%llu ino=%llu name=%s\n",
-                       e->dev, e->ino, e->name);
+                       "dev=%llu ino=%llu name=%s%s\n",
+                       e->dev, e->ino, e->name,
+                       e->inode ? "" : " (pending: no inode yet)");
     spin_unlock(&sus_path_lock);
 
     if (!sus_path_count)
@@ -1394,6 +1701,7 @@ int sus_path_add_hidden(const char *path)
 	e->dev = (u64)inode->i_sb->s_dev;
 	e->ino = (u64)inode->i_ino;
 	e->inode = inode;
+	e->pass = 0;
 	ihold(inode);
 	strscpy(e->name, p.dentry->d_name.name, sizeof(e->name));
 	sus_path_entry_set_path(e, path);
@@ -1489,6 +1797,13 @@ void sus_path_exit(void)
      * (and their inode references) can be torn down safely. */
     sus_path_getname_unregister();
     cancel_delayed_work_sync(&ih_restore_wq);
+    /* The retry timer must be off, and no resolution pass may be in flight while
+     * the table is emptied below: a pass re-finds its entry under the lock and
+     * never frees anything, but it may not run past the teardown either.  It is
+     * a trylock in the pass, so this can never deadlock against it. */
+    cancel_delayed_work_sync(&sus_path_pending_wq);
+    mutex_lock(&sus_path_pending_lock);
+    mutex_unlock(&sus_path_pending_lock);
 	sus_path_ih_unregister();
     sus_path_syscall_unregister();
     sus_path_path_unregister();
@@ -1509,6 +1824,7 @@ void sus_path_exit(void)
     spin_lock(&sus_path_lock);
     list_splice_init(&sus_path_list, &doomed);
     sus_path_count = 0;
+    atomic_set(&sus_path_n_pending, 0);
     spin_unlock(&sus_path_lock);
 
     /* iput outside the lock: it can sleep and evict the inode. */
@@ -1520,18 +1836,39 @@ void sus_path_exit(void)
     }
 }
 
-/* supercall: CMD_SUSFS_ADD_SUS_PATH / CMD_SUSFS_ADD_SUS_PATH_LOOP
+/* supercall: CMD_SUSFS_ADD_SUS_PATH (0x55550) / CMD_SUSFS_ADD_SUS_PATH_LOOP (0x55553)
  *
- * Upstream keeps every added path (one inode flag per path) and its _LOOP variant
- * only re-flags the same inode after a zygote-spawned app is marked umounted.
- * Since our list is permanent and the match is unconditional, both commands do
- * exactly the same thing here. */
+ * Upstream keeps the two apart:
+ *   susfs_add_sus_path()       needs the path to exist - kern_path() with
+ *                              LOOKUP_FOLLOW, and the lookup error is the
+ *                              command's answer (susfs.c:58-62);
+ *   susfs_add_sus_path_loop()  checks for an empty string only, stores the path
+ *                              in LH_SUS_PATH_LOOP and resolves it later
+ *                              (susfs.c:99-132 and susfs_run_sus_path_loop(),
+ *                              susfs.c:134-172 - see the block above
+ *                              sus_path_resolve_pending()).
+ *
+ * The dispatcher hands both commands to this one function without saying which
+ * one arrived (susfs_supercall.c:143-146), so the permissive rule wins: a path
+ * that does not exist yet is registered as PENDING instead of being rejected,
+ * which is exactly what the _LOOP variant promises.  Only "not there yet"
+ * (-ENOENT) is treated that way - a real lookup error (ENOTDIR, EACCES on a
+ * parent, ELOOP) is still reported, and the tool's add_sus_path() runs
+ * realpath() first, so its behaviour does not change either.
+ *
+ * A pending rule is not dead weight: the path-string layer matches the
+ * registered string, so open/stat/exec/readlink answer ENOENT from the moment
+ * the path exists.  What the pending state delays is the by-inode layers (LSM
+ * hooks, DAC probes) and the getdents64 filter, which are filled in as soon as
+ * the inode resolves. */
 void sus_path_supercall(void __user **arg)
 {
     struct st_susfs_sus_path info = {0};
     struct sus_path_entry *e;
-    struct path path;
-    struct inode *inode;
+    struct path path = {0};
+    struct inode *inode = NULL;
+    u64 dev = 0;
+    u64 ino = 0;
     int rc;
 
     if (copy_from_user(&info, (void __user *)*arg, sizeof(info))) {
@@ -1551,57 +1888,76 @@ void sus_path_supercall(void __user **arg)
     }
 
     rc = kern_path(info.target_pathname, LOOKUP_FOLLOW, &path);
-    if (rc) {
+    if (!rc) {
+        inode = d_inode(path.dentry);
+        if (!inode) {
+            path_put(&path);
+            rc = -ENOENT;
+        }
+    }
+    if (rc && rc != -ENOENT) {
         pr_warn("sus_path: failed opening '%s' (%d)\n", info.target_pathname, rc);
         info.err = rc;
         goto out;
     }
 
-    inode = d_inode(path.dentry);
-    if (!inode) {
-        path_put(&path);
-        info.err = -ENOENT;
-        goto out;
-    }
-
     e = kmalloc(sizeof(*e), GFP_KERNEL);
     if (!e) {
-        path_put(&path);
+        if (inode)
+            path_put(&path);
         info.err = -ENOMEM;
         goto out;
     }
-    e->dev = (u64)inode->i_sb->s_dev;
-    e->ino = (u64)inode->i_ino;
-    e->inode = inode;
-    /* Hold the inode: the LSM hooks match on this pointer, and the dentry is
-     * about to be released by path_put(), which would otherwise be free to
-     * evict it and let the address be reused. */
-    ihold(inode);
-    strscpy(e->name, path.dentry->d_name.name, sizeof(e->name));
-    sus_path_entry_set_path(e, info.target_pathname);
-    INIT_LIST_HEAD(&e->list);
-    path_put(&path);
 
-    if (!e->ino) {
-        /* filesystem does not expose a usable inode number: fall back to name */
-        pr_warn("sus_path: '%s' has ino 0, falling back to name matching\n",
-                info.target_pathname);
+    e->dev = 0;
+    e->ino = 0;
+    e->inode = NULL;
+    e->pass = 0;
+    e->name[0] = '\0';
+
+    if (inode) {
+        dev = (u64)inode->i_sb->s_dev;
+        ino = (u64)inode->i_ino;
+        e->dev = dev;
+        e->ino = ino;
+        e->inode = inode;
+        /* Hold the inode: the LSM hooks match on this pointer, and the dentry is
+         * about to be released by path_put(), which would otherwise be free to
+         * evict it and let the address be reused. */
+        ihold(inode);
+        strscpy(e->name, path.dentry->d_name.name, sizeof(e->name));
     }
+    sus_path_entry_set_path(e, info.target_pathname);
+    if (!inode)
+        /* No dentry to take the name from yet: the basename of the registered
+         * path is what the table shows until the lookup succeeds (it is then
+         * replaced by the real dentry name, which is what the dirent filter has
+         * to compare - following a symlink changes it). */
+        sus_path_basename(e->path, e->name, sizeof(e->name));
+    INIT_LIST_HEAD(&e->list);
+    if (inode)
+        path_put(&path);
 
     spin_lock(&sus_path_lock);
     if (sus_path_count >= SUS_PATH_MAX_ENTRIES) {
         spin_unlock(&sus_path_lock);
-        iput(e->inode);
+        if (e->inode)
+            iput(e->inode);
         kfree(e);
         info.err = -ENOSPC;
         goto out;
     }
     {
         struct sus_path_entry *cur;
+
         list_for_each_entry(cur, &sus_path_list, list) {
-            if (cur->inode == inode) {
+            /* Same inode: upstream's set_bit() is idempotent.  Same
+             * still-unresolved path: nothing to add but the retry marker. */
+            if ((inode && cur->inode == inode) ||
+                (!inode && !cur->inode && !strcmp(cur->path, e->path))) {
                 spin_unlock(&sus_path_lock);
-                iput(e->inode);
+                if (e->inode)
+                    iput(e->inode);
                 kfree(e);
                 info.err = 0;   /* already registered, upstream is idempotent */
                 goto out;
@@ -1610,7 +1966,21 @@ void sus_path_supercall(void __user **arg)
     }
     list_add_tail(&e->list, &sus_path_list);
     sus_path_count++;
+    if (!inode)
+        atomic_inc(&sus_path_n_pending);
     spin_unlock(&sus_path_lock);
+
+    if (inode && !ino) {
+        /* Stay factual about what an ino-0 filesystem costs: upstream needs no
+         * inode number at all (it hides by the AS_FLAGS_SUS_PATH bit on
+         * inode->i_mapping) and its dirent filter does ilookup(sb, d_ino), which
+         * finds nothing for ino 0 either.  So neither implementation filters the
+         * listing here; the by-inode layers and the path-string layer still hide
+         * the path, and a name-based fallback would hide unrelated entries that
+         * happen to report d_ino 0 as well. */
+        pr_warn("sus_path: '%s' reports ino 0 - hidden by inode and by path, but a directory listing cannot be filtered for it\n",
+                info.target_pathname);
+    }
 
     if (!dirent_tmp) {
         dirent_tmp = kmalloc(DIRENT_BUF_SIZE, GFP_KERNEL);
@@ -1624,9 +1994,21 @@ void sus_path_supercall(void __user **arg)
      * hooks.  Idempotent, and safe to call with a rule already in the list. */
     sus_path_hooks_arm();
 
+    if (!inode) {
+        pr_info("sus_path: hide '%s' (pending: path does not exist yet - hidden by path from now on, inode resolved in the background)\n",
+                info.target_pathname);
+        /* The retry path: this add is itself the first retry opportunity (the
+         * failing lookup was microseconds ago, but an earlier add in the same
+         * batch may be what the rule waits for), then the bounded timer keeps
+         * trying.  Upstream re-resolves on every zygote-spawned app instead,
+         * which is an event this kernel does not hand us. */
+        sus_path_pending_arm();
+    } else {
+        pr_info("sus_path: hide '%s' (dev=%llu ino=%llu)\n",
+                info.target_pathname, dev, ino);
+    }
+
     info.err = 0;
-    pr_info("sus_path: hide '%s' (dev=%llu ino=%llu)\n",
-            info.target_pathname, e->dev, e->ino);
 out:
     /* upstream writes back only ->err for input-type commands */
     if (copy_to_user(&((struct st_susfs_sus_path __user *)*arg)->err,
