@@ -19,7 +19,7 @@ for n in 1 2 3 4 5 6 7 8; do
 	rmmod susfs_guard_lkm 2>/dev/null
 	echo "=== ih_only=$n ==="
 
-	ksud insmod $K ih_only=$n
+	ksud insmod $K ih_only=$n ih_secs=12
 	echo "insmod rc=$?"
 	sleep 2
 	dmesg | tail -12 | grep -a "susfs_ih: trying" | tail -1

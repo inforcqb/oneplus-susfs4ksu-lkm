@@ -890,7 +890,8 @@ static void sus_path_hooks_arm(void)
         return;
 
     hooks_armed = true;
-    sus_path_tracepoint_register();
+    if (!no_extra)
+        sus_path_tracepoint_register();
 
     /* Entry-decision and onLeave hooks: patch the entries if we can, otherwise
      * probe them.  Never both - a kprobe owns the first instruction of its
@@ -1046,6 +1047,8 @@ __attribute__((visibility("hidden"))) int susfs_ih_decide_name(u64 p, int mode)
 static int ih_enabled;
 /* Bisect knob: install only the n-th entry (1-based): 0 = none, -1 = all,
  * anything else implies enabled. */
+static int no_extra;
+module_param(no_extra, int, 0644);
 static int ih_only = -1;
 module_param(ih_only, int, 0644);
 /* Kernel-side timed rollback: restore the entries after n seconds and stop
@@ -1384,6 +1387,12 @@ int sus_path_init(void)
      * rule exists: with nothing registered there is nothing to answer, so they
      * cost nothing until then. */
     pr_info("sus_path: hooks deferred until the first rule\n");
+
+    if (no_extra) {
+        pr_info("sus_path: no_extra=1 - LSM, DAC and tracepoint layers stay OFF (isolation test)
+");
+        return 0;
+    }
 
     /* LSM hooks: reject path-based access to registered inodes outright. */
     rc = ksu_register_lsm_hook(&sus_path_getattr_hook);
