@@ -1900,19 +1900,26 @@ static struct {
 	 * 6729 and 1165 times respectively during one round of path walks. */
 	{ "inode_permission",          susfs_ih_stub_inode_permission,   &susfs_ih_tramp_inode_permission },
 	{ "generic_permission",        susfs_ih_stub_generic_permission, &susfs_ih_tramp_generic_permission },
-	/* The one that matches EVERY spelling of a path.
+	/* walk_component is deliberately NOT installed, and that is a measured
+	 * decision rather than an oversight.
 	 *
-	 * The entry hooks above match the caller's path string, so a relative path, a
-	 * symlink, a ..-path or a /proc/self/root prefix all slip past them; the LSM
-	 * layer matches the inode but runs after the DAC check, so where DAC denies
-	 * the caller it cannot answer at all and the caller sees EACCES.  Path
-	 * walking resolves one component at a time through walk_component(), with the
-	 * parent directory in nd->path and the component name in nd->last, before
-	 * may_lookup()/inode_permission() - so a rule can be matched there by
-	 * (parent dev, parent ino, name) and answered with ERR_PTR(-ENOENT), whatever
-	 * the caller's spelling was.  Measured reachable: 4165 calls per round of
-	 * path walks. */
-	{ "walk_component",            susfs_ih_stub_walk_component,     &susfs_ih_tramp_walk_component },
+	 * It is the right place in principle: nd->path is the resolved parent,
+	 * nd->last is the component being looked up (fs/namei.c:2275-2303 sets it
+	 * immediately before the call) and it all happens before
+	 * may_lookup()/inode_permission(), so a hit could answer ERR_PTR(-ENOENT) for
+	 * EVERY spelling of a path - which is the one thing the entry hooks (string)
+	 * and the LSM layer (after DAC) cannot both do.
+	 *
+	 * It also installs cleanly and its decider is reached: with only this hook
+	 * armed the counter moved.  But the calls that matter never arrive - the
+	 * call site in link_path_walk is inlined, and the copy that still has a
+	 * symbol is only reached from other callers.  Measured end to end: a cat of a
+	 * hidden 0600 file still answered EACCES, and the diagnostic that logs a
+	 * component name matching a rule printed nothing for it.
+	 *
+	 * Installing it would therefore cost a stub on every component of every path
+	 * walk while never seeing ours.  The decider and the parent key stay in the
+	 * tree for a kernel where that call site survives LTO. */
 };
 
 #define N_IH_HOOKS ARRAY_SIZE(ih_table)
