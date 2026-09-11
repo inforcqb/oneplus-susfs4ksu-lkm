@@ -65,7 +65,10 @@ module_param(hook_syscall, int, 0444);
  * ih_hook_stub.S), so the whole path can be exercised without touching anything
  * the system depends on. */
 
-extern long ih_test_target(long x);
+static noinline __attribute__((no_stack_protector)) long ih_test_target(long x)
+{
+	return x * 3 + 7;
+}
 
 static long ih_selftest_arg;
 static int ih_selftest_hide;
@@ -188,8 +191,9 @@ static int ih_patch(unsigned long entry, void *stub, bool core_text,
 	void *tr;
 
 	if (!ih_sane_prologue((const u32 *)entry)) {
-		pr_err("ih_hook: %px prologue not understood, refusing\n",
-		       (void *)entry);
+		pr_err("ih_hook: %px prologue not understood: %08x %08x %08x %08x\n",
+		       (void *)entry, ((const u32 *)entry)[0], ((const u32 *)entry)[1],
+		       ((const u32 *)entry)[2], ((const u32 *)entry)[3]);
 		return -EPERM;
 	}
 
