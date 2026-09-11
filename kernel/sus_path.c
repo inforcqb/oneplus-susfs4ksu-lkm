@@ -201,41 +201,48 @@ static inline bool sus_path_is_resolver(void)
  * under override_creds(ksu_cred) (susfs.c:139 ... revert_creds() at :171): the
  * creds a worker walks with are not the ones the path is supposed to be visible
  * to, and everything that decides on the caller - SELinux, DAC and our own gate
- * - can tell the difference.  Same here.
+ * - can tell the difference.
  *
- * ksu_cred is a `struct cred *` in KernelSU (the `kernelsu` module on this
- * device), so the symbol address points at the pointer and the value has to be
- * read at use.  Resolved once; a missing symbol, a NULL pointer or a cred nobody
- * holds a reference to means the walk simply runs with the caller's creds.
- * use_ksu_cred=0 turns it off at runtime. */
-static int sus_path_use_ksu_cred = 1;
-module_param_named(use_ksu_cred, sus_path_use_ksu_cred, int, 0644);
-static struct cred **sus_path_ksu_cred_slot;
-static bool sus_path_ksu_cred_lookup_done;
+ * Measured on device: a kworker walks as uid 0 in the kernel domain, so a plain
+ * kern_path("/data/local/tmp/...") comes back -EACCES and the rule stays pending
+ * forever (pend: last-rc=-13).  Upstream's answer is ksu_cred, but that symbol
+ * lives in the `kernelsu` module and find_kernel_symbol_exact() deliberately
+ * refuses module symbols ("ignore symbol ... of module ...") - so rather than
+ * depend on KernelSU internals, the creds of whoever registered the rule are
+ * saved (a reference is held) and the walk borrows those: that process is by
+ * definition one that can reach the path, since it is the one being told to hide
+ * it.  Exactly one stored reference, released on unload. */
+static struct cred *sus_path_pending_cred;
+static DEFINE_MUTEX(sus_path_cred_lock);
+static atomic_t sus_path_used_caller_cred = ATOMIC_INIT(0);
+
+/* Called from the supercall (process context) when a rule is registered pending. */
+static void sus_path_save_caller_cred(void)
+{
+    struct cred *new = get_cred(current_cred());
+    struct cred *old;
+
+    mutex_lock(&sus_path_cred_lock);
+    old = sus_path_pending_cred;
+    sus_path_pending_cred = new;
+    mutex_unlock(&sus_path_cred_lock);
+    if (old)
+        put_cred(old);
+}
 
 static const struct cred *sus_path_override_creds(void)
 {
     struct cred *cred;
 
-    if (!sus_path_use_ksu_cred)
+    mutex_lock(&sus_path_cred_lock);
+    cred = sus_path_pending_cred;
+    if (cred)
+        get_cred(cred);
+    mutex_unlock(&sus_path_cred_lock);
+    if (!cred)
         return NULL;
 
-    if (!sus_path_ksu_cred_lookup_done) {
-        sus_path_ksu_cred_slot = (struct cred **)find_kernel_symbol_exact("ksu_cred");
-        sus_path_ksu_cred_lookup_done = true;
-        pr_info("sus_path: ksu_cred %s - pending paths are resolved with %s creds\n",
-                sus_path_ksu_cred_slot ? "found" : "NOT found",
-                sus_path_ksu_cred_slot ? "KernelSU's" : "the caller's");
-    }
-    if (!sus_path_ksu_cred_slot)
-        return NULL;
-
-    cred = (struct cred *)READ_ONCE(*sus_path_ksu_cred_slot);
-    /* A cred with no reference left is stale (KernelSU sets this pointer once
-     * and never frees it while loaded) - do not walk with it. */
-    if (!cred || atomic_read(&cred->usage) <= 0)
-        return NULL;
-
+    atomic_inc(&sus_path_used_caller_cred);
     return override_creds(cred);
 }
 
@@ -243,6 +250,18 @@ static void sus_path_revert_creds(const struct cred *saved)
 {
     if (saved)
         revert_creds(saved);
+}
+
+static void sus_path_drop_caller_cred(void)
+{
+    struct cred *old;
+
+    mutex_lock(&sus_path_cred_lock);
+    old = sus_path_pending_cred;
+    sus_path_pending_cred = NULL;
+    mutex_unlock(&sus_path_cred_lock);
+    if (old)
+        put_cred(old);
 }
 
 /* What the pending machinery did, for hide_list: "pending never drops" has to be
@@ -1794,13 +1813,13 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
      * > 0 with pending > 0 means the walk kept failing (last-rc says how), and
      * lost > 0 would mean a walk succeeded with no rule left to publish it. */
     n += scnprintf(buf + n, PAGE_SIZE - n,
-                   "pend: passes=%d ticks=%d walks=%d lost=%d last-rc=%d ksu-cred=%d\n",
+                   "pend: passes=%d ticks=%d walks=%d lost=%d last-rc=%d caller-cred=%d\n",
                    atomic_read(&sus_path_pend_passes),
                    atomic_read(&sus_path_pend_ticks),
                    atomic_read(&sus_path_pend_walks),
                    atomic_read(&sus_path_pend_lost),
                    atomic_read(&sus_path_pend_last_rc),
-                   (int)(sus_path_use_ksu_cred && sus_path_ksu_cred_slot != NULL));
+                   (int)(sus_path_pending_cred != NULL));
 
     spin_lock(&sus_path_lock);
     list_for_each_entry(e, &sus_path_list, list)
@@ -1958,6 +1977,8 @@ void sus_path_exit(void)
     cancel_delayed_work_sync(&sus_path_pending_wq);
     mutex_lock(&sus_path_pending_lock);
     mutex_unlock(&sus_path_pending_lock);
+    /* No walk can be in flight now, so the borrowed creds are ours to release. */
+    sus_path_drop_caller_cred();
 	sus_path_ih_unregister();
     sus_path_syscall_unregister();
     sus_path_path_unregister();
@@ -2170,6 +2191,10 @@ void sus_path_supercall(void __user **arg)
     if (!inode) {
         pr_info("sus_path: hide '%s' (pending: path does not exist yet - hidden by path from now on, inode resolved in the background)\n",
                 info.target_pathname);
+        /* The walk happens later, in a worker whose own creds cannot reach a
+         * path under /data (measured: -EACCES), so remember the creds of the
+         * process that registered the rule - it is by definition able to. */
+        sus_path_save_caller_cred();
         /* The retry path: this add is itself the first retry opportunity (the
          * failing lookup was microseconds ago, but an earlier add in the same
          * batch may be what the rule waits for), then the bounded timer keeps
