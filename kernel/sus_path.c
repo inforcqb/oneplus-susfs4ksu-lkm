@@ -556,6 +556,103 @@ static struct kprobe kp_user_path = {
     .pre_handler = kp_user_path_pre,
 };
 
+/* ---- syscall-entry layer ----
+ *
+ * The measured rule on this kernel: only ABI entry points and a handful of
+ * cross-unit functions survive LTO as symbols that are actually executed.
+ * filename_lookup earns its keep (its hit log fired for stat), but do_filp_open
+ * is called from do_sys_openat2 in the same file and was inlined, so `cat` on a
+ * hidden 0600 file still answered EACCES.
+ *
+ * Syscall wrappers cannot be inlined - they ARE the ABI - which is why the
+ * supercall probe on __arm64_sys_reboot has never missed.  Same treatment: read
+ * the caller's path and answer -ENOENT straight away, before any permission
+ * check runs.
+ *
+ * These wrappers take the user's registers as their only argument, so
+ * regs->regs[0] is the pt_regs to read from (verified for this kernel by the
+ * uname and supercall probes, which rely on the same fact); argno is the
+ * x-register holding the pathname in the 64-bit ABI. */
+static int kp_sys_path_answer(struct pt_regs *regs, int argno)
+{
+    const struct pt_regs *uregs = (const struct pt_regs *)regs->regs[0];
+    char buf[SUS_PATH_LEN];
+    long n;
+
+    if (!uregs)
+        return 0;
+    n = strncpy_from_user(buf, (const char __user *)uregs->regs[argno],
+                          sizeof(buf) - 1);
+    if (n <= 0)
+        return 0;
+    buf[n] = '\0';
+    return kp_path_answer(regs, buf, false);    /* syscalls return long */
+}
+
+#define SUSFS_SYS_PROBE(fn, argno)					\
+	static int kp_##fn##_pre(struct kprobe *kp, struct pt_regs *regs) \
+	{								\
+		return kp_sys_path_answer(regs, argno);			\
+	}								\
+	static struct kprobe kp_##fn = {				\
+		.symbol_name = #fn,					\
+		.pre_handler = kp_##fn##_pre,				\
+	}
+
+SUSFS_SYS_PROBE(__arm64_sys_openat, 1);
+SUSFS_SYS_PROBE(__arm64_sys_openat2, 1);
+SUSFS_SYS_PROBE(__arm64_sys_newfstatat, 1);
+SUSFS_SYS_PROBE(__arm64_sys_statx, 1);
+SUSFS_SYS_PROBE(__arm64_sys_faccessat, 1);
+SUSFS_SYS_PROBE(__arm64_sys_faccessat2, 1);
+SUSFS_SYS_PROBE(__arm64_sys_readlinkat, 1);
+SUSFS_SYS_PROBE(__arm64_sys_execve, 0);
+
+static struct kprobe *sys_path_probes[] = {
+    &kp___arm64_sys_openat,
+    &kp___arm64_sys_openat2,
+    &kp___arm64_sys_newfstatat,
+    &kp___arm64_sys_statx,
+    &kp___arm64_sys_faccessat,
+    &kp___arm64_sys_faccessat2,
+    &kp___arm64_sys_readlinkat,
+    &kp___arm64_sys_execve,
+};
+
+#define N_SYS_PATH_PROBES ARRAY_SIZE(sys_path_probes)
+static bool sys_path_probes_registered[N_SYS_PATH_PROBES];
+
+static void sus_path_syscall_register(void)
+{
+    int i, n = 0;
+
+    for (i = 0; i < N_SYS_PATH_PROBES; i++) {
+        int rc = register_kprobe(sys_path_probes[i]);
+
+        if (rc) {
+            pr_warn("sus_path: kprobe(%s) failed %d\n",
+                    sys_path_probes[i]->symbol_name, rc);
+            continue;
+        }
+        sys_path_probes_registered[i] = true;
+        n++;
+    }
+    pr_info("sus_path: syscall layer armed (%d/%d probes)\n", n,
+            (int)N_SYS_PATH_PROBES);
+}
+
+static void sus_path_syscall_unregister(void)
+{
+    int i;
+
+    for (i = 0; i < N_SYS_PATH_PROBES; i++) {
+        if (!sys_path_probes_registered[i])
+            continue;
+        unregister_kprobe(sys_path_probes[i]);
+        sys_path_probes_registered[i] = false;
+    }
+}
+
 static struct kprobe *path_probes[] = {
     &kp_filename_lookup,
     &kp_filp_open,
@@ -868,6 +965,7 @@ int sus_path_init(void)
      * answers ENOENT before the DAC check on a hidden directory can answer
      * EACCES. */
     sus_path_path_register();
+    sus_path_syscall_register();
 
     return 0;
 }
@@ -879,6 +977,7 @@ void sus_path_exit(void)
 
     /* Unregister the hooks FIRST: after this nothing can match, so the entries
      * (and their inode references) can be torn down safely. */
+    sus_path_syscall_unregister();
     sus_path_path_unregister();
     sus_path_dac_unregister();
     if (sus_path_perm_hook.entry)
