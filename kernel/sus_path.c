@@ -886,15 +886,17 @@ static void sus_path_hooks_arm(void)
 
     hooks_armed = true;
     sus_path_tracepoint_register();
-    sus_path_getname_register();
 
-    /* Entry-decision hooks: patch the entries if we can, otherwise probe them.
-     * Never both - a kprobe owns the first instruction of its target. */
+    /* Entry-decision and onLeave hooks: patch the entries if we can, otherwise
+     * probe them.  Never both - a kprobe owns the first instruction of its
+     * target.  getname is in the patched set too now: its stub returns to
+     * itself after the original ran, which is what the kretprobe used to do. */
     if (sus_path_ih_register())
-        pr_info("sus_path: syscall/path entries use inline hooks\n");
+        pr_info("sus_path: syscall/path/getname use inline hooks\n");
     else {
         sus_path_syscall_register();
         sus_path_path_register();
+        sus_path_getname_register();
     }
     pr_info("sus_path: hooks armed (first rule registered)\n");
 }
@@ -925,6 +927,7 @@ extern void susfs_ih_stub_execve(void);
 extern void susfs_ih_stub_filename_lookup(void);
 extern void susfs_ih_stub_do_filp_open(void);
 extern void susfs_ih_stub_user_path_at_empty(void);
+extern void susfs_ih_stub_getname(void);
 
 extern u64 susfs_ih_tramp_openat;
 extern u64 susfs_ih_tramp_openat2;
@@ -937,6 +940,29 @@ extern u64 susfs_ih_tramp_execve;
 extern u64 susfs_ih_tramp_filename_lookup;
 extern u64 susfs_ih_tramp_do_filp_open;
 extern u64 susfs_ih_tramp_user_path_at_empty;
+extern u64 susfs_ih_tramp_getname;
+
+/* onLeave handler for getname(): the stub calls this after the original ran, with
+ * the original arguments and its return value (in x2).  Returning a different
+ * value replaces it - which is how a kretprobe's job is done with a patched
+ * entry.
+ *
+ * On a hit the freshly allocated struct filename must be released first
+ * (putname), otherwise it leaks; every caller already checks IS_ERR. */
+u64 susfs_ih_after_getname(u64 a0, u64 a1, u64 ret)
+{
+	struct filename *f = (struct filename *)ret;
+
+	if (IS_ERR_OR_NULL(f) || !f->name)
+		return ret;
+	if (!sus_path_match_path(f->name))
+		return ret;
+
+	pr_info_ratelimited("sus_path: getname hit '%s' (uid=%u)\n",
+			    f->name, current_uid().val);
+	putname(f);
+	return (u64)(unsigned long)ERR_PTR(-ENOENT);
+}
 
 /* Called from the syscall stubs: x0 is the wrapper's pt_regs, argno the register
  * holding the pathname. */
@@ -1014,6 +1040,7 @@ static struct {
 	{ "filename_lookup",           susfs_ih_stub_filename_lookup, &susfs_ih_tramp_filename_lookup },
 	{ "do_filp_open",              susfs_ih_stub_do_filp_open,  &susfs_ih_tramp_do_filp_open },
 	{ "user_path_at_empty",        susfs_ih_stub_user_path_at_empty, &susfs_ih_tramp_user_path_at_empty },
+	{ "getname",                   susfs_ih_stub_getname,       &susfs_ih_tramp_getname },
 };
 
 #define N_IH_HOOKS ARRAY_SIZE(ih_table)

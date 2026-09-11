@@ -85,6 +85,57 @@ susfs_ih_stub_##n:;						\
 	IH_TAIL(n);						\
 	.size	susfs_ih_stub_##n, . - susfs_ih_stub_##n
 
+/* onLeave hook: the same patch, but the stub hands the frame back to itself.
+ *
+ * It stores the caller's real LR in a spare slot, points the target's LR at the
+ * label after the trampoline jump, and enters the original function.  The
+ * target's own prologue (paciasp and friends) then signs THAT LR, so its
+ * epilogue restores and authenticates it happily - and control lands back here
+ * with x0 holding the target's return value.  We then call the C after-handler
+ * and leave with the real LR, so this can rewrite a return value.
+ *
+ * Layout: [0..144] x0-x18, [152] LR for the target, [160] real LR,
+ *         [168] the target's return value. */
+#define SUSFS_IH_LEAVE_STUB(n, after_fn)			\
+	.globl	susfs_ih_stub_##n;				\
+	.type	susfs_ih_stub_##n, %function;			\
+susfs_ih_stub_##n:;						\
+	sub	sp, sp, #192;					\
+	stp	x0,  x1,  [sp, #0];				\
+	stp	x2,  x3,  [sp, #16];				\
+	stp	x4,  x5,  [sp, #32];				\
+	stp	x6,  x7,  [sp, #48];				\
+	stp	x8,  x9,  [sp, #64];				\
+	stp	x10, x11, [sp, #80];				\
+	stp	x12, x13, [sp, #96];				\
+	stp	x14, x15, [sp, #112];				\
+	stp	x16, x17, [sp, #128];				\
+	str	x18, [sp, #144];				\
+	str	x30, [sp, #160];	/* real LR */		\
+	adr	x9, 9f;						\
+	str	x9,  [sp, #152];	/* LR for target */	\
+	mov	x30, x9;					\
+	ldp	x0,  x1,  [sp, #0];				\
+	ldp	x2,  x3,  [sp, #16];				\
+	ldp	x4,  x5,  [sp, #32];				\
+	ldp	x6,  x7,  [sp, #48];				\
+	ldp	x8,  x9,  [sp, #64];				\
+	ldp	x10, x11, [sp, #80];				\
+	ldp	x12, x13, [sp, #96];				\
+	ldp	x14, x15, [sp, #112];				\
+	ldr	x18, [sp, #144];				\
+	ldr	x16, =susfs_ih_tramp_##n;			\
+	ldr	x16, [x16];					\
+	ret	x16;						\
+9:;	/* x0 = target's return value */			\
+	str	x0, [sp, #168];					\
+	ldp	x0,  x1,  [sp, #0];	/* original args */	\
+	ldr	x2,  [sp, #168];	/* return value */	\
+	bl	after_fn;					\
+	ldr	x30, [sp, #160];				\
+	add	sp, sp, #192;					\
+	ret
+
 	SUSFS_IH_SYS_STUB(openat, 1)
 	SUSFS_IH_SYS_STUB(openat2, 1)
 	SUSFS_IH_SYS_STUB(newfstatat, 1)
@@ -97,6 +148,9 @@ susfs_ih_stub_##n:;						\
 	SUSFS_IH_NAME_STUB(filename_lookup, 0)
 	SUSFS_IH_NAME_STUB(do_filp_open, 0)
 	SUSFS_IH_NAME_STUB(user_path_at_empty, 1)
+
+	/* onLeave: needs the result of the original call */
+	SUSFS_IH_LEAVE_STUB(getname, susfs_ih_after_getname)
 
 	.bss
 	.align	3
@@ -116,3 +170,4 @@ susfs_ih_tramp_##n:;						\
 	SUSFS_IH_TRAMP(filename_lookup)
 	SUSFS_IH_TRAMP(do_filp_open)
 	SUSFS_IH_TRAMP(user_path_at_empty)
+	SUSFS_IH_TRAMP(getname)
