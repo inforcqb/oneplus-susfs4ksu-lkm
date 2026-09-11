@@ -155,8 +155,14 @@ static bool ih_sane_prologue(const u32 *insn)
 	return true;
 }
 
-/* Build the trampoline for `entry`: replay the two instructions we overwrite,
- * then ldr x16, #8 / ret x16 into entry+8.  Returns the page or NULL. */
+/* Build the trampoline for `entry`: a landing pad, the two instructions we
+ * overwrite, then ldr x16, #8 / ret x16 into entry+8.  Returns the page or
+ * NULL.
+ *
+ * The leading `bti c` is not decoration: the stub arrives here with an indirect
+ * branch, this page can be BTI-guarded, and the replayed instruction is a
+ * landing pad only by accident (paciasp is, stp is not).  The stub uses
+ * `ret x16` on top of that, which is exempt anyway. */
 static __nocfi void *ih_build_tramp(unsigned long entry, const u32 *orig)
 {
 	u32 *tr = pfn_module_alloc(IH_TRAMP_SIZE);
@@ -164,11 +170,12 @@ static __nocfi void *ih_build_tramp(unsigned long entry, const u32 *orig)
 	if (!tr)
 		return NULL;
 
-	tr[0] = orig[0];
-	tr[1] = orig[1];
-	tr[2] = 0x58000050u;			/* ldr x16, #8         */
-	tr[3] = 0xd65f0200u;			/* ret x16 (BTI-exempt) */
-	*(u64 *)(tr + 4) = entry + 8;
+	tr[0] = 0xd503245fu;			/* bti c               */
+	tr[1] = orig[0];
+	tr[2] = orig[1];
+	tr[3] = 0x58000050u;			/* ldr x16, #8         */
+	tr[4] = 0xd65f0200u;			/* ret x16 (BTI-exempt) */
+	*(u64 *)(tr + 5) = entry + 8;		/* -> entry + 8        */
 
 	ih_flush_icache(tr, IH_TRAMP_SIZE);
 

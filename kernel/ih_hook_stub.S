@@ -91,7 +91,7 @@ ih_openat_allow:
 	IH_RESTORE_REGS()
 	ldr	x16, =ih_openat_tramp
 	ldr	x16, [x16]
-	br	x16
+	ret	x16
 	.size	ih_openat_stub, . - ih_openat_stub
 
 /* Same shape, for the self-test target: the decision function decides purely on
@@ -109,7 +109,7 @@ ih_selftest_allow:
 	IH_RESTORE_REGS()
 	ldr	x16, =ih_selftest_tramp
 	ldr	x16, [x16]
-	br	x16
+	ret	x16
 	.size	ih_selftest_stub, . - ih_selftest_stub
 
 	.bss
