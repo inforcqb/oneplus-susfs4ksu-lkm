@@ -54,10 +54,19 @@ jobs:
           readelf -S "$f" | grep -E "__versions|\.BTF|cfi|\.llvm_addrsig|\.plt|modinfo" || true
           echo "--- vermagic"
           modinfo "$f" 2>/dev/null | grep -E "vermagic|srcversion" || true
-          f=kernel/syscall_test.ko
-          readelf -S "$f" | grep -E "__versions|\.BTF|cfi|\.llvm_addrsig|\.plt|modinfo" || true
-          echo "--- syscall_test vermagic"
-          modinfo "$f" 2>/dev/null | grep -E "vermagic|srcversion" || true
+
+      # Not part of the module: a freestanding aarch64 client for the supercall
+      # commands ksu_susfs does not expose (hide_sus_mnts_for_non_su_procs,
+      # add_sus_path_loop).  Build failure must not hide the module artifact, so
+      # this step is allowed to fail.
+      - name: Build userspace supercall client
+        continue-on-error: true
+        run: |
+          clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
+                -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
+                -o /tmp/susfs_sc tools/susfs_sc.c
+          file /tmp/susfs_sc
+          ls -la /tmp/susfs_sc
 
       - name: Upload .ko
         uses: actions/upload-artifact@v4
@@ -66,3 +75,11 @@ jobs:
           path: |
             kernel/susfs_guard_lkm.ko
           if-no-files-found: error
+
+      - name: Upload userspace client
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs_sc
+          path: /tmp/susfs_sc
+          if-no-files-found: warn
