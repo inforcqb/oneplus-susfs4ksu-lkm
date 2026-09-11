@@ -881,6 +881,7 @@ static int sus_path_inode_permission(struct inode *inode, int mask)
  * cannot reach the child's lookup at all.  Upstream behaves the same way -
  * register the directory. */
 static atomic_t n_enoent_dac = ATOMIC_INIT(0);      /* retired: was the DAC kprobe layer */
+static atomic_t n_nd_calls = ATOMIC_INIT(0);        /* walk_component hook invocations */
 
 /* ---- the DAC layer used to live here, as a kprobe ----
  *
@@ -1745,6 +1746,8 @@ __attribute__((visibility("hidden"))) int susfs_ih_decide_nd(u64 nd_ptr)
 	const struct susfs_nd_mirror *nd = (const struct susfs_nd_mirror *)nd_ptr;
 	struct inode *parent;
 
+	atomic_inc(&n_nd_calls);
+
 	if (IS_ERR_OR_NULL((void *)nd_ptr) || !nd->path.dentry)
 		return 0;
 	if (!current_uid().val)		/* root is never hidden */
@@ -1753,6 +1756,15 @@ __attribute__((visibility("hidden"))) int susfs_ih_decide_nd(u64 nd_ptr)
 	parent = d_inode(nd->path.dentry);
 	if (!parent)
 		return 0;
+
+	/* Diagnostic: the first few calls show the key we are matching on, so a
+	 * hook that is installed but never fires can be told apart from one that
+	 * fires and misses. */
+	if (atomic_read(&n_nd_calls) <= 6)
+		pr_info("sus_path: walk_component hook: parent dev=%llu ino=%llu name=%.*s\n",
+			(unsigned long long)parent->i_sb->s_dev,
+			(unsigned long long)parent->i_ino,
+			(int)nd->last.len, nd->last.name);
 
 	return sus_path_parent_hit((u64)parent->i_sb->s_dev, (u64)parent->i_ino,
 				   nd->last.name, nd->last.len) ? 1 : 0;
@@ -2195,8 +2207,8 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
     spin_lock(&sus_path_lock);
     list_for_each_entry(e, &sus_path_list, list)
         n += scnprintf(buf + n, PAGE_SIZE - n,
-                       "dev=%llu ino=%llu name=%s%s\n",
-                       e->dev, e->ino, e->name,
+                       "dev=%llu ino=%llu parent=%llu/%llu name=%s%s\n",
+                       e->dev, e->ino, e->parent_dev, e->parent_ino, e->name,
                        e->inode ? "" : " (pending: no inode yet)");
     spin_unlock(&sus_path_lock);
 
