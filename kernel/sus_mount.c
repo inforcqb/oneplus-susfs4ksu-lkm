@@ -288,6 +288,7 @@ static int sus_mount_mark_ksu_mounts(void)
     unsigned long min;
     int marked = 0;
     unsigned int seen = 0;
+    int scan_logged = 0;
     bool hit_cap = false;
     bool failed = false;
 
@@ -371,6 +372,13 @@ static int sus_mount_mark_ksu_mounts(void)
             mnt_path.mnt = &r->mnt;
             mnt_path.dentry = r->mnt.mnt_root;
             dp = sus_mount_d_path(&mnt_path, buf, PATH_MAX);
+            /* Diagnostic while the matching rule is being validated: the first
+             * few mounts show what d_path() actually renders for them. */
+            if (scan_logged < 12) {
+                scan_logged++;
+                pr_info("sus_mount: scan %s -> %s\n", r->mnt_devname,
+                        IS_ERR_OR_NULL(dp) ? "(d_path failed)" : dp);
+            }
             if (IS_ERR_OR_NULL(dp) || !sus_mount_is_adb_mountpoint(dp))
                 continue;
             shown = dp;
