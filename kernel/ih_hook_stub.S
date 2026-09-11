@@ -50,10 +50,14 @@
 
 	.text
 
-/* Self-test target, written in assembly on purpose: a C function in a module
- * gets a paciasp prologue AND a stack-protector canary, and that canary is
- * loaded with adrp (PC-relative), which is exactly what the patch sanity check
- * must refuse.  This one has a prologue that can be replayed verbatim. */
+/* Self-test target, written in assembly on purpose:
+ *  - a C function in a module gets a stack-protector canary loaded with adrp
+ *    (PC-relative), which the patch sanity check must refuse;
+ *  - worse, in a kCFI kernel the ADDRESS of a C function taken in C code is the
+ *    .cfi_jt entry ("bti c ; b func"), so patching it would patch the thunk.
+ *    This pair avoids both: ih_test_target has a replayable prologue, and
+ *    ih_test_target_addr computes the real entry with adrp/add, which no
+ *    compiler rewrites - the same problem kCFI posed for the first attempt. */
 	.globl	ih_test_target
 	.type	ih_test_target, %function
 ih_test_target:
@@ -65,6 +69,14 @@ ih_test_target:
 	ldp	x29, x30, [sp], #16
 	ret
 	.size	ih_test_target, . - ih_test_target
+
+	.globl	ih_test_target_addr
+	.type	ih_test_target_addr, %function
+ih_test_target_addr:
+	adrp	x0, ih_test_target
+	add	x0, x0, :lo12:ih_test_target
+	ret
+	.size	ih_test_target_addr, . - ih_test_target_addr
 
 	.globl	ih_openat_stub
 	.type	ih_openat_stub, %function

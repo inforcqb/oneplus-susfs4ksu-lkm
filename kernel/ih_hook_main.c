@@ -65,10 +65,8 @@ module_param(hook_syscall, int, 0444);
  * ih_hook_stub.S), so the whole path can be exercised without touching anything
  * the system depends on. */
 
-static noinline __attribute__((no_stack_protector)) long ih_test_target(long x)
-{
-	return x * 3 + 7;
-}
+extern long ih_test_target(long x);
+extern unsigned long ih_test_target_addr(void);
 
 static long ih_selftest_arg;
 static int ih_selftest_hide;
@@ -234,7 +232,7 @@ static void ih_unpatch(unsigned long entry, const u32 *saved, bool core_text,
 /* ------------------------------------------------------------------ */
 static void ih_run_selftest(void)
 {
-	unsigned long entry = (unsigned long)ih_test_target;
+	unsigned long entry = ih_test_target_addr();
 	u32 saved[2];
 	void *tr = NULL;
 	long got;
