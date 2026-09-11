@@ -22,6 +22,7 @@
 #include <linux/kallsyms.h>
 #include <linux/string.h>
 #include "susfs_log.h"
+#include "symbol_resolver.h"	/* find_kernel_symbol_exact (kallsyms_op) */
 
 /* local mirror of kernel/kallsyms.c struct kallsym_iter (layout is KMI-frozen);
  * only the name field matters here. */
@@ -87,24 +88,55 @@ static int hide_syms_s_show_pre(struct kprobe *kp, struct pt_regs *regs)
 	return 0;
 }
 
+/* Registered by ADDRESS, not by name.
+ *
+ * This tree has CONFIG_KALLSYMS_ALL=y and FULL LTO, and there are three
+ * different `s_show` functions: kernel/kallsyms.c:741 (the one we want),
+ * kernel/trace/trace.c:4654 and mm/vmalloc.c:4052.  A kprobe registered with
+ * .symbol_name gets whichever one kallsyms happens to list first, and the
+ * handler above would then read a struct trace_iterator / vmap_area as if it
+ * were struct kallsym_iter - reading inside someone else's allocation, and
+ * silently failing to hide anything.
+ *
+ * kallsyms_op is the seq_operations table (a data symbol, again thanks to
+ * KALLSYMS_ALL) whose .show is exactly the function kallsyms actually calls, so
+ * take the address from the table itself. */
 static struct kprobe kp_s_show = {
-	.symbol_name = "s_show",
 	.pre_handler = hide_syms_s_show_pre,
 };
+
+static unsigned long hide_syms_target(void)
+{
+	const struct seq_operations *op;
+	unsigned long addr = find_kernel_symbol_exact("kallsyms_op");
+
+	if (!addr)
+		return 0;
+	op = (const struct seq_operations *)addr;
+	return (unsigned long)op->show;
+}
 
 static bool hide_registered;
 
 int susfs_hide_syms_init(void)
 {
 	int rc;
+	unsigned long fn = hide_syms_target();
 
+	if (!fn) {
+		pr_warn("susfs_hide_syms: kallsyms_op.show not found, not armed\n");
+		return -ENOENT;
+	}
+
+	kp_s_show.addr = (kprobe_opcode_t *)fn;
 	rc = register_kprobe(&kp_s_show);
 	if (rc) {
-		pr_warn("register_kprobe(s_show) failed %d\n", rc);
+		pr_warn("susfs_hide_syms: register_kprobe(%px) failed %d\n",
+			(void *)fn, rc);
 		return rc;
 	}
 	hide_registered = true;
-	pr_info("susfs_hide_syms: armed (kallsyms s_show)\n");
+	pr_info("susfs_hide_syms: armed (kallsyms_op.show=%px)\n", (void *)fn);
 	return 0;
 }
 

@@ -591,7 +591,9 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 	if (is_compat_task()) {
 		if (syscall_get_nr(current, regs) != COMPAT_FSTATAT64_NR)
 			return;
-		susfs_kstat_spoof_compat_statbuf(statbuf);
+		/* syscall_get_arguments() returns the raw registers; for a 32-bit
+		 * task only the low half is the argument. */
+		susfs_kstat_spoof_compat_statbuf((unsigned long)compat_ptr((u32)statbuf));
 	} else {
 		if (syscall_get_nr(current, regs) != __NR_newfstatat)
 			return;

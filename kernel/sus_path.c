@@ -1264,20 +1264,44 @@ static void sus_path_syscall_unregister(void)
  *     half-answered;
  *   - nothing needs putname(): the caller releases the filename as usual.
  *
- * A compile-time constant is all that is needed: nothing has to be computed, the
- * kernel only has to look the name up and fail.  Shaped like an ordinary
- * temporary file, and deliberately NOT upstream's literal - "..5.u.S" is a
- * marker anyone can grep a running kernel for, and a per-path value would buy
- * nothing that this does not already have. */
-#define SUS_PATH_FAKE_NAME ".x7f3a9c21"
+ * The replacement is hex only, so nothing has to be computed at all - just an
+ * ordinary-looking name that the kernel will look up and fail to find.
+ * Deliberately NOT upstream's literal ("..5.u.S" is a marker anybody can grep a
+ * running kernel for). */
+#define SUS_PATH_FAKE_CHARS "0123456789abcdef"
 
 /* Called from the getname layers on a hit, with the filename the kernel just
- * built: the object keeps its identity and its ownership, only the name it
- * points at changes.  The replacement is a string literal, so it outlives the
- * filename (which the caller frees with putname()) and owns nothing. */
+ * built.  The name is overwritten IN PLACE, with the same length it already had:
+ *
+ *  - putname() does `if (name->name != name->iname) kfree(name->name);`
+ *    (fs/namei.c:257-267), so pointing name at a module constant would hand it a
+ *    non-heap pointer to free.  Overwriting the buffer is the only safe move.
+ *  - keeping the length identical means the write cannot run past the original
+ *    buffer, whether that is the embedded iname[] (EMBEDDED_NAME_MAX, 5.15
+ *    fs/namei.c:125) or the PATH_MAX block allocated for an over-long path.  It
+ *    also leaves the terminating NUL where it was.
+ *  - the replacement is hex only, so it can never be "." or "..", and contains
+ *    no '/': the lookup that follows treats it as a plain relative name, which
+ *    is exactly what makes it fail.
+ *
+ * A FNV-1a of the original seeds a per-position mix, so two different hidden
+ * paths do not end up renamed to the same string. */
 static void sus_path_spoof_name(struct filename *f)
 {
-	f->name = SUS_PATH_FAKE_NAME;
+	char *name = (char *)f->name;	/* the buffer is kmalloc'ed, only const-qualified */
+	size_t len = strlen(name);
+	u32 h = 0x811c9dc5u;
+	size_t i;
+
+	if (!len)
+		return;
+
+	for (i = 0; i < len; i++)
+		h = (h ^ (u8)name[i]) * 16777619u;
+	for (i = 0; i < len; i++) {
+		h = h * 1103515245u + 12345u;
+		name[i] = SUS_PATH_FAKE_CHARS[(h >> 16) & 0xf];
+	}
 }
 
 static int kr_getname_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -1876,9 +1900,16 @@ static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret)
         return;
 
     /* NOTE: in a sys_exit probe regs->regs[0] already holds the return value,
-     * so only args[1] (the buffer) and args[2] (the byte count) are usable. */
+     * so only args[1] (the buffer) and args[2] (the byte count) are usable.
+     *
+     * arm64's syscall_get_arguments() hands back the raw registers, and for a
+     * 32-bit task only the low half of each is the argument - every other compat
+     * path in this file masks with compat_ptr(), so this one has to as well or a
+     * 32-bit caller's buffer address is treated as 64-bit garbage. */
     syscall_get_arguments(current, regs, args);
     dirent_buf = args[1];
+    if (is_compat_task())
+        dirent_buf = (unsigned long)compat_ptr((u32)dirent_buf);
     if (!dirent_buf)
         return;
 

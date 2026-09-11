@@ -52,6 +52,9 @@ static int kr_newuname_entry(struct kretprobe_instance *ri, struct pt_regs *regs
 
     /* this GKI kernel does NOT auto-adjust syscall-wrapper probe regs:
      * regs->regs[0] is the struct pt_regs* argument, not the user arg */
+    if (!user)
+        return 1;   /* no return handler: ri->data would be left stale */
+
     a->name = (struct new_utsname __user *)user->regs[0];
     return 0;
 }

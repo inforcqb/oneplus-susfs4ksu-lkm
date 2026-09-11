@@ -225,11 +225,22 @@ static bool susfs_cmd_handled(unsigned int cmd)
 static int reboot_pre(struct kprobe *kp, struct pt_regs *regs)
 {
 	struct pt_regs *real_regs = (struct pt_regs *)regs->regs[0];
-	int magic1 = (int)real_regs->regs[0];
-	int magic2 = (int)real_regs->regs[1];
-	unsigned int cmd = (unsigned int)real_regs->regs[2];
-	void __user *payload = (void __user *)real_regs->regs[3];
+	int magic1, magic2;
+	unsigned int cmd;
+	void __user *payload;
 	struct susfs_tw *tw;
+
+	/* A prober runs before the callee, so an argument the callee would have
+	 * checked is still raw here - see the filename_lookup lesson in
+	 * sus_path.c.  The syscall ABI does guarantee this one, but a NULL check
+	 * costs nothing and this is the path that accepts commands. */
+	if (!real_regs)
+		return 0;
+
+	magic1 = (int)real_regs->regs[0];
+	magic2 = (int)real_regs->regs[1];
+	cmd = (unsigned int)real_regs->regs[2];
+	payload = (void __user *)real_regs->regs[3];
 
 	if (magic1 != KSU_INSTALL_MAGIC1)
 		return 0;

@@ -61,10 +61,12 @@ static int avc_audit_post_pre(struct kprobe *kp, struct pt_regs *regs)
 	u32 tsid = (u32)regs->regs[2];
 
 	atomic_inc(&avc_enter_count);
-	if (tsid == avc_su_sid) {
-		atomic_inc(&avc_hit_count);
-		regs->regs[2] = avc_priv_app_sid;
-	}
+	/* avc_su_sid == 0 means security_secctx_to_secid() failed (see init), and
+	 * a failed resolution must not turn "sid 0" into a match. */
+	if (!avc_su_sid || tsid != avc_su_sid)
+		return 0;
+	atomic_inc(&avc_hit_count);
+	regs->regs[2] = avc_priv_app_sid;
 	return 0;
 }
 

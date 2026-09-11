@@ -863,20 +863,21 @@ static void or_del(const char *target)
 	if (!e)
 		return;
 
-	/* Retire, never free: an in-flight reader may still hold these paths.
-	 * The slot stays in the array (marked dead) and is reused by or_add. */
+	/* Retire, never free - and never CLEAR either.
+	 *
+	 * A reader that has already passed its `dead` check still holds a pointer to
+	 * these fields and hands them to vfs_open()/d_path()/vfs_statfs(), which
+	 * dereference path->dentry immediately (fs/open.c:1032, fs/d_path.c:282,
+	 * fs/statfs.c:90).  Nulling them here while such a reader is on its way is a
+	 * straight NULL-dereference oops, reachable from any app because the control
+	 * node is 0777 (or_uid_matches() is only consulted later, inside the probe).
+	 * The values therefore stay exactly as they were: the entry is dead, nobody
+	 * looks at it again, and the two struct paths are pinned until unload. */
 	WRITE_ONCE(e->dead, true);
 	smp_wmb();
 	or_retire_path(&e->redirected_path);
 	or_retire_path(&e->target_path);
-	e->redirected_path.dentry = NULL;
-	e->redirected_path.mnt = NULL;
-	e->target_path.dentry = NULL;
-	e->target_path.mnt = NULL;
-	e->target_ino = 0;
-	e->target_dev = 0;
-	e->redirected_ino = 0;
-	e->redirected_dev = 0;
+
 	e->target_pathname[0] = '\0';
 	e->redirected_pathname[0] = '\0';
 }
