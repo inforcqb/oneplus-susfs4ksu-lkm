@@ -850,6 +850,43 @@ static void sus_path_path_unregister(void)
     }
 }
 
+/* Every hook below the LSM layer is only worth its cost once something is
+ * actually registered: kprobe/kretprobe entry costs a brk trap per hit, and the
+ * getdents64 tracepoint sits on every syscall exit.  With no rules there is
+ * nothing to answer, so they are armed on the first rule and torn down when the
+ * module goes - the same "no rules, no cost" effect as nop'ing a patched call
+ * site, but through the kernel's own register/unregister paths (unregistering a
+ * kprobe restores the original instruction) instead of hand-written text
+ * patching.
+ *
+ * The LSM hooks are exempt: they are pointer swaps, already cost-free. */
+static bool hooks_armed;
+
+static void sus_path_tracepoint_register(void)
+{
+    int rc = register_trace_sys_exit(sus_path_sys_exit, NULL);
+
+    if (rc) {
+        pr_warn("register_trace_sys_exit(getdents64) failed %d\n", rc);
+        return;
+    }
+    path_registered = true;
+    pr_info("sus_path: getdents64 filter armed\n");
+}
+
+static void sus_path_hooks_arm(void)
+{
+    if (hooks_armed || !READ_ONCE(sus_path_count))
+        return;
+
+    hooks_armed = true;
+    sus_path_tracepoint_register();
+    sus_path_syscall_register();
+    sus_path_getname_register();
+    sus_path_path_register();
+    pr_info("sus_path: hooks armed (first rule registered)\n");
+}
+
 /* compact the dirent chain in-place; returns the new byte count */
 static long sus_path_filter(unsigned long buf, long count)
 {
@@ -1006,8 +1043,6 @@ static const struct kernel_param_ops sus_path_list_ops = {
  * looking for.  (A raw inode pointer used to be printed here too; removed.) */
 module_param_cb(hide_list, &sus_path_list_ops, NULL, 0400);
 
-static bool path_registered;
-
 /* Add a path to the hidden set from kernel code, bypassing the supercall.
  * Used by susfs_init() to self-hide the /proc control nodes.
  *
@@ -1070,6 +1105,7 @@ int sus_path_add_hidden(const char *path)
 	spin_unlock(&sus_path_lock);
 
 	pr_info("sus_path: hidden (built-in) '%s'\n", path);
+	sus_path_hooks_arm();
 	return 0;
 }
 
@@ -1090,13 +1126,11 @@ int sus_path_init(void)
         return -ENOMEM;
     }
 
-    rc = register_trace_sys_exit(sus_path_sys_exit, NULL);
-    if (rc)
-        pr_warn("register_trace_sys_exit(getdents64) failed %d\n", rc);
-    else {
-        path_registered = true;
-        pr_info("sus_path: getdents64 filter armed\n");
-    }
+    /* The getdents64 tracepoint (it sits on every syscall exit), the syscall
+     * probes and the getname hooks are armed by sus_path_hooks_arm() once a
+     * rule exists: with nothing registered there is nothing to answer, so they
+     * cost nothing until then. */
+    pr_info("sus_path: hooks deferred until the first rule\n");
 
     /* LSM hooks: reject path-based access to registered inodes outright. */
     rc = ksu_register_lsm_hook(&sus_path_getattr_hook);
@@ -1114,16 +1148,10 @@ int sus_path_init(void)
                 sus_path_perm_hook.original);
 
     /* And the DAC layer, without which a caller DAC denies gets EACCES instead
-     * of ENOENT (see the note above it). */
+     * of ENOENT (see the note above it).  Registered eagerly because it is the
+     * layer that would otherwise answer EACCES, and it has never been observed
+     * to fire on this kernel anyway. */
     sus_path_dac_register();
-
-    /* Plus the entry-point layer: the probes above register but never fire on
-     * this kernel (LTO inlines them), and this is the layer that actually
-     * answers ENOENT before the DAC check on a hidden directory can answer
-     * EACCES. */
-    sus_path_path_register();
-    sus_path_syscall_register();
-    sus_path_getname_register();
 
     return 0;
 }
@@ -1265,14 +1293,10 @@ void sus_path_supercall(void __user **arg)
             goto out;
         }
     }
-    if (!path_registered) {
-        rc = register_trace_sys_exit(sus_path_sys_exit, NULL);
-        if (rc) {
-            info.err = rc;
-            goto out;
-        }
-        path_registered = true;
-    }
+
+    /* First rule: arm the tracepoint, the syscall probes and the getname
+     * hooks.  Idempotent, and safe to call with a rule already in the list. */
+    sus_path_hooks_arm();
 
     info.err = 0;
     pr_info("sus_path: hide '%s' (dev=%llu ino=%llu)\n",
