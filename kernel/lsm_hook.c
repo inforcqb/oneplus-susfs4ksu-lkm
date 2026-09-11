@@ -12,6 +12,7 @@
 #include <linux/kernel.h>
 #include <linux/lsm_hooks.h>
 #include <linux/mutex.h>
+#include <linux/delay.h>
 #include <linux/rcupdate.h>
 #include <linux/string.h>
 
@@ -442,7 +443,7 @@ void ksu_lsm_unhook(struct ksu_lsm_hook *hook)
     }
 #endif
 
-    synchronize_rcu();
+    ksu_lsm_hook_drain();
     pr_info("lsm_hook: restored %s hook slot %px to %px\n", hook->head_name ?: "unknown", slot, hook->original);
     ksu_lsm_hook_untrack(hook);
     hook->entry = NULL;
@@ -450,6 +451,45 @@ void ksu_lsm_unhook(struct ksu_lsm_hook *hook)
     hook->scall = NULL;
 #endif
     mutex_unlock(&ksu_lsm_hook_lock);
+}
+
+static void ksu_lsm_hook_drain(void);
+
+/* Wait until nothing can still be inside a replacement function.
+ *
+ * synchronize_rcu() is not enough here: the LSM call sites walk their hook list
+ * with a plain hlist_for_each_entry (security/security.c), so they are not RCU
+ * read-side sections and a task that is already executing our replacement is
+ * invisible to that barrier.  It can still be there when the module text is
+ * unmapped, which is a use-after-free on the next instruction.
+ *
+ * synchronize_rcu_tasks() waits for every task to pass through a context switch,
+ * which does cover it.  The symbol is resolved at runtime and called through a
+ * __nocfi wrapper (kCFI checks the type hash at such a call sites); if it cannot
+ * be resolved, a delay is the fallback, and synchronize_rcu() still runs. */
+static void (*ksu_lsm_sync_rcu_tasks_fn)(void);
+static bool ksu_lsm_sync_looked_up;
+
+static __nocfi void ksu_lsm_call_drain(void (*fn)(void))
+{
+    fn();
+}
+
+static void ksu_lsm_hook_drain(void)
+{
+    if (!ksu_lsm_sync_looked_up) {
+        ksu_lsm_sync_rcu_tasks_fn =
+            (void *)find_kernel_symbol_exact("synchronize_rcu_tasks");
+        ksu_lsm_sync_looked_up = true;
+        if (!ksu_lsm_sync_rcu_tasks_fn)
+            pr_warn("lsm_hook: synchronize_rcu_tasks not found, using a delay\n");
+    }
+
+    synchronize_rcu();
+    if (ksu_lsm_sync_rcu_tasks_fn)
+        ksu_lsm_call_drain(ksu_lsm_sync_rcu_tasks_fn);
+    else
+        msleep(50);
 }
 
 int ksu_register_lsm_hook(struct ksu_lsm_hook *hook)

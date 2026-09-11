@@ -97,6 +97,7 @@ struct linux_dirent64 {
 };
 
 #define D_NAME_OFF offsetof(struct linux_dirent64, d_name)
+#define D_RECLEN_OFF offsetof(struct linux_dirent64, d_reclen)
 
 /*
  * One registered path.
@@ -174,6 +175,9 @@ static DEFINE_SPINLOCK(sus_path_buf_lock);
  * counter and the ratelimited log are what makes "the listing did not get
  * filtered" visible instead of just producing a longer listing. */
 static atomic_t n_dirent_rewrite_fail = ATOMIC_INIT(0);
+/* How often a whole chunk turned out to be hidden and had to be answered with a
+ * placeholder record instead of EOF - see sus_path_filter(). */
+static atomic_t n_dirent_all_hidden = ATOMIC_INIT(0);
 
 /* ---- the resolver's own exemption ----
  *
@@ -1797,8 +1801,14 @@ static long sus_path_filter(unsigned long buf, long count)
 
     spin_lock(&sus_path_buf_lock);
 
+    /* uaccess under a spinlock may not fault: if the page is not resident the
+     * copy would sleep right here.  Disabled, a faulting copy simply fails, and
+     * every failure path below answers "no filtering" rather than guessing. */
+    pagefault_disable();
+
     tmp = dirent_tmp;
     if (!tmp) {
+        pagefault_enable();
         spin_unlock(&sus_path_buf_lock);
         return count;
     }
@@ -1870,6 +1880,7 @@ static long sus_path_filter(unsigned long buf, long count)
         offset += reclen;
     }
 
+    pagefault_enable();
     spin_unlock(&sus_path_buf_lock);
 
     if (failed) {
@@ -1878,6 +1889,35 @@ static long sus_path_filter(unsigned long buf, long count)
                             offset, count, written ? written : count);
         if (!written)
             return count;       /* nothing was written back: claim no filtering */
+    }
+
+    /* Everything in this chunk was hidden, and returning 0 here would be read as
+     * end-of-directory: the caller stops, and the visible entries in the next
+     * chunk are never seen at all.
+     *
+     * So one record is left behind as a placeholder - d_ino = 0 with an empty
+     * name.  readdir() skips records whose d_ino is 0 (bionic does), which makes
+     * the caller ask again and reach the entries that do exist; a caller parsing
+     * the buffer by hand sees an entry without a name, which is still better than
+     * a directory that ends early.  The hidden name is gone from the buffer
+     * either way. */
+    if (!failed && count > 0 && written == 0) {
+        unsigned short reclen = 0;
+        u64 zero = 0;
+        char nul = '\0';
+
+        if (!copy_from_user(&reclen, (void __user *)(buf + D_RECLEN_OFF),
+                            sizeof(reclen)) &&
+            reclen >= D_NAME_OFF + 1 && reclen <= count &&
+            !copy_to_user((void __user *)buf, &zero, sizeof(zero)) &&
+            !copy_to_user((void __user *)(buf + D_NAME_OFF), &nul, 1)) {
+            atomic_inc(&n_dirent_all_hidden);
+            return reclen;
+        }
+        /* Could not build the placeholder: filtering would be worse than not
+         * filtering, because the caller would lose the chunk entirely. */
+        atomic_inc(&n_dirent_rewrite_fail);
+        return count;
     }
 
     return written;
@@ -1939,8 +1979,9 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
                    atomic_read(&n_enoent_perm), atomic_read(&n_enoent_dac),
                    atomic_read(&n_enoent_gper), atomic_read(&n_enoent_path));
     n += scnprintf(buf + n, PAGE_SIZE - n,
-                   "dirent: rewrite-fail=%d  pending=%d\n",
+                   "dirent: rewrite-fail=%d  all-hidden=%d  pending=%d\n",
                    atomic_read(&n_dirent_rewrite_fail),
+                   atomic_read(&n_dirent_all_hidden),
                    atomic_read(&sus_path_n_pending));
     /* Everything the pending machinery did, so that "still pending" can be read
      * for what it is: passes/ticks == 0 means the retry never ran at all, walks

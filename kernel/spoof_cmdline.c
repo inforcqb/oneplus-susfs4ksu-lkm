@@ -97,22 +97,19 @@ int susfs_spoof_cmdline_init(void)
 
 void susfs_spoof_cmdline_exit(void)
 {
-	struct retired_str *r, *tmp;
-
-	/* Unpublish before freeing anything. */
+	/* Unpublish - and deliberately free nothing.
+	 *
+	 * /proc/bootconfig is read through seq_puts() with no lock of ours, so a
+	 * reader that already picked up the pointer can still be printing it while
+	 * this runs.  The retired list exists for exactly that reason, and unload is
+	 * not an exception: the module's own memory is going away anyway, so the
+	 * only thing a kfree() here could buy is a use-after-free. */
 	if (spoof_active) {
 		saved_boot_config = orig_boot_config;
 		spoof_active = false;
 		orig_boot_config = NULL;
 	}
-	kfree(fake_boot_config);
 	fake_boot_config = NULL;
-
-	list_for_each_entry_safe(r, tmp, &retired_strs, list) {
-		list_del(&r->list);
-		kfree(r->s);
-		kfree(r);
-	}
 }
 
 /* supercall: CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG */
