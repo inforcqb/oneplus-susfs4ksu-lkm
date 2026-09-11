@@ -1042,7 +1042,7 @@ __attribute__((visibility("hidden"))) int susfs_ih_decide_name(u64 p, int mode)
  * device without panicking, and that has not been narrowed down yet.  The
  * standalone test module, which has none of those layers, works fine.  Set
  * ih_enabled=1 to arm them for debugging. */
-static int ih_enabled;
+static int ih_enabled;	/* 0: patched entries off - see INLINE_HOOK.md */
 module_param(ih_enabled, int, 0644);
 
 static struct {
