@@ -43,7 +43,8 @@
 
 #define IH_TAIL(n)						\
 	IH_RESTORE();						\
-	adrp	x16, susfs_ih_tramp_##n;			`n	add	x16, x16, :lo12:susfs_ih_tramp_##n;			\
+	adrp	x16, susfs_ih_tramp_##n;			
+	add	x16, x16, :lo12:susfs_ih_tramp_##n;			\
 	ldr	x16, [x16];					\
 	br	x16
 
@@ -124,7 +125,8 @@ susfs_ih_stub_##n:;						\
 	ldp	x12, x13, [sp, #96];				\
 	ldp	x14, x15, [sp, #112];				\
 	ldr	x18, [sp, #144];				\
-	adrp	x16, susfs_ih_tramp_##n;			`n	add	x16, x16, :lo12:susfs_ih_tramp_##n;			\
+	adrp	x16, susfs_ih_tramp_##n;			
+	add	x16, x16, :lo12:susfs_ih_tramp_##n;			\
 	ldr	x16, [x16];					\
 	br	x16;						\
 9:;	/* x0 = target's return value */			\
