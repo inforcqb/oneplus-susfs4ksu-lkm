@@ -1144,6 +1144,56 @@ static struct kprobe *sys_path_probes[] = {
     &kp___arm64_sys_execve,
 };
 
+/* KernelSU hooks these by replacing the syscall table entry and calling the
+ * original wrapper from its own hook (kallsyms has ksu_hook_faccessat,
+ * ksu_hook_newfstatat, ksu_hook_execve, ksu_hook_setresuid).  An entry hook on
+ * the wrapper breaks that call - measured:
+ *
+ *     Internal error: Oops - FPAC: 0000000072000000
+ *     pc : __arm64_sys_faccessat+0x2c4/0x848
+ *     lr : ksu_hook_faccessat+0x44/0x58 [kernelsu]
+ *     Kernel panic - not syncing: Oops - FPAC: Fatal exception
+ *
+ * faccessat, faccessat2 and newfstatat have no side effect, so they need no entry
+ * hook at all: sus_path_sys_exit() replaces their answer with ENOENT on the way
+ * out, in a tracepoint that is registered anyway.  execve does have effects and
+ * cannot be undone after the fact, so it keeps a kprobe - a BRK is the kernel's
+ * own mechanism and ksu_hook's call to the original returns normally through it. */
+static struct kprobe *fallback_syscall_probes[] = {
+    &kp___arm64_sys_execve,
+};
+
+#define N_FALLBACK_PROBES ARRAY_SIZE(fallback_syscall_probes)
+static bool fallback_probes_registered[N_FALLBACK_PROBES];
+
+static void sus_path_syscall_fallback_register(void)
+{
+    int i, n = 0;
+
+    for (i = 0; i < N_FALLBACK_PROBES; i++) {
+        if (register_kprobe(fallback_syscall_probes[i])) {
+            pr_warn("sus_path: fallback kprobe(%s) failed\n",
+                    fallback_syscall_probes[i]->symbol_name);
+            continue;
+        }
+        fallback_probes_registered[i] = true;
+        n++;
+    }
+    pr_info("sus_path: %d syscall(s) KernelSU also hooks keep a probe instead\n", n);
+}
+
+static void sus_path_syscall_fallback_unregister(void)
+{
+    int i;
+
+    for (i = 0; i < N_FALLBACK_PROBES; i++) {
+        if (!fallback_probes_registered[i])
+            continue;
+        unregister_kprobe(fallback_syscall_probes[i]);
+        fallback_probes_registered[i] = false;
+    }
+}
+
 /* 32-bit (AArch32) callers.
  *
  * Only the syscalls that need different semantics get their own wrapper: on
@@ -1568,8 +1618,14 @@ static void sus_path_hooks_arm(void)
     }
 
     hooks_armed = true;
-    if (!no_extra)
+    if (!no_extra) {
         sus_path_tracepoint_register();
+    } else {
+        /* no_extra is the isolation switch: with the tracepoint gone, faccessat,
+         * faccessat2 and newfstatat have NO layer at all - they are answered by
+         * sus_path_sys_exit() precisely because KernelSU owns their entries. */
+        pr_warn("sus_path: no_extra - sys_exit rewrite off, faccessat/newfstatat uncovered\n");
+    }
 
     /* Entry-decision and onLeave hooks: patch the entries if we can, otherwise
      * probe them.  Never both - a kprobe owns the first instruction of its
@@ -1584,6 +1640,10 @@ static void sus_path_hooks_arm(void)
          * coverage the moment the inline hooks came up. */
         sus_path_path_register();
         sus_path_compat_register();
+        /* entry-hooked syscalls must not also get a kprobe (a kprobe would write
+         * its BRK over the patched entry).  Only the ones that are deliberately
+         * NOT patched - because KernelSU hooks them - get a probe here. */
+        sus_path_syscall_fallback_register();
     } else {
         sus_path_syscall_register();
         sus_path_path_register();
@@ -1786,12 +1846,28 @@ static struct {
 } ih_table[] = {
 	{ "__arm64_sys_openat",        susfs_ih_stub_openat,        &susfs_ih_tramp_openat },
 	{ "__arm64_sys_openat2",       susfs_ih_stub_openat2,       &susfs_ih_tramp_openat2 },
-	{ "__arm64_sys_newfstatat",    susfs_ih_stub_newfstatat,    &susfs_ih_tramp_newfstatat },
 	{ "__arm64_sys_statx",         susfs_ih_stub_statx,         &susfs_ih_tramp_statx },
-	{ "__arm64_sys_faccessat",     susfs_ih_stub_faccessat,     &susfs_ih_tramp_faccessat },
-	{ "__arm64_sys_faccessat2",    susfs_ih_stub_faccessat2,    &susfs_ih_tramp_faccessat2 },
 	{ "__arm64_sys_readlinkat",    susfs_ih_stub_readlinkat,    &susfs_ih_tramp_readlinkat },
-	{ "__arm64_sys_execve",        susfs_ih_stub_execve,        &susfs_ih_tramp_execve },
+	/* NOT newfstatat, faccessat, faccessat2 or execve.
+	 *
+	 * kallsyms lists ksu_hook_newfstatat, ksu_hook_faccessat, ksu_hook_execve and
+	 * ksu_hook_setresuid (with .cfi_jt entries), all installed by
+	 * ksu_syscall_table_hook(): KernelSU replaces those syscall TABLE entries with
+	 * ksu_syscall_dispatcher and calls the original wrapper from its own hook.
+	 * Patching the wrapper's entry breaks that call - measured:
+	 *
+	 *     Internal error: Oops - FPAC: 0000000072000000
+	 *     pc : __arm64_sys_faccessat+0x2c4/0x848
+	 *     lr : ksu_hook_faccessat+0x44/0x58 [kernelsu]
+	 *     Kernel panic - not syncing: Oops - FPAC: Fatal exception
+	 *
+	 * The same hook covers faccessat and faccessat2, so both are left alone even
+	 * though only the first one was seen to crash.  Neither has a side effect, so
+	 * neither needs an entry hook: sus_path_sys_exit() replaces their answer with
+	 * ENOENT on the way out.  execve has real effects and cannot be undone after
+	 * the fact, so it keeps a kprobe (a BRK is the kernel's own mechanism and
+	 * KernelSU's call to the original returns through it normally) -
+	 * see fallback_syscall_probes[]. */
 	/* onLeave: getname_flags gets no entry decision - the stub lets the original
 	 * run and inspects the struct filename it returned (INLINE_HOOK.md 5.9).
 	 *
@@ -2031,11 +2107,69 @@ static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret)
     long new_count;
     int nr;
 
+    nr = syscall_get_nr(current, regs);
+
+    /* ---- the syscalls KernelSU also hooks: answer them on the way OUT ----
+     *
+     * KernelSU replaces these syscall table entries and calls the original
+     * wrapper from its own hook, so an entry hook here breaks that call:
+     *
+     *     Internal error: Oops - FPAC: 0000000072000000
+     *     pc : __arm64_sys_faccessat+0x2c4/0x848
+     *     lr : ksu_hook_faccessat+0x44/0x58 [kernelsu]
+     *
+     * None of these three has a side effect, so replacing the answer here is
+     * indistinguishable from never running the call - and this tracepoint is
+     * registered anyway for the dirent filter, so it costs a comparison plus the
+     * argument read.  execve is NOT handled this way: it has real effects, so it
+     * is stopped at its entry instead.
+     *
+     * syscall_get_arguments() gives the raw registers, with args[1] being the
+     * original x1 (the pathname) - x0 in regs no longer holds it at exit. */
+    if (!is_compat_task() &&
+        (nr == __NR_faccessat ||
+#ifdef __NR_faccessat2
+         nr == __NR_faccessat2 ||
+#endif
+         nr == __NR_newfstatat)) {
+        const char __user *up;
+        char name[SUS_PATH_LEN];
+        long n;
+
+        if (!READ_ONCE(sus_path_count))
+            return;
+
+        syscall_get_arguments(current, regs, args);
+        up = (const char __user *)args[1];
+        if (!up)
+            return;
+
+        /* Same rule as the dirent filter: a tracepoint runs with preemption
+         * disabled, so a uaccess that has to fault would sleep right here.
+         * Disabled, a non-resident page simply reports -EFAULT and the call is
+         * left alone.  The caller just wrote this string for the syscall, so it
+         * is resident in every ordinary case. */
+        pagefault_disable();
+        n = strncpy_from_user(name, up, sizeof(name) - 1);
+        pagefault_enable();
+
+        if (n <= 0)
+            return;
+        name[n] = '\0';
+
+        if (sus_path_match_path(name)) {
+            atomic_inc(&n_enoent_path);
+            pr_info_ratelimited("sus_path: path hit (sys_exit rewrite) '%s' (uid=%u)\n",
+                                name, current_uid().val);
+            regs->regs[0] = (unsigned long)-ENOENT;   /* was ret, success or EACCES */
+        }
+        return;
+    }
+
     /* 32-bit tasks reach getdents64 through the compat table with a different
      * syscall number, but the dirent64 buffer layout is identical (v5.15 has no
      * compat_filldir64).  The old code returned early for compat tasks, which
      * left 32-bit apps able to list hidden entries for no reason. */
-    nr = syscall_get_nr(current, regs);
     if (is_compat_task()) {
         if (nr != __NR_compat_getdents64)
             return;
@@ -2281,6 +2415,7 @@ void sus_path_exit(void)
 	sus_path_ih_unregister();
     sus_path_cand_unregister();
     sus_path_syscall_unregister();
+    sus_path_syscall_fallback_unregister();
     sus_path_path_unregister();
     sus_path_dac_unregister();
     if (sus_path_perm_hook.entry)
