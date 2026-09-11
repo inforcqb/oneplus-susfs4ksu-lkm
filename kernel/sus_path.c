@@ -56,6 +56,9 @@
 
 #define DIRENT_BUF_SIZE 65536  /* getdents usually returns <= 32-64KB */
 #define SUS_PATH_MAX_ENTRIES 8192
+/* Longest registered path, for the string-level hooks.  256 matches the ABI's
+ * target_pathname field. */
+#define SUS_PATH_LEN 256
 
 /* arm64 compat (32-bit) getdents64.  Not reachable through asm/unistd.h in this
  * build, so spelled out per arch/arm64/include/asm/unistd32.h. */
@@ -88,7 +91,14 @@ struct sus_path_entry {
     u64 dev;
     u64 ino;
     char name[NAME_MAX + 1];
+    /* The path as it was registered, for the string-level hooks below: the
+     * lookup entry points hand us the caller's own path string, not an inode.
+     * Stored without a trailing slash, path_len == strlen(path). */
+    char path[SUS_PATH_LEN];
+    unsigned int path_len;
 };
+
+static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path);
 
 static LIST_HEAD(sus_path_list);
 static DEFINE_SPINLOCK(sus_path_lock);
@@ -182,6 +192,19 @@ module_param(hide_from_apps, int, 0644);
 
 static atomic_t n_enoent_getattr = ATOMIC_INIT(0);
 static atomic_t n_enoent_perm = ATOMIC_INIT(0);
+
+/* Store the registered path for the string-level hooks, without a trailing
+ * slash (so "path/" and "path" both match "path" and "path/child"). */
+static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path)
+{
+    size_t n = strnlen(path, SUS_PATH_LEN - 1);
+
+    while (n > 1 && path[n - 1] == '/')
+        n--;
+    memcpy(e->path, path, n);
+    e->path[n] = '\0';
+    e->path_len = (unsigned int)n;
+}
 
 static bool sus_path_inode_hidden(struct inode *inode)
 {
@@ -400,133 +423,176 @@ static void sus_path_dac_unregister(void)
     }
 }
 
-/* ---- lookup layer ----
+/* ---- path-string layer ----
  *
- * The DAC probes above turn out not to fire on this kernel: a registered 0600
- * root file still answers EACCES on read, which only happens if neither
- * inode_permission() nor generic_permission() is reached - GKI's LTO inlines
- * them into their callers, so the kallsyms entries are just the copies kept for
- * module references.  (That also answers "why not patch a jump instead of using
- * a kprobe": patching those entries would rewrite code nothing executes.)
+ * Measured on this device: inode_permission, generic_permission, walk_component,
+ * lookup_dcache and __lookup_slow all register as kprobes and then never fire.
+ * GKI's full LTO inlines them into their callers, so their kallsyms entries are
+ * only the out-of-line copies kept for module references - which is also the
+ * answer to "why not patch a jump in instead of a kprobe": patching those
+ * entries would rewrite code nothing executes.
  *
- * So the answer has to be produced where upstream produces it - at lookup time,
- * before the target inode is permission-checked at all.  Upstream patches
- * fs/namei.c; an LKM cannot, but it can watch the lookup helpers, and unlike the
- * DAC helpers these are big enough that LTO leaves them alone (each has a symbol
- * and a .cfi_jt entry, verified on the device).
+ * Every hook of ours that does work on this kernel is one that LTO cannot
+ * inline: vfs_open, vfs_getattr, show_map_vma (called through a function
+ * pointer) and __arm64_sys_reboot - i.e. functions called across compilation
+ * units.  The path-resolution entry points are the same kind of citizen, and
+ * they are where the answer has to be produced: before any permission check on
+ * the target, so a hidden directory answers ENOENT instead of EACCES.
  *
- * A hit is rewritten into -ENOENT:
- *   - walk_component()  every component of the path walk, i.e. also the
- *                       directory whose MAY_EXEC check would answer EACCES;
- *   - lookup_dcache()   open's last component;
- *   - __lookup_slow()   the cache-miss path.
+ * They hand us the caller's path STRING (struct filename::name), not an inode,
+ * so matching is string-based: an absolute path that equals a registered path,
+ * or has one as a '/'-terminated prefix.  Upstream matches by inode instead,
+ * which also catches symlinked spellings and relative paths; a relative path is
+ * skipped here because it cannot be compared without the cwd - and reaching one
+ * under a hidden directory requires the directory's MAY_EXEC first, which the
+ * lookup on it does cover.
  *
- * struct nameidata is defined inside fs/namei.c, not in a header, so it cannot
- * be declared here.  It is not needed either: the only field used is the first
- * one, and nameidata has always started with `struct path path`.  Reading that
- * prefix is what keeps this compilable. */
-struct sus_path_nd_prefix {
-    struct path path;
-};
+ *   filename_lookup     stat/access/chdir and friends (kernel-side string)
+ *   do_filp_open        open/openat (kernel-side string)
+ *   user_path_at_empty  the same, one level up, in case the above are inlined
+ *                       into it - takes a __user pointer, read with
+ *                       strncpy_from_user
+ */
+static atomic_t n_enoent_path = ATOMIC_INIT(0);
 
-struct sus_path_walk_args {
-    struct sus_path_nd_prefix *nd;
-};
-
-static int kr_walk_component_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+static bool sus_path_match_path(const char *path)
 {
-    struct sus_path_walk_args *a = (struct sus_path_walk_args *)ri->data;
+    struct sus_path_entry *e;
+    bool hit = false;
 
-    a->nd = (struct sus_path_nd_prefix *)regs->regs[0];
-    return 0;
+    if (!path || path[0] != '/')    /* only absolute paths are comparable */
+        return false;
+    if (!sus_path_gate_uid_ok())
+        return false;
+    if (!READ_ONCE(sus_path_count))
+        return false;
+
+    spin_lock(&sus_path_lock);
+    list_for_each_entry(e, &sus_path_list, list) {
+        unsigned int n = e->path_len;
+
+        if (!n || strncmp(path, e->path, n))
+            continue;
+        if (path[n] == '\0' || path[n] == '/') {
+            hit = true;
+            break;
+        }
+    }
+    spin_unlock(&sus_path_lock);
+    return hit;
 }
 
-/* walk_component() returns 1 with nd->path already moved to the component it
- * resolved, so rewriting that into -ENOENT makes the walk stop here - before
- * the caller's inode_permission() on the parent can answer EACCES. */
-static int kr_walk_component_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+/* Shared tail: count, log (so that "registered" and "reached" can be told
+ * apart, which is exactly what the DAC probes above failed to do), answer
+ * -ENOENT and skip the function. */
+static int kp_path_answer(struct pt_regs *regs, const char *name, bool errptr)
 {
-    struct sus_path_walk_args *a = (struct sus_path_walk_args *)ri->data;
-    struct dentry *d;
-
-    if ((long)regs_return_value(regs) <= 0 || !a->nd)
+    if (!sus_path_match_path(name))
         return 0;
 
-    d = READ_ONCE(a->nd->path.dentry);
-    if (d && sus_path_lookup_hit(READ_ONCE(d->d_inode)))
-        regs_set_return_value(regs, (unsigned long)-ENOENT);
-    return 0;
-}
-
-/* lookup_dcache() and __lookup_slow() return struct dentry *, so they take the
- * ERR_PTR form. */
-static int kr_lookup_dcache_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-    struct dentry *d = (struct dentry *)regs_return_value(regs);
-
-    if (IS_ERR_OR_NULL(d))
-        return 0;
-    if (sus_path_lookup_hit(READ_ONCE(d->d_inode)))
+    atomic_inc(&n_enoent_path);
+    pr_info_ratelimited("sus_path: path hit '%s' (uid=%u)\n",
+                        name, current_uid().val);
+    if (errptr)
         regs_set_return_value(regs, (unsigned long)ERR_PTR(-ENOENT));
-    return 0;
+    else
+        regs_set_return_value(regs, (unsigned long)-ENOENT);
+    regs->pc = regs->regs[30];
+    return 1;
 }
 
-static struct kretprobe krp_walk_component = {
-    .kp.symbol_name = "walk_component",
-    .entry_handler = kr_walk_component_entry,
-    .handler = kr_walk_component_ret,
-    .data_size = sizeof(struct sus_path_walk_args),
-    .maxactive = 64,
+/* filename_lookup(dfd, struct filename *name, ...) and
+ * do_filp_open(dfd, struct filename *pathname, ...): the name is argument 2 in
+ * both, already a kernel string. */
+static int kp_filename_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+    struct filename *f = (struct filename *)regs->regs[1];
+
+    if (!f || !f->name)
+        return 0;
+    return kp_path_answer(regs, f->name, false);
+}
+
+static int kp_filp_open_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+    struct filename *f = (struct filename *)regs->regs[1];
+
+    if (!f || !f->name)
+        return 0;
+    return kp_path_answer(regs, f->name, true);     /* returns struct file * */
+}
+
+/* user_path_at_empty(dfd, const char __user *name, ...) */
+static int kp_user_path_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+    const char __user *uname = (const char __user *)regs->regs[1];
+    char buf[SUS_PATH_LEN];
+    long n;
+
+    if (!uname)
+        return 0;
+    /* Bounded read of the caller's own path.  Fails harmlessly (-EFAULT) if the
+     * page is not there; this is the same uaccess the getdents64 tracepoint
+     * already does in a context that cannot sleep. */
+    n = strncpy_from_user(buf, uname, sizeof(buf) - 1);
+    if (n <= 0)
+        return 0;
+    buf[n] = '\0';
+    return kp_path_answer(regs, buf, false);
+}
+
+static struct kprobe kp_filename_lookup = {
+    .symbol_name = "filename_lookup",
+    .pre_handler = kp_filename_pre,
 };
 
-static struct kretprobe krp_lookup_dcache = {
-    .kp.symbol_name = "lookup_dcache",
-    .handler = kr_lookup_dcache_ret,
-    .maxactive = 64,
+static struct kprobe kp_filp_open = {
+    .symbol_name = "do_filp_open",
+    .pre_handler = kp_filp_open_pre,
 };
 
-static struct kretprobe krp_lookup_slow = {
-    .kp.symbol_name = "__lookup_slow",
-    .handler = kr_lookup_dcache_ret,     /* same return-value rewrite */
-    .maxactive = 64,
+static struct kprobe kp_user_path = {
+    .symbol_name = "user_path_at_empty",
+    .pre_handler = kp_user_path_pre,
 };
 
-static struct kretprobe *lookup_krps[] = {
-    &krp_walk_component,
-    &krp_lookup_dcache,
-    &krp_lookup_slow,
+static struct kprobe *path_probes[] = {
+    &kp_filename_lookup,
+    &kp_filp_open,
+    &kp_user_path,
 };
 
-#define N_LOOKUP_KRPS ARRAY_SIZE(lookup_krps)
-static bool lookup_registered[N_LOOKUP_KRPS];
+#define N_PATH_PROBES ARRAY_SIZE(path_probes)
+static bool path_probes_registered[N_PATH_PROBES];
 
-static void sus_path_lookup_register(void)
+static void sus_path_path_register(void)
 {
     int i;
 
-    for (i = 0; i < N_LOOKUP_KRPS; i++) {
-        int rc = register_kretprobe(lookup_krps[i]);
+    for (i = 0; i < N_PATH_PROBES; i++) {
+        int rc = register_kprobe(path_probes[i]);
 
         if (rc) {
-            pr_warn("sus_path: kretprobe(%s) failed %d\n",
-                    lookup_krps[i]->kp.symbol_name, rc);
+            pr_warn("sus_path: kprobe(%s) failed %d\n",
+                    path_probes[i]->symbol_name, rc);
             continue;
         }
-        lookup_registered[i] = true;
+        path_probes_registered[i] = true;
     }
-    pr_info("sus_path: lookup layer armed (walk_component=%d lookup_dcache=%d __lookup_slow=%d)\n",
-            lookup_registered[0], lookup_registered[1], lookup_registered[2]);
+    pr_info("sus_path: path layer armed (filename_lookup=%d do_filp_open=%d user_path_at_empty=%d)\n",
+            path_probes_registered[0], path_probes_registered[1],
+            path_probes_registered[2]);
 }
 
-static void sus_path_lookup_unregister(void)
+static void sus_path_path_unregister(void)
 {
     int i;
 
-    for (i = 0; i < N_LOOKUP_KRPS; i++) {
-        if (!lookup_registered[i])
+    for (i = 0; i < N_PATH_PROBES; i++) {
+        if (!path_probes_registered[i])
             continue;
-        unregister_kretprobe(lookup_krps[i]);
-        lookup_registered[i] = false;
+        unregister_kprobe(path_probes[i]);
+        path_probes_registered[i] = false;
     }
 }
 
@@ -722,6 +788,7 @@ int sus_path_add_hidden(const char *path)
 	e->inode = inode;
 	ihold(inode);
 	strscpy(e->name, p.dentry->d_name.name, sizeof(e->name));
+	sus_path_entry_set_path(e, path);
 	INIT_LIST_HEAD(&e->list);
 	path_put(&p);
 
@@ -796,10 +863,11 @@ int sus_path_init(void)
      * of ENOENT (see the note above it). */
     sus_path_dac_register();
 
-    /* Plus the lookup layer: the DAC probes above do not fire on this kernel,
-     * and this is the layer that actually answers ENOENT before the DAC check
-     * on a hidden directory can answer EACCES. */
-    sus_path_lookup_register();
+    /* Plus the entry-point layer: the probes above register but never fire on
+     * this kernel (LTO inlines them), and this is the layer that actually
+     * answers ENOENT before the DAC check on a hidden directory can answer
+     * EACCES. */
+    sus_path_path_register();
 
     return 0;
 }
@@ -811,7 +879,7 @@ void sus_path_exit(void)
 
     /* Unregister the hooks FIRST: after this nothing can match, so the entries
      * (and their inode references) can be torn down safely. */
-    sus_path_lookup_unregister();
+    sus_path_path_unregister();
     sus_path_dac_unregister();
     if (sus_path_perm_hook.entry)
         ksu_unregister_lsm_hook(&sus_path_perm_hook);
@@ -898,6 +966,7 @@ void sus_path_supercall(void __user **arg)
      * evict it and let the address be reused. */
     ihold(inode);
     strscpy(e->name, path.dentry->d_name.name, sizeof(e->name));
+    sus_path_entry_set_path(e, info.target_pathname);
     INIT_LIST_HEAD(&e->list);
     path_put(&path);
 
