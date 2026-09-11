@@ -1008,11 +1008,13 @@ __attribute__((visibility("hidden"))) u64 susfs_ih_after_getname(u64 a0, u64 a1,
 	struct filename *f = (struct filename *)ret;
 
 	/* Diagnostic: proves whether the patched entry is reached at all on this
-	 * kernel.  The first few calls are logged in full, the rest are silent. */
+	 * kernel.  That question is not academic - the getname wrapper resolved,
+	 * patched and then never ran, and only this counter showed it.  Three
+	 * lines per insmod is cheap enough to keep. */
 	{
 		static atomic_t calls = ATOMIC_INIT(0);
 
-		if (atomic_inc_return(&calls) <= 10)
+		if (atomic_inc_return(&calls) <= 3)
 			pr_info("sus_path: getname_flags returned %px (name=%s)\n",
 				(void *)f, (!IS_ERR_OR_NULL(f) && f->name) ?
 				f->name : "-");

@@ -196,6 +196,23 @@ STAGE A: PASS
 
 脚本：`t_ihA.sh`（no_extra=1 的最小验证）、`t_ihAll.sh`（逐条 `1..8`）、`t_ihFull.sh`（八条一起）。
 
+**Stage D：最终形状（九条入口，默认参数，全部层都在）**
+
+第 9 条是 `getname_flags` 的 onLeave hook（见 5.11）；隐藏文件用 `0644`（见 5.12）。
+
+| 检查 | 结果 |
+|---|---|
+| 安装 | `inline hooks armed (9 entries patched)`，九条 `hooked` 全成功 |
+| 未被 ih 覆盖的层 | `path layer armed (filename_lookup=1 do_filp_open=1 user_path_at_empty=1)`、`32-bit syscall layer armed (2/7 compat probes)` —— 它们的目标符号不同，继续用 kprobe，不会被 ih 挤掉 |
+| app `cat` / `ls -l` / `stat` / `test -r` / 执行该文件 | 全部 `No such file or directory` / `NOPE`（openat、newfstatat、statx、faccessat、execve 五条入口 + getname 层） |
+| root | `secret`、`7 -rw-r--r--`，完全不受影响 |
+| app 其它路径（`/dev/ptmx`、`ls /system/bin`） | `PTMX_OK` / `LS_OK`，放行路径正常 |
+| 存活 | 8 CPU 全程在线，uptime 连续，ring buffer 里无 `CFI failure` / `BUG` / `WARNING` |
+| 第二条规则 / 卸载再装 | 同一条热路径再来一次仍然正常 |
+| `rmmod` | 干净恢复：app 又能读到 `secret`，`/dev/ptmx` 正常 |
+
+脚本：`t_ihFinal.sh`（默认参数全量）、`t_ihName2.sh`（第 9 条 + 调用计数诊断）、`t_dump.sh` / `t_dump2.sh`（minidump 分析）。
+
 ---
 
 ## 7. 复现方式
@@ -223,10 +240,17 @@ ksud insmod /data/local/tmp/ih_hook_test.ko selftest=0 hook_syscall=1   # 真 ho
   搬迁时必须同时摘掉对应的 kprobe。主模块里的做法：`sus_path_ih_register()` 只要有一条装不上，
   就整体回滚并改走 kprobe（`sus_path_hooks_arm()`）。
 * **这批已经搬完**：8 个 `__arm64_sys_*`（openat / openat2 / newfstatat / statx / faccessat /
-  faccessat2 / readlinkat / execve）现在默认走 inline hook（`ih_enabled=1`）。
-* **还没搬**：`getname` 的 onLeave（stub 先经 trampoline 跑完原函数再回到自己处理结果）、
-  以及 `filename_lookup` / `do_filp_open` / `user_path_at_empty` 三个内核内部入口 ——
-  它们的 stub 已经写好，但没有进 `ih_table[]`，需要各自单独上机验证。
+  faccessat2 / readlinkat / execve）现在默认走 inline hook（`ih_enabled=1`），
+  加上 `getname_flags` 的 onLeave（第 9 条）。
+* **有意留在 kprobe 上的**：`filename_lookup` / `do_filp_open` / `user_path_at_empty`
+  （path 层）与 7 个 `__arm64_compat_sys_*`（32 位层）。它们的目标符号和 ih 那九条不同，
+  不冲突，所以 ih 上线后它们照常注册 kprobe —— 32 位这一层尤其不能丢：32 位调用者的
+  syscall 入口探针读不到用户路径（`-EFAULT`），getname 层才是它们的决策点。
+* **卸载时的原子性**：入口的 8 字节是两次 4 字节写入（`bti c` 与 `b stub`）。目前
+  `ksu_patch_text` 的 `stop_machine` 让"同时执行"不可能发生，但一个 CPU 恰好停在
+  entry 的 4 字节中间被停住时，恢复后可能只执行第二条。彻底的做法是分两阶段写
+  （装：先写 `b stub` 再写 `bti c`；卸：先写回 `orig[0]` 再写回 `orig[1]`），
+  每一步之后各自跨核 flush，两个中间态都是可正确执行的组合。
 * 性能对比：有/无 hook 的基准（kprobe 的实际开销尚未量化）。
 ### 5.6 cpp 会把宏参数字符串化（本来只是 mov 的立即数）
 
@@ -296,3 +320,81 @@ LR。命中隐藏的路径**没事**，因为 `IH_HIDE()` 一直都恢复了 x30
 * **热入口会把任何微小错误放大成崩溃**。同样一段 stub 挂在只调用一次的模块内函数上跑一万遍
   也不会有事，挂在 openat 上第一个毫秒就炸 —— 所以冷路径自测通过**不能**作为热路径可用的证据，
   隔离测试必须用真的热入口（`ih_only=1` 就是为此而留）。
+
+### 5.9 `on_each_cpu` 不是符号，于是"跨核 flush"空转了一整个版本
+
+代码写的是：
+
+```c
+pfn_on_each_cpu = find_kernel_symbol_exact("on_each_cpu");
+...
+if (!rc && pfn_on_each_cpu) { ...; pfn_on_each_cpu(susfs_ih_remote_flush, NULL, 1); }
+```
+
+5.15 的 `include/linux/smp.h` 里 `on_each_cpu()` 是 **static inline** 包一层
+`on_each_cpu_cond_mask()`，**kallsyms 里根本没有这个符号**，所以解析永远返回 NULL，
+`if` 永远不成立，跨核 flush 从加进去那天起就没执行过 —— 表现却是"看起来一切正常"：
+只有 `ksu_patch_text` 的本核 flush 在起作用，其它核继续跑各自 I-cache 里的旧指令
+（这甚至"侥幸安全"：它们看不到半更新的指令流）。
+
+三条修正，缺一不可：
+
+1. 用真实符号 `smp_call_function`（内核确有导出），它跑**其它** CPU，本核由调用者自己刷；
+2. `susfs_ih_ready()` 把它列为**必需** —— 解析不到就安装失败，而不是静默降级成单核 flush；
+3. **给调用它的函数加 `__nocfi`**（见 5.10）。
+
+### 5.10 CFI failure：通过函数指针调用解析来的符号
+
+修完 5.9 立刻吃到第一个 panic：
+
+```
+susfs_ih_install+0x2c0/0x4f4 [susfs_guard_lkm]
+Kernel panic - not syncing: CFI failure (target: smp_call_function+0x0/0x8c)
+```
+
+`susfs_ih_flush_range_remote()` 通过函数指针调 `smp_call_function`，但没标 `__nocfi`：
+kCFI 在该间接调用点校验目标前的类型哈希，而 `pfn_smp_call_function` 的类型是
+`void (*)(...)`、真身是 `int (*)(...)`，哈希对不上 → panic。**这条路径以前从没执行过**
+（5.9 的 `if` 恒假），所以从来没暴露。
+
+**规则**：凡是"用解析出来的内核符号地址作函数指针调用"的函数都要 `__nocfi`（`susfs_ih_init_impl`、
+`build_tramp`、`write`、`install_impl`、`uninstall_impl`、`flush_range_remote` 全部如此）。
+反向的一条同样重要：**内核回调我们的函数**（`smp_call_function(func, ...)` 里的 `func`）
+**不能**标 `__nocfi` —— 那样模块函数就没有类型哈希，内核在它的间接调用点上会读到垃圾而 panic。
+回调签名必须与内核期望的类型一致（`void (*)(void *)`）。
+
+顺带：`set_memory_*`、`module_alloc`、`synchronize_rcu_tasks` 在本内核 kallsyms 里都存在
+（`on_each_cpu` 是唯一的例外），`synchronize_rcu_tasks` 用于卸载时的在途宽限。
+
+### 5.11 符号存在 ≠ 会被执行：`getname` 与 `getname_flags`
+
+把 getname 的 onLeave hook 接上去之后：安装成功、设备不崩、`after-handler` 的命中计数**恒为 0**，
+app 拿到的还是 LSM/DAC 层的 `EACCES`。原因是 5.15 的
+
+```c
+struct filename *getname(const char __user *filename)
+{ return getname_flags(filename, 0, NULL); }
+```
+
+在 LTO 下被内联进调用者，`getname` 这个符号在 kallsyms 里存在、但**没有任何调用点**，
+patch 它等于 patch 一段死代码。真正执行的是 `getname_flags`（kallsyms 地址 `...c0614`，
+非页对齐，正是函数本体而非 `.cfi_jt` 桩）。
+
+诊断手段值得保留：在 after-handler 里对前几次调用无条件打印返回值与 `f->name`，
+一眼就能区分"没被执行"和"执行了但没命中"：
+
+```
+sus_path: getname_flags returned ffffff80072be000 (name=/data/user/0/.../msf_lifecycle_monitor.xml)
+```
+
+换成 `getname_flags` 之后立刻命中：`uid 10123` 的 `cat` 得到 `No such file or directory`，
+root 照常读到内容。
+
+**教训**：这条内核上"入口是否真的被执行"必须实测（LTO 把 stderr 里的直觉全推翻了，
+`inode_permission`/`generic_permission`/`walk_component`/`do_filp_open` 都是同一类符号）。
+
+### 5.12 测试文件权限会掩盖结论
+
+同一个 getname hook，隐藏文件是 `0600` 时 app 得到 `EACCES`（内核自己的 DAC 检查在
+`security_inode_permission()` **之前**就拒了），是 `0644` 时才轮到我们的层说话、给出 `ENOENT`。
+所以"onLeave 层是否生效"这类验证**必须用 DAC 放行的权限**（0644），否则看到的是 DAC 的答案。
