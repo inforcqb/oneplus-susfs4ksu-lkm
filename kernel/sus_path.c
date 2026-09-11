@@ -603,10 +603,19 @@ static int kp_sys_path_answer(struct pt_regs *regs, int argno)
     n = strncpy_from_user(buf, (const char __user *)up, sizeof(buf) - 1);
     /* Diagnostic for the 32-bit path: without it, "the wrapper never ran" and
      * "it ran but the path could not be read" look identical from outside. */
-    if (is_compat_task())
-        pr_info_ratelimited("sus_path: compat read=%ld reg=%#lx up=%#lx '%s'\n",
-                            n, reg, (unsigned long)up,
-                            n > 0 ? buf : "(unreadable)");
+    if (is_compat_task()) {
+        char probe[16];
+        unsigned char first = 0;
+        int rc_copy = copy_from_user(probe, up, sizeof(probe));
+        int rc_byte = get_user(first, (unsigned char __user *)up);
+
+        pr_info_ratelimited("sus_path: compat r0=%#lx r1=%#lx r2=%#lx r3=%#lx up=%#lx copy=%d get_user=%d byte=%#x strncpy=%ld\n",
+                            (unsigned long)uregs->regs[0],
+                            (unsigned long)uregs->regs[1],
+                            (unsigned long)uregs->regs[2],
+                            (unsigned long)uregs->regs[3],
+                            (unsigned long)up, rc_copy, rc_byte, first, n);
+    }
     if (n <= 0)
         return 0;
     buf[n] = '\0';
