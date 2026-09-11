@@ -128,6 +128,10 @@ struct sus_path_entry {
      * one pass from retrying the same unresolved rule over and over, without
      * having to hold a pointer across the sleepable kern_path(). */
     unsigned int pass;
+    /* This rule is one of the module's own control nodes (/proc/susfs_*): hide
+     * it from every non-root caller, not only from apps - see
+     * sus_path_entry_gate(). */
+    bool self_protect;
 };
 
 static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path);
@@ -273,6 +277,62 @@ static atomic_t sus_path_pend_lost = ATOMIC_INIT(0);        /* walk ok, rule gon
 static atomic_t sus_path_pend_last_rc = ATOMIC_INIT(0);     /* last walk result */
 static atomic_t sus_path_pend_logged_rc = ATOMIC_INIT(1);   /* rc already reported */
 
+/* ---- gates ----
+ *
+ * Defined up here because every decision layer below - the dirent filter, the
+ * inode lookups and the path-string matcher - has to ask the same question. */
+
+/* UID half of the upstream gate.  Separate because the getdents64 tracepoint
+ * only has an inode NUMBER, not an inode, so it cannot apply the ownership
+ * check in sus_path_gate_ok(). */
+static inline bool sus_path_gate_uid_ok(void)
+{
+    if (!hide_from_apps)
+        return true;
+    return current_uid().val >= 10000;
+}
+
+/* Full upstream gate for the LSM layer: an app process, and the file is not
+ * owned by the caller (upstream is_i_uid_not_allowed()).
+ *
+ * hide_from_apps=0 must bypass the WHOLE gate, ownership check included -
+ * otherwise a root-owned file would still be skipped for root (0 != 0 is false)
+ * and disabling the gate would silently do nothing for exactly the case it is
+ * meant for. */
+static inline bool sus_path_gate_ok(struct inode *inode)
+{
+    if (!hide_from_apps)
+        return true;
+    if (current_uid().val < 10000)
+        return false;
+    return current_uid().val != inode->i_uid.val;
+}
+
+/* Per-rule gate.
+ *
+ * A rule flagged self_protect is one of this module's own control nodes.  Those
+ * have to be invisible to EVERY non-root caller, not just to apps: the ordinary
+ * gate is uid >= 10000, so a probe running as system (1000) or shell (2000)
+ * would read /proc/susfs_kstat straight out of the listing - exactly the trace
+ * this module exists to avoid.  Root keeps access so the operator can manage the
+ * module.
+ *
+ * Ordinary rules keep the upstream semantics untouched. */
+static inline bool sus_path_entry_gate(const struct sus_path_entry *e)
+{
+    if (e->self_protect)
+        return current_uid().val != 0;
+    return sus_path_gate_uid_ok();
+}
+
+static inline bool sus_path_entry_gate_inode(const struct sus_path_entry *e,
+                                             struct inode *inode)
+{
+    if (e->self_protect)
+        return current_uid().val != 0;
+    return sus_path_gate_ok(inode);
+}
+
 static bool sus_path_is_hidden(u64 ino, const char *name)
 {
     struct sus_path_entry *e;
@@ -293,7 +353,8 @@ static bool sus_path_is_hidden(u64 ino, const char *name)
     if (ino) {
         spin_lock(&sus_path_lock);
         list_for_each_entry(e, &sus_path_list, list) {
-            if (e->ino && e->ino == ino && !strcmp(e->name, name)) {
+            if (e->ino && e->ino == ino && !strcmp(e->name, name) &&
+                sus_path_entry_gate(e)) {
                 hidden = true;
                 break;
             }
@@ -648,7 +709,7 @@ static bool sus_path_inode_hidden(struct inode *inode)
 
     spin_lock(&sus_path_lock);
     list_for_each_entry(e, &sus_path_list, list) {
-        if (e->inode == inode) {
+        if (e->inode == inode && sus_path_entry_gate_inode(e, inode)) {
             hidden = true;
             break;
         }
@@ -658,31 +719,8 @@ static bool sus_path_inode_hidden(struct inode *inode)
     return hidden;
 }
 
-/* UID half of the upstream gate.  Separate because the getdents64 tracepoint
- * only has an inode NUMBER, not an inode, so it cannot apply the ownership
- * check below. */
-static inline bool sus_path_gate_uid_ok(void)
-{
-    if (!hide_from_apps)
-        return true;
-    return current_uid().val >= 10000;
-}
-
-/* Full upstream gate for the LSM layer: an app process, and the file is not
- * owned by the caller (upstream is_i_uid_not_allowed()).
- *
- * hide_from_apps=0 must bypass the WHOLE gate, ownership check included -
- * otherwise a root-owned file would still be skipped for root (0 != 0 is false)
- * and disabling the gate would silently do nothing for exactly the case it is
- * meant for. */
-static inline bool sus_path_gate_ok(struct inode *inode)
-{
-    if (!hide_from_apps)
-        return true;
-    if (current_uid().val < 10000)
-        return false;
-    return current_uid().val != inode->i_uid.val;
-}
+/* The gates live near the top of the file (see "---- gates ----"): every
+ * decision layer needs them. */
 
 static int sus_path_inode_getattr(const struct path *path)
 {
@@ -691,7 +729,7 @@ static int sus_path_inode_getattr(const struct path *path)
 
     if (path && path->dentry) {
         inode = d_inode(path->dentry);
-        if (sus_path_inode_hidden(inode) && sus_path_gate_ok(inode)) {
+        if (sus_path_inode_hidden(inode)) {
             atomic_inc(&n_enoent_getattr);
             return -ENOENT;
         }
@@ -705,7 +743,7 @@ static int sus_path_inode_permission(struct inode *inode, int mask)
 {
     int (*orig)(struct inode *, int) = (void *)sus_path_perm_hook.original;
 
-    if (sus_path_inode_hidden(inode) && sus_path_gate_ok(inode)) {
+    if (sus_path_inode_hidden(inode)) {
         atomic_inc(&n_enoent_perm);
         return -ENOENT;
     }
@@ -755,7 +793,7 @@ static bool sus_path_lookup_hit(struct inode *inode)
 {
     if (!inode)
         return false;
-    return sus_path_inode_hidden(inode) && sus_path_gate_ok(inode);
+    return sus_path_inode_hidden(inode);
 }
 
 /* 5.15 signature: inode_permission(struct user_namespace *mnt_userns,
@@ -900,8 +938,9 @@ static bool sus_path_match_path(const char *path)
 
     if (!path || path[0] != '/')    /* only absolute paths are comparable */
         return false;
-    if (!sus_path_gate_uid_ok())
-        return false;
+    /* No gate here: the per-rule gate is applied below, once we know WHICH rule
+     * matched - our own control nodes are hidden from every non-root caller,
+     * while ordinary rules keep the uid>=10000 rule. */
     if (!READ_ONCE(sus_path_count))
         return false;
 
@@ -912,6 +951,8 @@ static bool sus_path_match_path(const char *path)
         if (!n || strncmp(path, e->path, n))
             continue;
         if (path[n] == '\0' || path[n] == '/') {
+            if (!sus_path_entry_gate(e))
+                continue;
             hit = true;
             break;
         }
@@ -1206,6 +1247,39 @@ static void sus_path_syscall_unregister(void)
  * then leak, so the original is released with putname() first.  When getname()
  * merely forwards getname_flags()' result, the inner probe has already done
  * this and the outer one sees ERR_PTR and stops. */
+/* ---- what a hidden path is rewritten to ----
+ *
+ * Upstream's namei patch makes the kernel re-look-up a name that cannot exist
+ * (kernel_patches/fs/susfs.c:45, susfs_fake_qstr_name = QSTR_INIT("..5.u.S", 7),
+ * "used to re-test the dcache lookup") instead of faking an error, and the same
+ * reasoning applies here:
+ *
+ *   - the object handed back stays a valid struct filename, so a caller that
+ *     passes it on without an IS_ERR() of its own - do_linkat() gives getname()'s
+ *     result straight to filename_lookup(), fs/namei.c:4608 - never meets an
+ *     error pointer it did not expect.  Getting this wrong is what took the
+ *     device down once (pc kp_filename_pre+0x1c, x8 = fffffffffffffffe);
+ *   - the ENOENT then comes from the ordinary lookup, at the point where the
+ *     kernel itself decides the file does not exist, so no layer is left
+ *     half-answered;
+ *   - nothing needs putname(): the caller releases the filename as usual.
+ *
+ * A compile-time constant is all that is needed: nothing has to be computed, the
+ * kernel only has to look the name up and fail.  Shaped like an ordinary
+ * temporary file, and deliberately NOT upstream's literal - "..5.u.S" is a
+ * marker anyone can grep a running kernel for, and a per-path value would buy
+ * nothing that this does not already have. */
+#define SUS_PATH_FAKE_NAME ".x7f3a9c21"
+
+/* Called from the getname layers on a hit, with the filename the kernel just
+ * built: the object keeps its identity and its ownership, only the name it
+ * points at changes.  The replacement is a string literal, so it outlives the
+ * filename (which the caller frees with putname()) and owns nothing. */
+static void sus_path_spoof_name(struct filename *f)
+{
+	f->name = SUS_PATH_FAKE_NAME;
+}
+
 static int kr_getname_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     struct filename *f = (struct filename *)regs_return_value(regs);
@@ -1218,8 +1292,7 @@ static int kr_getname_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
     atomic_inc(&n_enoent_path);
     pr_info_ratelimited("sus_path: getname hit '%s' (uid=%u)\n",
                         f->name, current_uid().val);
-    putname(f);
-    regs_set_return_value(regs, (unsigned long)ERR_PTR(-ENOENT));
+    sus_path_spoof_name(f);
     return 0;
 }
 
@@ -1413,7 +1486,6 @@ extern void susfs_ih_stub_filename_lookup(void);
 extern void susfs_ih_stub_do_filp_open(void);
 extern void susfs_ih_stub_user_path_at_empty(void);
 extern void susfs_ih_stub_getname(void);
-extern void susfs_ih_stub_getname(void);
 extern u64 susfs_ih_tramp_openat;
 extern u64 susfs_ih_tramp_openat2;
 extern u64 susfs_ih_tramp_newfstatat;
@@ -1445,8 +1517,12 @@ extern u64 susfs_ih_tramp_getname;
  * value replaces it - which is how a kretprobe's job is done with a patched
  * entry.
  *
- * On a hit the freshly allocated struct filename must be released first
- * (putname), otherwise it leaks; every caller already checks IS_ERR. */
+ * On a hit the filename is NOT replaced with an error pointer: it keeps being a
+ * perfectly good struct filename, only pointing at a name that cannot exist (see
+ * sus_path_spoof_name).  Callers that pass the object on without looking - and
+ * do_linkat() really does hand getname()'s result straight to
+ * filename_lookup() - then just get the ENOENT they asked for from the normal
+ * lookup path, instead of exposing every downstream hook to an error pointer. */
 __attribute__((visibility("hidden"))) u64 susfs_ih_after_getname(u64 a0, u64 a1, u64 ret)
 {
 	struct filename *f = (struct filename *)ret;
@@ -1459,8 +1535,8 @@ __attribute__((visibility("hidden"))) u64 susfs_ih_after_getname(u64 a0, u64 a1,
 	pr_info_ratelimited("sus_path: getname hit '%s' (uid=%u)\n",
 			    f->name, current_uid().val);
 	atomic_inc(&n_enoent_path);
-	putname(f);
-	return (u64)(unsigned long)ERR_PTR(-ENOENT);
+	sus_path_spoof_name(f);
+	return ret;
 }
 
 /* Called from the syscall stubs: x0 is the wrapper's pt_regs, argno the register
@@ -1474,7 +1550,10 @@ __attribute__((visibility("hidden"))) int susfs_ih_decide(u64 uregs_arg, int arg
 
 	if (!uregs || argno < 0 || argno > 5)
 		return 0;
-	if (!sus_path_gate_uid_ok())
+	/* Root is never hidden; for everyone else the per-rule gate decides (it has
+	 * to, because our own control nodes are hidden from all non-root callers,
+	 * not just from apps). */
+	if (!current_uid().val)
 		return 0;
 
 	up = (const char __user *)uregs->regs[argno];
@@ -1510,7 +1589,7 @@ __attribute__((visibility("hidden"))) int susfs_ih_decide_name(u64 p, int mode)
 	char buf[SUS_PATH_LEN];
 	long n;
 
-	if (!p || !sus_path_gate_uid_ok())
+	if (!p || !current_uid().val)
 		return 0;
 
 	if (mode == 0) {
@@ -1732,10 +1811,9 @@ static long sus_path_filter(unsigned long buf, long count)
         name[nlen] = 0;
 
         hide = sus_path_is_hidden((u64)d.d_ino, name);
-        /* Same gate as the LSM layer, otherwise listing and open would disagree
-         * (upstream's filldir64 also goes through susfs_is_inode_sus_path). */
-        if (hide && !sus_path_gate_uid_ok())
-            hide = false;
+        /* No gate here any more: sus_path_is_hidden() applies the per-rule gate
+         * itself (and has to, or the module's own /proc nodes would still show
+         * up for uid 1000/2000). */
 
         if (hide) {
             /* Dropped.  Every record after it moves down by its length, so the
@@ -1865,7 +1943,7 @@ module_param_cb(hide_list, &sus_path_list_ops, NULL, 0400);
  * Same entry shape and the same ihold discipline as sus_path_supercall(): the
  * inode pointer is what the LSM layer matches on, and it must outlive
  * path_put() below or the address could be recycled. */
-int sus_path_add_hidden(const char *path)
+static int sus_path_add_hidden_ex(const char *path, bool self_protect)
 {
 	struct path p;
 	struct inode *inode;
@@ -1892,6 +1970,7 @@ int sus_path_add_hidden(const char *path)
 	e->ino = (u64)inode->i_ino;
 	e->inode = inode;
 	e->pass = 0;
+	e->self_protect = self_protect;
 	ihold(inode);
 	strscpy(e->name, p.dentry->d_name.name, sizeof(e->name));
 	sus_path_entry_set_path(e, path);
@@ -1921,9 +2000,23 @@ int sus_path_add_hidden(const char *path)
 	sus_path_count++;
 	spin_unlock(&sus_path_lock);
 
-	pr_info("sus_path: hidden (built-in) '%s'\n", path);
+	pr_info("sus_path: hidden (built-in) '%s'%s\n", path,
+		self_protect ? " (self-protected: hidden from every non-root caller)" : "");
 	sus_path_hooks_arm();
 	return 0;
+}
+
+/* Register one of the module's own control nodes.  Same table, but the rule is
+ * flagged so the gate hides it from every non-root caller rather than only from
+ * apps - see sus_path_entry_gate(). */
+int sus_path_add_self_hidden(const char *path)
+{
+	return sus_path_add_hidden_ex(path, true);
+}
+
+int sus_path_add_hidden(const char *path)
+{
+	return sus_path_add_hidden_ex(path, false);
 }
 
 /* Whether the path-based layer actually installed.  Both hooks must be patched:

@@ -37,7 +37,12 @@
  * to create them for hand configuration; they are then also registered in
  * sus_path (see susfs_self_hide_nodes), which still hides stat/open for callers
  * DAC would allow. */
-bool susfs_expose_proc;
+/* Default ON: the nodes are this module's interface, and they are protected by
+ * sus_path (every non-root caller sees ENOENT).  They are only created when the
+ * LSM layer that does the hiding is installed, so an unprotected node cannot
+ * happen; expose_proc=0 removes them entirely for operators who want nothing
+ * under /proc at all. */
+bool susfs_expose_proc = true;
 module_param_named(expose_proc, susfs_expose_proc, bool, 0600);
 
 /* Our own control nodes.  Hidden from app processes by sus_path below. */
@@ -65,7 +70,7 @@ static void susfs_self_hide_nodes(void)
         return;
 
     for (i = 0; i < ARRAY_SIZE(susfs_self_hide_paths); i++) {
-        int rc = sus_path_add_hidden(susfs_self_hide_paths[i]);
+        int rc = sus_path_add_self_hidden(susfs_self_hide_paths[i]);
 
         if (rc)
             pr_warn("susfs_guard_lkm: self-hide %s failed %d\n",

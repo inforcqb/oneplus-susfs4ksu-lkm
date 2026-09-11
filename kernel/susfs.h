@@ -20,9 +20,18 @@ static inline bool susfs_abi_path_ok(const char *field, size_t size)
  * Used to self-hide the /proc control nodes.  Returns 0 or a negative errno. */
 int sus_path_add_hidden(const char *path);
 
-/* Whether the /proc/susfs_* control nodes are created at all.  They are hidden
- * from apps by sus_path either way; this only decides whether they exist for
- * root.  Defined in susfs_main.c. */
+/* Same, for one of this module's own control nodes: the rule is flagged so the
+ * gate hides it from EVERY non-root caller, not merely from apps (uid>=10000).
+ * Without that, a probe running as system (1000) or shell (2000) reads the node
+ * name straight out of /proc - see sus_path_entry_gate(). */
+int sus_path_add_self_hidden(const char *path);
+
+/* Whether the /proc/susfs_* control nodes are created at all.  Defaults to TRUE:
+ * the nodes are the module's own interface, and sus_path hides them from every
+ * non-root caller (ENOENT, not EACCES).  They are only created when the LSM
+ * layer that does the hiding is actually installed, so nobody can end up with an
+ * unprotected control node; expose_proc=0 removes them entirely.
+ * Defined in susfs_main.c. */
 extern bool susfs_expose_proc;
 
 /* feature init/exit (each feature is its own translation unit) */
