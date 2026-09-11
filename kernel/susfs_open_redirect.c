@@ -695,7 +695,7 @@ static int or_add(const char *target, const char *redirected, int scheme)
 	struct sus_or_entry *e;
 	struct path tp, rp;
 	struct inode *ti, *ri;
-	int rc, i;
+	int rc;
 
 	/* upstream susfs.c:792-796 */
 	if (scheme < UID_NON_APP_PROC || scheme > UID_UMOUNTED_PROC)
