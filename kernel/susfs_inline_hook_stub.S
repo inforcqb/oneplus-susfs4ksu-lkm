@@ -61,6 +61,7 @@
 #define IH_TAIL(n)						\
 	IH_RESTORE_ARGS();					\
 	IH_TRAMP_ADDR(n);					\
+	add	sp, sp, #192;\
 	br	x16
 
 /* hit path: leave with ENOENT instead of running the original */
