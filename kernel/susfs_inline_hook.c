@@ -38,17 +38,23 @@ static void *(*pfn_module_alloc)(unsigned long size);
 static int (*pfn_set_memory_ro)(unsigned long addr, int numpages);
 static int (*pfn_set_memory_rw)(unsigned long addr, int numpages);
 static int (*pfn_set_memory_x)(unsigned long addr, int numpages);
-static void (*pfn_on_each_cpu)(void (*func)(void *), void *info, int wait);
+static int (*pfn_smp_call_function)(void (*func)(void *), void *info, int wait);
 static void (*pfn_sync_rcu_tasks)(void);
 
-/* on_each_cpu is part of the contract, not a bonus: without it only the patching
- * CPU would drop its stale I-cache lines and the other cores would keep running
- * the old - or a half-updated - instruction stream.  A missing helper must fail
- * the install instead of silently degrading. */
+/* The cross-CPU flush is part of the contract, not a bonus: without it only the
+ * patching CPU would drop its stale I-cache lines and the other cores would keep
+ * running the old - or a half-updated - instruction stream.  A missing helper
+ * must fail the install instead of silently degrading.
+ *
+ * Note the symbol: on_each_cpu() is a static inline wrapper in 5.15's smp.h, so
+ * it is NOT in kallsyms - resolving it always failed, which is exactly how this
+ * flush spent a release doing nothing.  smp_call_function() is a real exported
+ * function and runs the callback on every other CPU; this CPU is handled
+ * directly by the caller. */
 bool susfs_ih_ready(void)
 {
 	return pfn_module_alloc && pfn_set_memory_ro && pfn_set_memory_rw &&
-	       pfn_set_memory_x && pfn_on_each_cpu;
+	       pfn_set_memory_x && pfn_smp_call_function;
 }
 
 /* __nocfi on every function that reaches a resolved kernel symbol through a
@@ -60,14 +66,14 @@ static __nocfi int susfs_ih_init_impl(void)
 	pfn_set_memory_ro = (void *)find_kernel_symbol_exact("set_memory_ro");
 	pfn_set_memory_rw = (void *)find_kernel_symbol_exact("set_memory_rw");
 	pfn_set_memory_x = (void *)find_kernel_symbol_exact("set_memory_x");
-	pfn_on_each_cpu = (void *)find_kernel_symbol_exact("on_each_cpu");
+	pfn_smp_call_function = (void *)find_kernel_symbol_exact("smp_call_function");
 	pfn_sync_rcu_tasks = (void *)find_kernel_symbol_exact("synchronize_rcu_tasks");
 
 	if (!susfs_ih_ready()) {
-		pr_warn("susfs_ih: helpers missing (alloc=%d ro=%d rw=%d x=%d each_cpu=%d)\n",
+		pr_warn("susfs_ih: helpers missing (alloc=%d ro=%d rw=%d x=%d call_fn=%d)\n",
 			!!pfn_module_alloc, !!pfn_set_memory_ro,
 			!!pfn_set_memory_rw, !!pfn_set_memory_x,
-			!!pfn_on_each_cpu);
+			!!pfn_smp_call_function);
 		return -ENOENT;
 	}
 	return 0;
@@ -101,8 +107,10 @@ static void susfs_ih_flush_range_remote(unsigned long lo, unsigned long hi)
 {
 	struct ih_flush_range r = { lo, hi };
 
-	if (pfn_on_each_cpu)
-		pfn_on_each_cpu(susfs_ih_remote_flush, &r, 1);
+	if (!pfn_smp_call_function)
+		return;
+	pfn_smp_call_function(susfs_ih_remote_flush, &r, 1);
+	susfs_ih_remote_flush(&r);	/* smp_call_function skips this CPU */
 }
 
 static void susfs_ih_flush_icache(void *addr, unsigned long len)
@@ -179,8 +187,9 @@ static __nocfi int susfs_ih_write(unsigned long entry, const void *src,
 					KSU_PATCH_TEXT_FLUSH_DCACHE);
 
 		if (!rc) {
-			/* on_each_cpu() runs the callback in IRQ context, where the
-			 * range has to come from the info pointer. */
+			/* smp_call_function() runs the callback on the other CPUs
+			 * in IRQ context, where the range has to come from the
+			 * info pointer. */
 			susfs_ih_flush_range_remote(entry, entry + len);
 		}
 		return rc;
