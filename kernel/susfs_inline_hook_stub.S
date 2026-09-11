@@ -64,6 +64,11 @@
 	mov	x0, #-2;	/* -ENOENT */			\
 	ret
 
+.hidden susfs_ih_decide
+.hidden susfs_ih_decide_name
+.hidden susfs_ih_after_getname
+.hidden susfs_ih_get_tramp
+
 	.text
 
 /* syscall wrappers: x0 is the pt_regs to read the user pointer from, argno the
