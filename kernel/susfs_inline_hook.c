@@ -37,6 +37,7 @@ static void *(*pfn_module_alloc)(unsigned long size);
 static int (*pfn_set_memory_ro)(unsigned long addr, int numpages);
 static int (*pfn_set_memory_rw)(unsigned long addr, int numpages);
 static int (*pfn_set_memory_x)(unsigned long addr, int numpages);
+static void (*pfn_on_each_cpu)(void (*func)(void *), void *info, int wait);
 
 bool susfs_ih_ready(void)
 {
@@ -53,6 +54,7 @@ static __nocfi int susfs_ih_init_impl(void)
 	pfn_set_memory_ro = (void *)find_kernel_symbol_exact("set_memory_ro");
 	pfn_set_memory_rw = (void *)find_kernel_symbol_exact("set_memory_rw");
 	pfn_set_memory_x = (void *)find_kernel_symbol_exact("set_memory_x");
+	pfn_on_each_cpu = (void *)find_kernel_symbol_exact("on_each_cpu");
 
 	if (!susfs_ih_ready()) {
 		pr_warn("susfs_ih: helpers missing (alloc=%d ro=%d rw=%d x=%d)\n",
@@ -66,6 +68,18 @@ static __nocfi int susfs_ih_init_impl(void)
 int susfs_ih_init(void)
 {
 	return susfs_ih_init_impl();
+}
+
+static unsigned long ih_flush_lo, ih_flush_hi;
+
+/* ksu_patch_text only flushes the CPU that ran it, which is fine for the data it
+ * was written for (hook-table pointers) but not for code: another core can keep
+ * executing the old or a half-updated instruction stream.  Every core now flushes
+ * for itself after the write. */
+static void susfs_ih_remote_flush(void *unused)
+{
+	caches_clean_inval_pou(ih_flush_lo, ih_flush_hi);
+	isb();
 }
 
 static void susfs_ih_flush_icache(void *addr, unsigned long len)
@@ -128,10 +142,19 @@ static __nocfi void *susfs_ih_build_tramp(unsigned long entry, const u32 *orig)
 static __nocfi int susfs_ih_write(unsigned long entry, const void *src,
 				  size_t len, bool core_text)
 {
-	if (core_text)
-		return ksu_patch_text((void *)entry, (void *)src, len,
-				      KSU_PATCH_TEXT_FLUSH_ICACHE |
-				      KSU_PATCH_TEXT_FLUSH_DCACHE);
+	if (core_text) {
+		int rc = ksu_patch_text((void *)entry, (void *)src, len,
+					KSU_PATCH_TEXT_FLUSH_ICACHE |
+					KSU_PATCH_TEXT_FLUSH_DCACHE);
+
+		if (!rc && pfn_on_each_cpu) {
+			ih_flush_lo = entry;
+			ih_flush_hi = entry + len;
+			wmb();
+			pfn_on_each_cpu(susfs_ih_remote_flush, NULL, 1);
+		}
+		return rc;
+	}
 
 	/* Our own module text: read-only, so unlock, write, re-lock. */
 	if (pfn_set_memory_rw(entry & PAGE_MASK, 1))

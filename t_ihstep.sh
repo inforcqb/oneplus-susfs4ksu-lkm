@@ -14,6 +14,7 @@ D=/data/local/tmp/dac_probe
 T=$D/f600
 KT=/data/adb/ksu/bin/ksu_susfs
 N=${1:-1}
+NOE=${2:-0}
 
 confirm() {
 	printf '\n========================================\n%s\n' "$1"
@@ -36,7 +37,7 @@ show() {
 	echo "--- end dmesg ---"
 }
 
-echo "entry #$N  (1 openat, 2 openat2, 3 newfstatat, 4 statx,"
+echo "entry #$N  no_extra=$NOE  (1 openat, 2 openat2, 3 newfstatat, 4 statx,"
 echo "            5 faccessat, 6 faccessat2, 7 readlinkat, 8 execve)"
 
 confirm "STEP 0 - clean slate: rmmod, recreate the test file"
@@ -51,7 +52,7 @@ echo "ptmx right now: $(su 10123 -c 'exec 3<>/dev/ptmx && echo ok || echo FAILED
 show
 
 confirm "STEP 1 - insmod ih_only=$N ih_secs=20   (module only; no hook yet)"
-ksud insmod $K ih_only=$N ih_secs=20
+ksud insmod $K ih_only=$N ih_secs=20 no_extra=$NOE
 echo "insmod rc=$?"
 lsmod | grep susfs
 show
