@@ -75,6 +75,35 @@
 > 拷进内核内存，不碰 uaccess，两个 ABI 通吃；命中则 `putname()` 释放刚分配的
 > `struct filename` 并返回 `ERR_PTR(-ENOENT)`。真机：32 位 `openat` → **ENOENT** ✓
 >
+> **inline hook 审计（本轮，只读子代理 + 真机逐条验证）**
+>
+> 已修（每条都有真机结论）：
+>
+> 1. **卸载竞态（致命）**：`susfs_ih_uninstall()` 会把 `*tramp_var` 清零，而在途 stub 是在
+>    `susfs_ih_decide()` 返回**之后**才读这个指针 —— 等于让 `br x16` 跳到 0。现在指针永久有效
+>    （trampoline 退役不释放），卸载后等 `synchronize_rcu_tasks()`（本内核 kallsyms 里有）
+>    或退化为延时，再让模块 text 被释放。
+> 2. **跨核 icache flush 从未生效**：`on_each_cpu()` 在 5.15 是 static inline、**不是符号**，
+>    解析永远 NULL，`if` 恒假。改用真实符号 `smp_call_function`，并把它列为**必需**
+>    （缺了就安装失败，不再静默降级）。修好立刻吃到 `CFI failure (target: smp_call_function)`
+>    —— 通过函数指针调符号的函数必须 `__nocfi`；反之**内核回调我们的函数不能加 `__nocfi`**。
+> 3. **getname 不是执行入口**：LTO 把 `getname()` 内联成 `getname_flags()` 的 wrapper，
+>    patch 成功但命中数恒 0。改 hook `getname_flags` 后 onLeave 立刻命中（`uid 10123` → ENOENT）。
+> 4. 安装失败改为写回原指令；入口 8 字节跨页时直接拒绝（`ksu_patch_text` 只映射一页 fixmap）；
+>    `sane_prologue()` 拒绝 BRK（别人已 kprobe 的入口）；`sus_path_hooks_arm()` 加互斥
+>    （两条规则并发会把已 patch 的入口当 orig，然后在活着的 inline hook 上再挂 kprobe）。
+> 5. ih 上线后**补注册**它不覆盖的层：path 层三个入口与 7 个 `__arm64_compat_sys_*`
+>    目标符号不同、不冲突，继续走 kprobe（实测 `2/7 compat probes`）；否则 32 位调用者
+>    会静默失去覆盖。
+> 6. ih 命中路径补上 `n_enoent_path` 计数与 ratelimited 日志，和 kprobe 路径一致。
+>
+> 有意不做：入口 8 字节的**两阶段原子写**（目前靠 `stop_machine` 保证不同时执行，残余风险是
+> 某 CPU 恰停在 4 字节中间）；trampoline 尾部 `ret x16` 造成的 RAS 净下溢（纯预测，本 SoC 无 GCS）。
+>
+> 真机最终形状：默认参数装 **9 条**（8 个 native wrapper + `getname_flags`），
+> app(10123) 的 `cat`/`ls -l`/`stat`/`test -r`/执行该文件全部 ENOENT，root 正常，
+> `/dev/ptmx` 正常，8 CPU 全程在线，ring buffer 无 `CFI failure`/`BUG`/`WARNING`，`rmmod` 干净恢复。
+>
 > **未修**（按优先级见 C 节）：P2 其余（sus_mount 域门控与阈值、sus_map 门控、
 > open_redirect 反向伪装与 scheme 1-4、`_LOOP` 语义）、P3 细节。
 >
