@@ -604,8 +604,9 @@ static int kp_sys_path_answer(struct pt_regs *regs, int argno)
     /* Diagnostic for the 32-bit path: without it, "the wrapper never ran" and
      * "it ran but the path could not be read" look identical from outside. */
     if (is_compat_task())
-        pr_info_ratelimited("sus_path: compat syscall, path read=%ld '%s'\n",
-                            n, n > 0 ? buf : "(unreadable)");
+        pr_info_ratelimited("sus_path: compat read=%ld reg=%#lx up=%#lx '%s'\n",
+                            n, reg, (unsigned long)up,
+                            n > 0 ? buf : "(unreadable)");
     if (n <= 0)
         return 0;
     buf[n] = '\0';
