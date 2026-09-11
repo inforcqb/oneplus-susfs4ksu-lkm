@@ -88,24 +88,27 @@ static int hide_syms_s_show_pre(struct kprobe *kp, struct pt_regs *regs)
 	return 0;
 }
 
-/* Registered by ADDRESS, not by name.
+/* Registered by name, which is what was measured to work: with this in place
+ * `grep -cE 'susfs_|ksu_' /proc/kallsyms` goes 257 -> 0.
  *
- * This tree has CONFIG_KALLSYMS_ALL=y and FULL LTO, and there are three
- * different `s_show` functions: kernel/kallsyms.c:741 (the one we want),
- * kernel/trace/trace.c:4654 and mm/vmalloc.c:4052.  A kprobe registered with
- * .symbol_name gets whichever one kallsyms happens to list first, and the
- * handler above would then read a struct trace_iterator / vmap_area as if it
- * were struct kallsym_iter - reading inside someone else's allocation, and
- * silently failing to hide anything.
+ * An audit pointed out that this tree has three different `s_show` functions
+ * (kernel/kallsyms.c, kernel/trace/trace.c, mm/vmalloc.c) and that a name-based
+ * registration gets whichever kallsyms lists first - a real hazard, since the
+ * handler reads m->private as struct kallsym_iter *.  Taking the address out of
+ * the kallsyms_op table instead and registering with .addr CRASHED the device on
+ * the first read of /proc/kallsyms, so the table's .show is not the address a
+ * kprobe can be hung on there (most likely the arm64 CFI jump-table thunk, which
+ * is what a function pointer in a table actually holds under this config).
  *
- * kallsyms_op is the seq_operations table (a data symbol, again thanks to
- * KALLSYMS_ALL) whose .show is exactly the function kallsyms actually calls, so
- * take the address from the table itself. */
+ * So: keep the working registration, and log both addresses so a mismatch is
+ * visible instead of silent. */
 static struct kprobe kp_s_show = {
+	.symbol_name = "s_show",
 	.pre_handler = hide_syms_s_show_pre,
 };
 
-static unsigned long hide_syms_target(void)
+/* Read-only comparison target: the function kallsyms itself calls. */
+static unsigned long hide_syms_table_show(void)
 {
 	const struct seq_operations *op;
 	unsigned long addr = find_kernel_symbol_exact("kallsyms_op");
@@ -121,22 +124,20 @@ static bool hide_registered;
 int susfs_hide_syms_init(void)
 {
 	int rc;
-	unsigned long fn = hide_syms_target();
+	unsigned long table_show;
 
-	if (!fn) {
-		pr_warn("susfs_hide_syms: kallsyms_op.show not found, not armed\n");
-		return -ENOENT;
-	}
-
-	kp_s_show.addr = (kprobe_opcode_t *)fn;
 	rc = register_kprobe(&kp_s_show);
 	if (rc) {
-		pr_warn("susfs_hide_syms: register_kprobe(%px) failed %d\n",
-			(void *)fn, rc);
+		pr_warn("susfs_hide_syms: register_kprobe(s_show) failed %d\n", rc);
 		return rc;
 	}
 	hide_registered = true;
-	pr_info("susfs_hide_syms: armed (kallsyms_op.show=%px)\n", (void *)fn);
+
+	table_show = hide_syms_table_show();
+	pr_info("susfs_hide_syms: armed at %px (kallsyms_op.show=%px%s)\n",
+		(void *)kp_s_show.addr, (void *)table_show,
+		(table_show && (unsigned long)kp_s_show.addr == table_show) ?
+		" - match" : " - DIFFERENT, /proc/kallsyms may not be filtered");
 	return 0;
 }
 
