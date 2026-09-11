@@ -292,7 +292,8 @@ static int sus_path_inode_permission(struct inode *inode, int mask)
  * caller and is not itself registered still answers EACCES, because the walk
  * cannot reach the child's lookup at all.  Upstream behaves the same way -
  * register the directory. */
-static atomic_t n_enoent_dac = ATOMIC_INIT(0);
+static atomic_t n_enoent_dac = ATOMIC_INIT(0);      /* inode_permission */
+static atomic_t n_enoent_gper = ATOMIC_INIT(0);     /* generic_permission */
 
 /* The other layers' decision, reused so every layer agrees. */
 static bool sus_path_lookup_hit(struct inode *inode)
@@ -305,14 +306,14 @@ static bool sus_path_lookup_hit(struct inode *inode)
 /* 5.15 signature: inode_permission(struct user_namespace *mnt_userns,
  * struct inode *inode, int mask) - the inode is argument 2, i.e. x1.  If that
  * ever changes the lookup simply misses and nothing else is affected. */
-static int kp_inode_permission_pre(struct kprobe *kp, struct pt_regs *regs)
+static int kp_dac_hit(struct pt_regs *regs, atomic_t *counter)
 {
     struct inode *inode = (struct inode *)regs->regs[1];
 
     if (!sus_path_lookup_hit(inode))
         return 0;
 
-    atomic_inc(&n_enoent_dac);
+    atomic_inc(counter);
     /* Answer "no such file" and skip the whole function: the DAC check inside
      * it is what would otherwise answer EACCES. */
     regs_set_return_value(regs, (unsigned long)-ENOENT);
@@ -320,12 +321,42 @@ static int kp_inode_permission_pre(struct kprobe *kp, struct pt_regs *regs)
     return 1;
 }
 
+static int kp_inode_permission_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+    return kp_dac_hit(regs, &n_enoent_dac);
+}
+
+/* inode_permission() itself turns out to be a dead end on this kernel: the
+ * 0600-file test (DAC denies the app, so the LSM layer can never be reached)
+ * still answered EACCES, i.e. the kprobe never fired - GKI's LTO inlines the
+ * function into its callers and the kallsyms entry is just the copy kept for
+ * module references.  Patching its entry would be equally pointless.
+ *
+ * generic_permission() is where that DAC decision actually lands for any
+ * filesystem without its own ->permission(), and it is NOT inlined (it has both
+ * a symbol and a .cfi_jt entry).  Same handler, same answer. */
+static int kp_generic_permission_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+    return kp_dac_hit(regs, &n_enoent_gper);
+}
+
 static struct kprobe kp_inode_permission = {
     .symbol_name = "inode_permission",
     .pre_handler = kp_inode_permission_pre,
 };
 
-static bool dac_hook_registered;
+static struct kprobe kp_generic_permission = {
+    .symbol_name = "generic_permission",
+    .pre_handler = kp_generic_permission_pre,
+};
+
+static struct kprobe *dac_probes[] = {
+    &kp_inode_permission,
+    &kp_generic_permission,
+};
+
+#define N_DAC_PROBES ARRAY_SIZE(dac_probes)
+static bool dac_registered[N_DAC_PROBES];
 
 /* Off means an app gets EACCES instead of ENOENT whenever the DAC check would
  * have denied it - i.e. the layer this exists for. */
@@ -334,26 +365,35 @@ module_param_named(hide_by_dac, hide_by_dac, int, 0644);
 
 static void sus_path_dac_register(void)
 {
-    int rc;
+    int i;
 
     if (!hide_by_dac)
         return;
 
-    rc = register_kprobe(&kp_inode_permission);
-    if (rc) {
-        pr_warn("sus_path: kprobe(inode_permission) failed %d\n", rc);
-        return;
+    for (i = 0; i < N_DAC_PROBES; i++) {
+        int rc = register_kprobe(dac_probes[i]);
+
+        if (rc) {
+            pr_warn("sus_path: kprobe(%s) failed %d\n",
+                    dac_probes[i]->symbol_name, rc);
+            continue;
+        }
+        dac_registered[i] = true;
     }
-    dac_hook_registered = true;
-    pr_info("sus_path: DAC layer armed (inode_permission)\n");
+    pr_info("sus_path: DAC layer armed (inode_permission=%d generic_permission=%d)\n",
+            dac_registered[0], dac_registered[1]);
 }
 
 static void sus_path_dac_unregister(void)
 {
-    if (!dac_hook_registered)
-        return;
-    unregister_kprobe(&kp_inode_permission);
-    dac_hook_registered = false;
+    int i;
+
+    for (i = 0; i < N_DAC_PROBES; i++) {
+        if (!dac_registered[i])
+            continue;
+        unregister_kprobe(dac_probes[i]);
+        dac_registered[i] = false;
+    }
 }
 
 /* compact the dirent chain in-place; returns the new byte count */
@@ -487,9 +527,10 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
     int n = 0;
 
     n += scnprintf(buf + n, PAGE_SIZE - n,
-                   "hide_from_apps=%d  enoent: getattr=%d perm=%d\n",
+                   "hide_from_apps=%d  enoent: getattr=%d perm=%d dac=%d gper=%d\n",
                    hide_from_apps, atomic_read(&n_enoent_getattr),
-                   atomic_read(&n_enoent_perm));
+                   atomic_read(&n_enoent_perm), atomic_read(&n_enoent_dac),
+                   atomic_read(&n_enoent_gper));
 
     spin_lock(&sus_path_lock);
     list_for_each_entry(e, &sus_path_list, list)
