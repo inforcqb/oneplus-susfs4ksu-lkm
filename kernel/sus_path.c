@@ -44,6 +44,8 @@
 #include <linux/spinlock.h>
 #include <linux/namei.h>
 #include <linux/fs.h>
+#include <linux/err.h>
+#include <linux/kprobes.h>
 #include <linux/limits.h>
 #include <linux/cred.h>
 #include <linux/atomic.h>
@@ -255,6 +257,160 @@ static int sus_path_inode_permission(struct inode *inode, int mask)
     if (!orig)
         return 0;
     return orig(inode, mask);
+}
+
+/* ---- path-lookup layer ----
+ *
+ * Why the LSM layer is not enough.  inode_permission() is:
+ *
+ *     retval = do_inode_permission(...);       DAC
+ *     if (retval) return retval;               <-- EACCES leaves HERE
+ *     return security_inode_permission(...);   our hook
+ *
+ * so a path whose PARENT denies the app execute permission answers EACCES
+ * before the hook is ever called - and "permission denied" tells the caller the
+ * entry exists, which is the one answer sus_path must never give.  Not
+ * theoretical: /data/adb is 0700 root:root, so an app running
+ * `ls /data/adb/service.d` gets EACCES no matter what is registered for
+ * service.d.  It only looked like it worked while the tests used 0755 paths
+ * like /data/local/tmp, where DAC passes and the LSM layer is reached.
+ *
+ * Upstream does not have this hole: it patches fs/namei.c at the LOOKUP level
+ * (lookup_fast, __lookup_slow, lookup_dcache, link_path_walk, lookup_open) and
+ * turns the dentry into "not found" before any permission check on the target.
+ *
+ * The LKM equivalent is a kretprobe on the lookup helpers that already hold the
+ * dentry, rewriting a hit into -ENOENT.  Hooks are on walk_component (covers
+ * every component of the path walk), __lookup_slow and lookup_dcache (the
+ * open-last-component paths).  lookup_fast and open_last_lookups were inlined by
+ * this kernel's LTO and have no symbol, which is why these three are the ones
+ * used. */
+struct sus_path_walk_args {
+    struct nameidata *nd;
+};
+
+/* The LSM layer's decision, reused so every layer agrees. */
+static bool sus_path_lookup_hit(struct inode *inode)
+{
+    if (!inode)
+        return false;
+    return sus_path_inode_hidden(inode) && sus_path_gate_ok(inode);
+}
+
+static int kr_walk_component_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct sus_path_walk_args *a = (struct sus_path_walk_args *)ri->data;
+
+    a->nd = (struct nameidata *)regs->regs[0];
+    return 0;
+}
+
+/* walk_component() returns 1 with nd->path already updated to the component it
+ * resolved, so a hit here answers "no such file" before the caller's
+ * inode_permission() on the parent directory can answer EACCES. */
+static int kr_walk_component_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct sus_path_walk_args *a = (struct sus_path_walk_args *)ri->data;
+    struct dentry *d;
+
+    if ((long)regs_return_value(regs) <= 0 || !a->nd)
+        return 0;
+
+    d = READ_ONCE(a->nd->path.dentry);
+    if (d && sus_path_lookup_hit(READ_ONCE(d->d_inode)))
+        regs_set_return_value(regs, (unsigned long)ERR_PTR(-ENOENT));
+    return 0;
+}
+
+/* lookup_dcache() feeds open's last component; __lookup_slow() is the
+ * cache-miss path taken by the walk.  Both already return ERR_PTR(...), so the
+ * same trick applies. */
+static int kr_lookup_dcache_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct dentry *d = (struct dentry *)regs_return_value(regs);
+
+    if (IS_ERR_OR_NULL(d))
+        return 0;
+    if (sus_path_lookup_hit(READ_ONCE(d->d_inode)))
+        regs_set_return_value(regs, (unsigned long)ERR_PTR(-ENOENT));
+    return 0;
+}
+
+static struct kretprobe krp_walk_component = {
+    .kp.symbol_name = "walk_component",
+    .entry_handler = kr_walk_component_entry,
+    .handler = kr_walk_component_ret,
+    .data_size = sizeof(struct sus_path_walk_args),
+    .maxactive = 64,
+};
+
+static struct kretprobe krp_lookup_dcache = {
+    .kp.symbol_name = "lookup_dcache",
+    .handler = kr_lookup_dcache_ret,
+    .maxactive = 64,
+};
+
+static struct kretprobe krp_lookup_slow = {
+    .kp.symbol_name = "__lookup_slow",
+    .handler = kr_lookup_dcache_ret,     /* same return-value rewrite */
+    .maxactive = 64,
+};
+
+static bool lookup_walk_registered;
+static bool lookup_dcache_registered;
+static bool lookup_slow_registered;
+
+/* The lookup helpers are on the hottest path there is, so a kretprobe on them is
+ * not free.  Off means an app gets EACCES (instead of ENOENT) whenever a parent
+ * directory denies it, which is upstream's behaviour only for paths whose
+ * parents are reachable. */
+static int hide_by_lookup = 1;
+module_param_named(hide_by_lookup, hide_by_lookup, int, 0644);
+
+static void sus_path_lookup_register(void)
+{
+    int rc;
+
+    if (!hide_by_lookup)
+        return;
+
+    rc = register_kretprobe(&krp_walk_component);
+    if (rc)
+        pr_warn("sus_path: kretprobe(walk_component) failed %d\n", rc);
+    else
+        lookup_walk_registered = true;
+
+    rc = register_kretprobe(&krp_lookup_dcache);
+    if (rc)
+        pr_warn("sus_path: kretprobe(lookup_dcache) failed %d\n", rc);
+    else
+        lookup_dcache_registered = true;
+
+    rc = register_kretprobe(&krp_lookup_slow);
+    if (rc)
+        pr_warn("sus_path: kretprobe(__lookup_slow) failed %d\n", rc);
+    else
+        lookup_slow_registered = true;
+
+    pr_info("sus_path: lookup layer armed (walk=%d dcache=%d slow=%d)\n",
+            lookup_walk_registered, lookup_dcache_registered,
+            lookup_slow_registered);
+}
+
+static void sus_path_lookup_unregister(void)
+{
+    if (lookup_slow_registered) {
+        unregister_kretprobe(&krp_lookup_slow);
+        lookup_slow_registered = false;
+    }
+    if (lookup_dcache_registered) {
+        unregister_kretprobe(&krp_lookup_dcache);
+        lookup_dcache_registered = false;
+    }
+    if (lookup_walk_registered) {
+        unregister_kretprobe(&krp_walk_component);
+        lookup_walk_registered = false;
+    }
 }
 
 /* compact the dirent chain in-place; returns the new byte count */
@@ -518,6 +674,10 @@ int sus_path_init(void)
         pr_info("sus_path: perm hook armed, orig=%ps\n",
                 sus_path_perm_hook.original);
 
+    /* And the lookup layer, without which a parent that denies the caller gives
+     * EACCES instead of ENOENT (see the note above it). */
+    sus_path_lookup_register();
+
     return 0;
 }
 
@@ -528,6 +688,7 @@ void sus_path_exit(void)
 
     /* Unregister the hooks FIRST: after this nothing can match, so the entries
      * (and their inode references) can be torn down safely. */
+    sus_path_lookup_unregister();
     if (sus_path_perm_hook.entry)
         ksu_unregister_lsm_hook(&sus_path_perm_hook);
     if (sus_path_getattr_hook.entry)
