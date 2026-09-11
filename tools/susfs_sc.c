@@ -179,9 +179,12 @@ int sc_main(long argc, char **argv)
 		  (long)payload);
 	say("susfs_sc: reboot() returned ");
 	say_hex((unsigned long)rc);
-	if (rc == 0 && len >= 8) {
-		/* Most SUSFS reply structs end with an int err; echo it so the
-		 * caller can tell success from a handled failure. */
+	if (len >= 8) {
+		/* Most SUSFS reply structs end with an int err; echo it either way.
+		 * On a NEGATIVE syscall result the caller seeded err with 126 and
+		 * must still see 126 - that is how "command not supported" is
+		 * detected - so printing it only on success would hide the very
+		 * thing this client exists to check. */
 		say("susfs_sc: payload tail: ");
 		say_hex(*(unsigned long *)(payload + ((len - 8) & ~7L)));
 	}
