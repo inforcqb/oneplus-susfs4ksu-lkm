@@ -941,12 +941,27 @@ static int kp_path_answer(struct pt_regs *regs, const char *name, bool errptr)
 
 /* filename_lookup(dfd, struct filename *name, ...) and
  * do_filp_open(dfd, struct filename *pathname, ...): the name is argument 2 in
- * both, already a kernel string. */
+ * both, already a kernel string.
+ *
+ * The name can legitimately BE an error pointer, and that is not hypothetical:
+ * do_linkat() passes getname()'s result straight to filename_lookup() with no
+ * IS_ERR() of its own (fs/namei.c:4608), leaving the check to the callee - and
+ * our own getname hook is what hands it ERR_PTR(-ENOENT) for a hidden path.  So
+ * the very first "ln <hidden path> /tmp/x" from an app dereferenced
+ * ERR_PTR(-2)->name here and took the device down (pc: kp_filename_pre+0x1c,
+ * x8 = fffffffffffffffe, "ldr x20, [x8]").
+ *
+ * kprobes run BEFORE the callee, so we are the ones who have to look. */
+static bool sus_path_name_ok(const struct filename *f)
+{
+    return !IS_ERR_OR_NULL(f) && f->name;
+}
+
 static int kp_filename_pre(struct kprobe *kp, struct pt_regs *regs)
 {
     struct filename *f = (struct filename *)regs->regs[1];
 
-    if (!f || !f->name)
+    if (!sus_path_name_ok(f))
         return 0;
     return kp_path_answer(regs, f->name, false);
 }
@@ -955,7 +970,7 @@ static int kp_filp_open_pre(struct kprobe *kp, struct pt_regs *regs)
 {
     struct filename *f = (struct filename *)regs->regs[1];
 
-    if (!f || !f->name)
+    if (!sus_path_name_ok(f))
         return 0;
     return kp_path_answer(regs, f->name, true);     /* returns struct file * */
 }
@@ -967,7 +982,7 @@ static int kp_user_path_pre(struct kprobe *kp, struct pt_regs *regs)
     char buf[SUS_PATH_LEN];
     long n;
 
-    if (!uname)
+    if (IS_ERR_OR_NULL(uname))
         return 0;
     /* Bounded read of the caller's own path.  Fails harmlessly (-EFAULT) if the
      * page is not there; this is the same uaccess the getdents64 tracepoint
@@ -1501,7 +1516,9 @@ __attribute__((visibility("hidden"))) int susfs_ih_decide_name(u64 p, int mode)
 	if (mode == 0) {
 		const struct filename *f = (const struct filename *)p;
 
-		if (!f->name)
+		/* Same trap as the filename_lookup kprobe: the caller may hand the
+		 * callee an error pointer and expect it to be checked there. */
+		if (IS_ERR_OR_NULL(f) || !f->name)
 			return 0;
 		if (!sus_path_match_path(f->name))
 			return 0;

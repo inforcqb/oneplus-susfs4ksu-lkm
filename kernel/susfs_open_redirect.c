@@ -345,7 +345,10 @@ static int or_vfs_open_pre(struct kprobe *kp, struct pt_regs *regs)
 	struct inode *inode;
 	struct sus_or_entry *e;
 
-	if (!path || !path->dentry)
+	/* IS_ERR_OR_NULL on the same principle as the sus_path name handlers: a
+	 * kprobe runs before the callee, so a caller that leaves argument checking
+	 * to it hands us an error pointer. */
+	if (IS_ERR_OR_NULL(path) || !path->dentry)
 		return 0;
 	inode = d_backing_inode(path->dentry);
 	if (!inode)
@@ -386,7 +389,7 @@ static int or_dpath_pre(struct kprobe *kp, struct pt_regs *regs)
 	struct inode *inode;
 	struct sus_or_entry *e;
 
-	if (!READ_ONCE(nor) || !path || !path->dentry)
+	if (!READ_ONCE(nor) || IS_ERR_OR_NULL(path) || !path->dentry)
 		return 0;
 	if (!or_reverse_visible())
 		return 0;
@@ -414,7 +417,7 @@ static int or_vfs_statfs_pre(struct kprobe *kp, struct pt_regs *regs)
 	struct inode *inode;
 	struct sus_or_entry *e;
 
-	if (!READ_ONCE(nor) || !path || !path->dentry)
+	if (!READ_ONCE(nor) || IS_ERR_OR_NULL(path) || !path->dentry)
 		return 0;
 	if (!or_reverse_visible())
 		return 0;
