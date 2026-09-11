@@ -119,8 +119,18 @@ susfs_ih_stub_##n:;						\
  * authenticates it happily - control lands back here with x0 holding the result,
  * which the C after-handler may replace.
  *
- * Layout: [0..144] x0-x18, [152] LR for the target, [160] real LR,
- *         [168] the target's return value. */
+ * Frame layout: [0..144] x0-x18, [152] LR handed to the target, [160] the real
+ * LR, [168] NZCV, [176] the target's return value.  The target runs with SP
+ * still at the stub's frame base - 192 bytes deeper than its callers expect - so
+ * its own frame lives at [sp-192-N, sp-192) and cannot touch any slot above it.
+ * That is what makes reading the original arguments back at 9f safe.
+ *
+ * Precondition: the target must be reachable with registers alone (<= 8
+ * arguments): a target taking arguments on the stack would read them out of this
+ * frame instead of its caller's.
+ *
+ * Contract: after_fn(u64 a0, u64 a1, u64 ret) returns the value the target's
+ * caller should see; the stub returns exactly that. */
 #define SUSFS_IH_LEAVE_STUB(n, after_fn)			\
 	.globl	susfs_ih_stub_##n;				\
 	.type	susfs_ih_stub_##n, %function;			\
@@ -133,9 +143,9 @@ susfs_ih_stub_##n:;						\
 	IH_TRAMP_ADDR(n);					\
 	br	x16;						\
 9:;								\
-	str	x0, [sp, #168];					\
+	str	x0, [sp, #176];					\
 	ldp	x0, x1, [sp, #0];				\
-	ldr	x2, [sp, #168];					\
+	ldr	x2, [sp, #176];					\
 	bl	after_fn;					\
 	ldr	x30, [sp, #160];				\
 	add	sp, sp, #192;					\

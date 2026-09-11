@@ -83,7 +83,7 @@ ih_test_target_addr:
 ih_openat_stub:
 	IH_SAVE_REGS()
 	bl	ih_openat_decide
-	cbz	x0, ih_openat_allow
+	cbz	w0, ih_openat_allow
 	IH_RESTORE_REGS()
 	mov	x0, #-2			/* -ENOENT */
 	ret
@@ -101,7 +101,7 @@ ih_openat_allow:
 ih_selftest_stub:
 	IH_SAVE_REGS()
 	bl	ih_selftest_decide
-	cbz	x0, ih_selftest_allow
+	cbz	w0, ih_selftest_allow
 	IH_RESTORE_REGS()
 	mov	x0, #-2
 	ret

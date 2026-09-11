@@ -25,6 +25,7 @@
 #include <linux/mm.h>
 #include <linux/set_memory.h>
 #include <linux/string.h>
+#include <linux/delay.h>
 #include <asm/cacheflush.h>
 #include "patch_memory.h"
 #include "symbol_resolver.h"
@@ -38,11 +39,16 @@ static int (*pfn_set_memory_ro)(unsigned long addr, int numpages);
 static int (*pfn_set_memory_rw)(unsigned long addr, int numpages);
 static int (*pfn_set_memory_x)(unsigned long addr, int numpages);
 static void (*pfn_on_each_cpu)(void (*func)(void *), void *info, int wait);
+static void (*pfn_sync_rcu_tasks)(void);
 
+/* on_each_cpu is part of the contract, not a bonus: without it only the patching
+ * CPU would drop its stale I-cache lines and the other cores would keep running
+ * the old - or a half-updated - instruction stream.  A missing helper must fail
+ * the install instead of silently degrading. */
 bool susfs_ih_ready(void)
 {
 	return pfn_module_alloc && pfn_set_memory_ro && pfn_set_memory_rw &&
-	       pfn_set_memory_x;
+	       pfn_set_memory_x && pfn_on_each_cpu;
 }
 
 /* __nocfi on every function that reaches a resolved kernel symbol through a
@@ -55,11 +61,13 @@ static __nocfi int susfs_ih_init_impl(void)
 	pfn_set_memory_rw = (void *)find_kernel_symbol_exact("set_memory_rw");
 	pfn_set_memory_x = (void *)find_kernel_symbol_exact("set_memory_x");
 	pfn_on_each_cpu = (void *)find_kernel_symbol_exact("on_each_cpu");
+	pfn_sync_rcu_tasks = (void *)find_kernel_symbol_exact("synchronize_rcu_tasks");
 
 	if (!susfs_ih_ready()) {
-		pr_warn("susfs_ih: helpers missing (alloc=%d ro=%d rw=%d x=%d)\n",
+		pr_warn("susfs_ih: helpers missing (alloc=%d ro=%d rw=%d x=%d each_cpu=%d)\n",
 			!!pfn_module_alloc, !!pfn_set_memory_ro,
-			!!pfn_set_memory_rw, !!pfn_set_memory_x);
+			!!pfn_set_memory_rw, !!pfn_set_memory_x,
+			!!pfn_on_each_cpu);
 		return -ENOENT;
 	}
 	return 0;
@@ -70,16 +78,31 @@ int susfs_ih_init(void)
 	return susfs_ih_init_impl();
 }
 
-static unsigned long ih_flush_lo, ih_flush_hi;
+/* The range travels in the info pointer rather than in globals: two installs can
+ * be in flight at once (one per entry) and globals would let them overwrite each
+ * other's range. */
+struct ih_flush_range {
+	unsigned long lo, hi;
+};
 
 /* ksu_patch_text only flushes the CPU that ran it, which is fine for the data it
  * was written for (hook-table pointers) but not for code: another core can keep
  * executing the old or a half-updated instruction stream.  Every core now flushes
  * for itself after the write. */
-static void susfs_ih_remote_flush(void *unused)
+static void susfs_ih_remote_flush(void *info)
 {
-	caches_clean_inval_pou(ih_flush_lo, ih_flush_hi);
+	const struct ih_flush_range *r = info;
+
+	caches_clean_inval_pou(r->lo, r->hi);
 	isb();
+}
+
+static void susfs_ih_flush_range_remote(unsigned long lo, unsigned long hi)
+{
+	struct ih_flush_range r = { lo, hi };
+
+	if (pfn_on_each_cpu)
+		pfn_on_each_cpu(susfs_ih_remote_flush, &r, 1);
 }
 
 static void susfs_ih_flush_icache(void *addr, unsigned long len)
@@ -92,12 +115,16 @@ static void susfs_ih_flush_icache(void *addr, unsigned long len)
 }
 
 /* Overwriting two instructions must not swallow a PC-relative one: those cannot
- * be replayed verbatim from the trampoline. */
+ * be replayed verbatim from the trampoline.  A BRK means somebody else already
+ * owns this entry (a kprobe, a livepatch): patching it would be overwritten by
+ * their restore and vice versa. */
 static bool susfs_ih_sane_prologue(const u32 *insn)
 {
 	int i;
 
 	for (i = 0; i < 2; i++) {
+		if ((insn[i] & 0xffe0001fu) == 0xd4200000u)	/* brk #imm */
+			return false;
 		if ((insn[i] & 0x1f000000u) == 0x10000000u)	/* adr/adrp */
 			return false;
 		if ((insn[i] & 0x3b000000u) == 0x18000000u)	/* ldr lit  */
@@ -129,6 +156,10 @@ static __nocfi void *susfs_ih_build_tramp(unsigned long entry, const u32 *orig)
 	*(u64 *)(tr + 5) = entry + 8;		/* -> entry + 8         */
 
 	susfs_ih_flush_icache(tr, IH_TRAMP_SIZE);
+	/* module_alloc() can hand back an address some other core still has stale
+	 * I-cache lines for, so this page has to be flushed everywhere too. */
+	susfs_ih_flush_range_remote((unsigned long)tr,
+				    (unsigned long)tr + IH_TRAMP_SIZE);
 
 	if (pfn_set_memory_ro((unsigned long)tr, 1) ||
 	    pfn_set_memory_x((unsigned long)tr, 1)) {
@@ -147,11 +178,10 @@ static __nocfi int susfs_ih_write(unsigned long entry, const void *src,
 					KSU_PATCH_TEXT_FLUSH_ICACHE |
 					KSU_PATCH_TEXT_FLUSH_DCACHE);
 
-		if (!rc && pfn_on_each_cpu) {
-			ih_flush_lo = entry;
-			ih_flush_hi = entry + len;
-			wmb();
-			pfn_on_each_cpu(susfs_ih_remote_flush, NULL, 1);
+		if (!rc) {
+			/* on_each_cpu() runs the callback in IRQ context, where the
+			 * range has to come from the info pointer. */
+			susfs_ih_flush_range_remote(entry, entry + len);
 		}
 		return rc;
 	}
@@ -182,6 +212,15 @@ static __nocfi int susfs_ih_install_impl(struct susfs_ih_hook *h,
 		return -ENOENT;
 	}
 
+	/* ksu_patch_text goes through a single fixmap page, so an 8-byte write that
+	 * straddles a page boundary would land half in the next slot and fail with
+	 * the first four bytes (the `bti c`) already committed - the entry would
+	 * lose its prologue and never be restored.  Refuse such an entry. */
+	if (((h->entry & (PAGE_SIZE - 1)) + sizeof(u32[2])) > PAGE_SIZE) {
+		pr_err("susfs_ih: %s entry straddles a page boundary\n", sym);
+		return -ERANGE;
+	}
+
 	memcpy(h->orig, (void *)h->entry, sizeof(h->orig));
 
 	if (!susfs_ih_sane_prologue(h->orig)) {
@@ -209,8 +248,12 @@ static __nocfi int susfs_ih_install_impl(struct susfs_ih_hook *h,
 
 	if (susfs_ih_write(h->entry, patch, sizeof(patch), true)) {
 		pr_err("susfs_ih: could not patch %s\n", sym);
-		if (tramp_var)
-			*tramp_var = 0;
+		/* A partially committed write may have left the entry inconsistent
+		 * (the first word is written separately from the second), so put the
+		 * original instructions back.  Do NOT clear *tramp_var and do NOT
+		 * free the trampoline: if even one byte of the branch landed, some
+		 * core may already be inside the stub and needs both. */
+		susfs_ih_write(h->entry, h->orig, sizeof(h->orig), true);
 		return -EIO;
 	}
 
@@ -237,8 +280,22 @@ static __nocfi void susfs_ih_uninstall_impl(struct susfs_ih_hook *h)
 		pr_info("susfs_ih: restored %px\n", (void *)h->entry);
 
 	h->installed = false;
-	if (h->tramp_var)
-		*h->tramp_var = 0;
+
+	/*
+	 * Restoring the entry only stops NEW calls from reaching the stub; a core
+	 * that is already inside it is still there, and it will read its
+	 * trampoline pointer after the decision function returns - so:
+	 *
+	 *  - *tramp_var must stay valid (the trampoline is retired, never freed),
+	 *    otherwise an in-flight stub loads 0 and branches to it;
+	 *  - the stub itself lives in this module's text, which is about to be
+	 *    unmapped, so wait for in-flight executions to drain first.
+	 */
+	if (pfn_sync_rcu_tasks)
+		pfn_sync_rcu_tasks();
+	else
+		msleep(50);
+
 	h->tramp = NULL;	/* retired, not freed */
 }
 

@@ -48,6 +48,7 @@
 #include <linux/kprobes.h>
 #include <linux/compat.h>
 #include <linux/workqueue.h>	/* compat_ptr(), for 32-bit callers */
+#include <linux/mutex.h>	/* serialises the first rule's arming */
 #include <linux/limits.h>
 #include <linux/cred.h>
 #include <linux/atomic.h>
@@ -868,6 +869,12 @@ static void sus_path_path_unregister(void)
  * The LSM hooks are exempt: they are pointer swaps, already cost-free. */
 static bool path_registered;
 static bool hooks_armed;
+/* Serialises the first rule's arming.  ih_hooks[] is global state: two rules
+ * arriving at once (a supercall task_work and a module_init caller) would both
+ * pass the hooks_armed check and the second one would read an entry that the
+ * first already patched, copy the patched instructions into h->orig, fail the
+ * prologue check and then register kprobes on top of live inline hooks. */
+static DEFINE_MUTEX(sus_path_arm_lock);
 
 /* The tracepoint callback and the filter it drives are defined below. */
 static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret);
@@ -890,8 +897,11 @@ static void sus_path_tracepoint_register(void)
 
 static void sus_path_hooks_arm(void)
 {
-    if (hooks_armed || !READ_ONCE(sus_path_count))
+    mutex_lock(&sus_path_arm_lock);
+    if (hooks_armed || !READ_ONCE(sus_path_count)) {
+        mutex_unlock(&sus_path_arm_lock);
         return;
+    }
 
     hooks_armed = true;
     if (!no_extra)
@@ -909,6 +919,7 @@ static void sus_path_hooks_arm(void)
         sus_path_getname_register();
     }
     pr_info("sus_path: hooks armed (first rule registered)\n");
+    mutex_unlock(&sus_path_arm_lock);
 }
 
 /* ---- inline hooks ----
@@ -983,6 +994,7 @@ __attribute__((visibility("hidden"))) u64 susfs_ih_after_getname(u64 a0, u64 a1,
 
 	pr_info_ratelimited("sus_path: getname hit '%s' (uid=%u)\n",
 			    f->name, current_uid().val);
+	atomic_inc(&n_enoent_path);
 	putname(f);
 	return (u64)(unsigned long)ERR_PTR(-ENOENT);
 }
@@ -1016,7 +1028,15 @@ __attribute__((visibility("hidden"))) int susfs_ih_decide(u64 uregs_arg, int arg
 	if (n <= 0)
 		return 0;
 	buf[n] = '\0';
-	return sus_path_match_path(buf) ? 1 : 0;
+	if (!sus_path_match_path(buf))
+		return 0;
+
+	/* Same accounting as the kprobe path, so the counters and the log stay
+	 * usable no matter which layer answered. */
+	atomic_inc(&n_enoent_path);
+	pr_info_ratelimited("sus_path: path hit (openat family) '%s' (uid=%u) [ih]\n",
+			    buf, current_uid().val);
+	return 1;
 }
 
 /* Called from the name-taking stubs: mode 0 = struct filename (already copied
@@ -1034,14 +1054,23 @@ __attribute__((visibility("hidden"))) int susfs_ih_decide_name(u64 p, int mode)
 
 		if (!f->name)
 			return 0;
-		return sus_path_match_path(f->name) ? 1 : 0;
+		if (!sus_path_match_path(f->name))
+			return 0;
+	} else {
+		n = strncpy_from_user(buf, (const char __user *)p,
+				      sizeof(buf) - 1);
+		if (n <= 0)
+			return 0;
+		buf[n] = '\0';
+		if (!sus_path_match_path(buf))
+			return 0;
 	}
 
-	n = strncpy_from_user(buf, (const char __user *)p, sizeof(buf) - 1);
-	if (n <= 0)
-		return 0;
-	buf[n] = '\0';
-	return sus_path_match_path(buf) ? 1 : 0;
+	atomic_inc(&n_enoent_path);
+	pr_info_ratelimited("sus_path: path hit '%s' (uid=%u) [ih]\n",
+			    mode == 0 ? ((const struct filename *)p)->name : buf,
+			    current_uid().val);
+	return 1;
 }
 
 /* On by default: the patched entries replace the kprobes for the syscalls whose
@@ -1398,7 +1427,7 @@ int sus_path_init(void)
     pr_info("sus_path: hooks deferred until the first rule\n");
 
     if (no_extra) {
-        pr_info("sus_path: no_extra=1 - LSM, DAC and tracepoint layers OFF (isolation test)\n");
+        pr_info("sus_path: no_extra=1 - LSM, DAC and getdents64 layers OFF; the inline hooks stay on (isolation test)\n");
         return 0;
     }
 

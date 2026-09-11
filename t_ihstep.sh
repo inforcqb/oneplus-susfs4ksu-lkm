@@ -8,7 +8,7 @@
 # an earlier step can mislead us).
 #
 # Entry numbers: 1 openat, 2 openat2, 3 newfstatat, 4 statx, 5 faccessat,
-#                6 faccessat2, 7 readlinkat, 8 execve
+#                6 faccessat2, 7 readlinkat, 8 execve, 9 getname (onLeave)
 K=/data/local/tmp/susfs.ko
 D=/data/local/tmp/dac_probe
 T=$D/f600
