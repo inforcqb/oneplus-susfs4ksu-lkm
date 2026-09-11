@@ -1757,14 +1757,28 @@ __attribute__((visibility("hidden"))) int susfs_ih_decide_nd(u64 nd_ptr)
 	if (!parent)
 		return 0;
 
-	/* Diagnostic: the first few calls show the key we are matching on, so a
-	 * hook that is installed but never fires can be told apart from one that
-	 * fires and misses. */
-	if (atomic_read(&n_nd_calls) <= 6)
-		pr_info("sus_path: walk_component hook: parent dev=%llu ino=%llu name=%.*s\n",
-			(unsigned long long)parent->i_sb->s_dev,
-			(unsigned long long)parent->i_ino,
-			(int)nd->last.len, nd->last.name);
+	/* Always report a component whose NAME matches a rule, whatever its parent
+	 * says: it separates "this hook never sees our paths" (an inlined copy is
+	 * doing the walking) from "it sees them and the parent key differs". */
+	{
+		struct sus_path_entry *e;
+
+		spin_lock(&sus_path_lock);
+		list_for_each_entry(e, &sus_path_list, list) {
+			if (strncmp(e->name, (const char *)nd->last.name, nd->last.len))
+				continue;
+			if (e->name[nd->last.len] != '\0')
+				continue;
+			pr_info_ratelimited("sus_path: walk_component saw '%s' with parent %llu/%llu; the rule says %llu/%llu\n",
+				e->name,
+				(unsigned long long)parent->i_sb->s_dev,
+				(unsigned long long)parent->i_ino,
+				(unsigned long long)e->parent_dev,
+				(unsigned long long)e->parent_ino);
+			break;
+		}
+		spin_unlock(&sus_path_lock);
+	}
 
 	return sus_path_parent_hit((u64)parent->i_sb->s_dev, (u64)parent->i_ino,
 				   nd->last.name, nd->last.len) ? 1 : 0;
