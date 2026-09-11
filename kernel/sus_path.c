@@ -1411,9 +1411,9 @@ static bool path_probes_registered[N_PATH_PROBES];
  * dereferencing the wrong register is how this module crashed a device before.
  * cand_probe=1 arms them; the hit counts show which ones are reachable. */
 
-#define N_CAND 14
+#define N_CAND 18
 static const char *const cand_syms[N_CAND] = {
-	"walk_component",	/* what upstream uses */
+	"walk_component",	/* what upstream uses - reachable, but see below */
 	"link_path_walk",
 	"step_into",
 	"handle_mounts",
@@ -1427,6 +1427,16 @@ static const char *const cand_syms[N_CAND] = {
 	"filename_parentat",
 	"__filename_parentat",
 	"vfs_open",		/* known reachable, but after the DAC check */
+	/* The interesting ones: inode_permission() takes the inode as its SECOND
+	 * argument, and a kprobe at its entry runs before its own DAC check - i.e.
+	 * judged by inode AND earlier than DAC, which is the one thing neither of
+	 * the layers we have can do.  An earlier measurement reported zero hits
+	 * here, but the same measurement also reported zero for walk_component,
+	 * which is demonstrably executed - so that measurement does not count. */
+	"inode_permission",
+	"generic_permission",
+	"inode_getattr",
+	"may_open",
 };
 
 static struct kprobe cand_kps[N_CAND];
