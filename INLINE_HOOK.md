@@ -203,3 +203,21 @@ ksud insmod /data/local/tmp/ih_hook_test.ko selftest=0 hook_syscall=1   # 真 ho
   过滤需要 **onLeave**（stub 先调 trampoline 进原函数、返回后再处理），比入口决策复杂。
 * 性能对比：有/无 hook 的基准（kprobe 的实际开销尚未量化）。
 * 主模块 `susfs_guard_lkm` 目前**尚未**使用 inline hook，保持 kprobe + 懒注册。
+### 5.6 cpp 会把宏参数字符串化（本来只是 mov 的立即数）
+
+IH_TAIL(idx) / SUSFS_IH_SYS_STUB(n, idx, argno) 展开后，汇编器报
+invalid fixup for movz/movk。排查中先后误判为"符号取址"、"PLT"、"CRLF 让续行失效"，
+全是错的：把**汇编器的真实输入**取出来看（clang -c -save-temps=obj），一眼就是
+
+    mov w1, "1"        ; 宏体里写的是 mov w1, #argno
+    mov w0, "0"        ; 宏体里写的是 mov w0, #idx
+
+# 紧跟在宏参数前就是 **字符串化运算符**，参数被加上了引号，汇编器于是把字符串当地址去
+movz/movk。mov x0, #-2 一直没事，正因为它的 # 后面不是宏参数。
+
+**教训**：
+- .S 的宏体里给立即数**不要写 #param**，写 mov w1, param 即可；
+- clang -E -x assembler-with-cpp file.S 走的是**传统 cpp**，不展开函数式宏，
+  输出只有十几行宏调用行 —— 拿它做诊断会被彻底带偏；
+- 要诊断 .S，用 clang --target=... -c -save-temps=obj 保留中间 .s，并把它当构建
+  产物导出；这一次就是靠它一次定位的。
