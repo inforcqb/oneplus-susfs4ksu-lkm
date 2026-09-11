@@ -158,40 +158,20 @@ static atomic_t or_rev_dpath_hits = ATOMIC_INIT(0);
 static atomic_t or_rev_statfs_hits = ATOMIC_INIT(0);
 static atomic_t or_rev_vma_hits = ATOMIC_INIT(0);
 
-/* Cached paths that have been replaced or deleted.
+/* Cached paths are per-entry and released once, at unload.
  *
  * The handlers run in interrupt context with no lock and hand
  * &e->redirected_path (or &e->target_path) straight to vfs_open()/d_path()/
  * vfs_statfs(), which read or path_get() it.  Freeing the old path on
  * replace/delete therefore raced a concurrent open into a use-after-free.
  * (Upstream avoids this with SRCU plus a re-walk on the open path, so it never
- * holds a cached path at all.)  Retiring keeps the reference alive until
- * unload; the price is one pinned dentry/mount per rule update and direction,
- * and updates are rare, configuration-time operations. */
-struct or_retired_path {
-	struct list_head list;
-	struct path path;
-};
-
-static LIST_HEAD(or_retired_paths);
-
-static void or_retire_path(struct path *p)
-{
-	struct or_retired_path *r;
-
-	if (!p->dentry)
-		return;
-	r = kmalloc(sizeof(*r), GFP_KERNEL);
-	if (!r) {
-		/* Cannot record it: leaking the reference is strictly safer than
-		 * dropping it while an open may still be using it. */
-		pr_warn("open_redirect: cannot retire path, leaking reference\n");
-		return;
-	}
-	r->path = *p;
-	list_add_tail(&r->list, &or_retired_paths);
-}
-
+ * holds a cached path at all.)
+ *
+ * There used to be a side list of "retired" paths for that, but it duplicated
+ * the struct path - one reference, two owners - so unload released it twice and
+ * the device died on rmmod.  A deleted rule simply keeps its paths now: dead
+ * entries are never reused, stay out of every lookup, and are released by exit
+ * like any other. */
 static void or_resolve_su_sid(void)
 {
 	int err;
@@ -620,7 +600,6 @@ int susfs_open_redirect_init(void)
 
 void susfs_open_redirect_exit(void)
 {
-	struct or_retired_path *r, *tmp;
 	int i;
 
 	or_unregister();
@@ -629,8 +608,9 @@ void susfs_open_redirect_exit(void)
 		or_proc_entry = NULL;
 	}
 
-	/* Nothing can reach these any more: the kprobes are already gone.
-	 * path_put() tolerates the NULLs left by or_del(). */
+	/* Nothing can reach these any more: the kprobes are already gone.  Every
+	 * entry is released exactly once here - dead ones included, which is what
+	 * makes "a deleted rule keeps its paths" safe. */
 	for (i = 0; i < nor; i++) {
 		path_put(&or_entries[i].redirected_path);
 		or_entries[i].redirected_path.dentry = NULL;
@@ -641,13 +621,6 @@ void susfs_open_redirect_exit(void)
 		or_entries[i].dead = true;
 	}
 	nor = 0;
-
-	/* And only now the retired ones. */
-	list_for_each_entry_safe(r, tmp, &or_retired_paths, list) {
-		list_del(&r->list);
-		path_put(&r->path);
-		kfree(r);
-	}
 }
 
 static int or_proc_show(struct seq_file *m, void *v)
@@ -813,31 +786,30 @@ static int or_add(const char *target, const char *redirected, int scheme)
 	}
 
 	if (e) {
-		/* Rewriting a live entry: mark it dead and retire its old paths.
-		 * Freeing them here would race a concurrent reader holding one. */
+		/* Rewriting a rule: mark the old entry dead and leave its paths alone.
+		 *
+		 * They stay as they are for the rest of the module's life, and unload
+		 * releases each entry exactly once.  Nothing is retired to a side list
+		 * any more: or_retire_path() duplicated the struct path, which meant the
+		 * same single reference was released twice on unload, and clearing the
+		 * fields (the older behaviour) pulled the path out from under a reader
+		 * that had already passed its dead check and was on its way into
+		 * vfs_open()/d_path()/vfs_statfs() with that very pointer. */
 		WRITE_ONCE(e->dead, true);
 		smp_wmb();
-		or_retire_path(&e->redirected_path);
-		or_retire_path(&e->target_path);
-	} else {
-		/* Reuse a retired slot before growing the array. */
-		for (i = 0; i < nor; i++) {
-			if (READ_ONCE(or_entries[i].dead)) {
-				e = &or_entries[i];
-				break;
-			}
-		}
-		if (!e) {
-			if (nor >= SUS_OR_MAX) {
-				path_put(&rp);
-				path_put(&tp);
-				return -ENOSPC;
-			}
-			e = &or_entries[nor];
-			nor++;
-		}
-		strscpy(e->target_pathname, target, OR_PATH_MAX);
+		e = NULL;
 	}
+
+	/* A retired slot is never reused either: reuse would overwrite path fields a
+	 * reader may still be holding, and would discard the reference the dead entry
+	 * still owns.  Rules are configuration, so the array growing is fine. */
+	if (nor >= SUS_OR_MAX) {
+		path_put(&rp);
+		path_put(&tp);
+		return -ENOSPC;
+	}
+	e = &or_entries[nor++];
+	strscpy(e->target_pathname, target, OR_PATH_MAX);
 
 	strscpy(e->redirected_pathname, redirected, OR_PATH_MAX);
 	e->target_ino = ti->i_ino;
@@ -863,20 +835,18 @@ static void or_del(const char *target)
 	if (!e)
 		return;
 
-	/* Retire, never free - and never CLEAR either.
+	/* Dead, and that is all.
 	 *
 	 * A reader that has already passed its `dead` check still holds a pointer to
 	 * these fields and hands them to vfs_open()/d_path()/vfs_statfs(), which
 	 * dereference path->dentry immediately (fs/open.c:1032, fs/d_path.c:282,
-	 * fs/statfs.c:90).  Nulling them here while such a reader is on its way is a
+	 * fs/statfs.c:90).  Clearing them here while such a reader is on its way is a
 	 * straight NULL-dereference oops, reachable from any app because the control
-	 * node is 0777 (or_uid_matches() is only consulted later, inside the probe).
-	 * The values therefore stay exactly as they were: the entry is dead, nobody
-	 * looks at it again, and the two struct paths are pinned until unload. */
+	 * node is 0777 (or_uid_matches() is consulted later, inside the probe).  So
+	 * the paths stay exactly as they are, pinned until unload, and released once
+	 * - by exit, which walks every entry including the dead ones. */
 	WRITE_ONCE(e->dead, true);
 	smp_wmb();
-	or_retire_path(&e->redirected_path);
-	or_retire_path(&e->target_path);
 
 	e->target_pathname[0] = '\0';
 	e->redirected_pathname[0] = '\0';
