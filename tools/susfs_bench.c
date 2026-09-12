@@ -41,6 +41,7 @@ typedef long s64;
 #define SYS_clock_gettime 113
 #define SYS_statx       291
 #define SYS_sched_setaffinity 122
+#define SYS_getpid      172
 
 #define AT_FDCWD      (-100)
 #define CLOCK_MONOTONIC 1
@@ -157,7 +158,7 @@ void bench_main(long argc, char **argv)
 {
 	const char *path = "/data/local/tmp/dac_probe/visible";
 	u64 iters = 500000;
-	u64 i, r, t0, t1, took, best;
+	u64 i, r, t0, t1, took, best, best_getpid;
 	long rc = 0;
 
 	if (argc > 1)
@@ -185,6 +186,19 @@ void bench_main(long argc, char **argv)
 	 * several: the minimum is the run that was least disturbed, which is the
 	 * number the layer itself is responsible for. */
 #define ROUNDS 10
+	/* No entry of ours is involved, so this line is the cost of whatever fires on
+	 * *every* syscall - tracepoints mainly.  It is the number that shows whether a
+	 * per-syscall callback is still being paid. */
+	best_getpid = ~0ull;
+	for (r = 0; r < ROUNDS; r++) {
+		t0 = now_ns();
+		for (i = 0; i < iters; i++)
+			rc += sys6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+		took = now_ns() - t0;
+		if (took < best_getpid)
+			best_getpid = took;
+	}	
+
 	best = ~0ull;
 	for (r = 0; r < ROUNDS; r++) {
 		t0 = now_ns();
@@ -194,6 +208,7 @@ void bench_main(long argc, char **argv)
 		if (took < best)
 			best = took;
 	}
+	report("getpid (no hook)", iters, best_getpid);
 	report("faccessat", iters, best);
 
 	best = ~0ull;
