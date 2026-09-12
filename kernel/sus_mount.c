@@ -599,14 +599,19 @@ static int sus_mount_mark_ksu_mounts(void)
             n_skipped_ns++;
             continue;
         }
-        /* Skip anything already carrying a KSU-range id: this is the idempotency
-         * guard (a re-enable, or an enable after the load-time scan, must not
-         * allocate a second id for the same mount - that would leak the first
-         * one for the mount's lifetime) and it is upstream's own test
-         * (patch:807).  Uses the constant, not the tunable, see
-         * SUS_MOUNT_KSU_ID_MIN. */
+        /* Anything already carrying a KSU-range id: this is the idempotency guard
+         * for a re-enable (or an enable after the load-time scan, where a second
+         * id for the same mount would leak the first one for the mount's
+         * lifetime) AND the cover for KernelSU's own mounts, which this kernel
+         * already hands such an id to - on this device exactly one, the
+         * meta-overlayfs loop mount at 2000000000.  Their line is skipped by that
+         * id alone (no marking needed), so they need the very same "the id the
+         * app is allowed to see" mapping, or fdinfo/statx keep printing a number
+         * mountinfo no longer lists.  Compares against the constant, not the
+         * tunable, see SUS_MOUNT_KSU_ID_MIN. */
         if ((unsigned int)r->mnt_id >= SUS_MOUNT_KSU_ID_MIN) {
             n_skipped_marked++;
+            sus_mount_idmap_add((int)r->mnt_id, sus_mount_shown_id(r));
             continue;
         }
 
