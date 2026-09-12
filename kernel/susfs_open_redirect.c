@@ -76,6 +76,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
+#include "mount.h"		/* fs/mount.h: real_mount() -> mnt_id */
 #include <linux/atomic.h>	/* reverse-disguise hit counters */
 #include <linux/security.h>	/* security_secctx_to_secid */
 #include "susfs_abi.h"
@@ -136,6 +137,11 @@ struct sus_or_entry {
 	 * target_path is what the reporters above are made to show instead. */
 	unsigned long redirected_ino;
 	dev_t redirected_dev;
+	/* Reverse direction, second number: fdinfo also prints mnt_id, and for the
+	 * redirected file that is the mount the redirection really opened - which can
+	 * differ from the target's (e.g. /system/etc/hosts vs /data/local/tmp/hosts).
+	 * Cached at add time because the reporter has only numbers to work with. */
+	unsigned long target_mnt_id;
 	/* Cached at add time, base references held for the entry's lifetime. */
 	struct path target_path;
 	struct path redirected_path;
@@ -292,12 +298,15 @@ static struct sus_or_entry *or_find_by_redirected_inode(unsigned long ino, dev_t
 	return NULL;
 }
 
-/* Reverse direction for the one caller that only has a number:
- * /proc/<pid>/fdinfo/N prints "ino:\t<i>" for the file an fd points at and no
- * device, so this lookup is by ino alone.  When two rules share that ino the call
- * refuses to answer - a missed disguise is better than disguising an unrelated
- * file (the same trade-off the dirent filter documents, made explicit here). */
-bool susfs_open_redirect_spoof_ino(unsigned long ino, unsigned long *out_ino)
+/* Reverse direction for the one caller that only has numbers:
+ * /proc/<pid>/fdinfo/N prints "mnt_id:\t<i>" and "ino:\t<j>" for the file an fd
+ * points at and no device, so this lookup is by ino alone.  When two rules share
+ * that ino the call refuses to answer - a missed disguise is better than
+ * disguising an unrelated file (the same trade-off the dirent filter documents,
+ * made explicit here).  On success it hands back both numbers the line should
+ * show: the target's ino, and the target's mount id (0 when unknown). */
+bool susfs_open_redirect_spoof_ids(unsigned long ino, unsigned long *out_ino,
+				   unsigned long *out_mnt_id)
 {
 	struct sus_or_entry *e = NULL;
 	int i, hits = 0;
@@ -317,6 +326,8 @@ bool susfs_open_redirect_spoof_ino(unsigned long ino, unsigned long *out_ino)
 	if (hits != 1)
 		return false;
 	*out_ino = e->target_ino;
+	if (out_mnt_id)
+		*out_mnt_id = e->target_mnt_id;
 	return true;
 }
 
@@ -525,13 +536,76 @@ static int or_fdinfo_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	return 0;
 }
 
+/* Find `label` in the already formatted buffer and parse the decimal that follows
+ * it.  Returns false when the label is absent or has no digits. */
+static bool or_fdinfo_find_dec(struct seq_file *m, const char *label, size_t label_len,
+			       size_t *out_pos, size_t *out_len, unsigned long *out_val)
+{
+	char *buf = m->buf;
+	size_t count = m->count, i, pos = 0, len = 0;
+	unsigned long v = 0;
+
+	for (i = 0; i + label_len < count; i++) {
+		if (!memcmp(buf + i, label, label_len)) {
+			pos = i + label_len;
+			break;
+		}
+	}
+	if (!pos)
+		return false;
+	while (pos + len < count && len < 10 &&
+	       buf[pos + len] >= '0' && buf[pos + len] <= '9') {
+		v = v * 10 + (unsigned long)(buf[pos + len] - '0');
+		len++;
+	}
+	if (!len)
+		return false;
+	*out_pos = pos;
+	*out_len = len;
+	*out_val = v;
+	return true;
+}
+
+/* Write new_val over the len digits at pos, growing or shrinking as needed.  The
+ * replacement can be LONGER (a redirected inode has no reason to be shorter than
+ * the target's - measured: 926498 -> 10166500 was refused by an earlier
+ * shrink-only version, so the hook reported hits with zero rewrites), and growing
+ * needs room in the seq_file buffer; without room the line is left alone rather
+ * than truncated. */
+static bool or_fdinfo_write_dec(struct seq_file *m, size_t pos, size_t len,
+				unsigned long new_val)
+{
+	char digits[12];
+	size_t count = m->count, i, n = 0;
+	unsigned int v = (unsigned int)new_val;
+
+	while (v) {
+		digits[n++] = (char)('0' + v % 10);
+		v /= 10;
+	}
+	if (!n)
+		return false;
+	if (n > len && count + (n - len) >= m->size)
+		return false;
+	for (i = 0; i < n / 2; i++) {
+		char t = digits[i];
+
+		digits[i] = digits[n - 1 - i];
+		digits[n - 1 - i] = t;
+	}
+	if (n != len)
+		memmove(m->buf + pos + n, m->buf + pos + len, count - (pos + len));
+	memcpy(m->buf + pos, digits, n);
+	m->count = count - len + n;
+	return true;
+}
+
 static int or_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct seq_file *m = *(struct seq_file **)ri->data;
-	char *buf, digits[12];
-	size_t count, i, pos = 0, len = 0, n = 0;
-	unsigned long old = 0, new_ino = 0;
-	unsigned int v;
+	size_t pos, len;
+	unsigned long old = 0, new_ino = 0, new_mnt = 0;
+	int rewrites = 0;
 
 	if (!m || (long)regs_return_value(regs) != 0)
 		return 0;
@@ -540,53 +614,28 @@ static int or_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	if (!or_reverse_visible())
 		return 0;
 
-	buf = m->buf;
-	count = m->count;
 	atomic_inc(&or_rev_fdinfo_hits);
 
-	for (i = 0; i + 5 < count; i++) {
-		if (!memcmp(buf + i, "ino:\t", 5)) {
-			pos = i + 5;
-			break;
-		}
-	}
-	if (!pos)
-		return 0;
-	while (pos + len < count && len < 10 &&
-	       buf[pos + len] >= '0' && buf[pos + len] <= '9') {
-		old = old * 10 + (unsigned long)(buf[pos + len] - '0');
-		len++;
-	}
-	if (!len)
-		return 0;
-	if (!susfs_open_redirect_spoof_ino(old, &new_ino) || new_ino == old)
-		return 0;
+	/* The ino is the rule's key, and the same rule knows the target's mount id -
+	 * so one lookup answers both lines.  ino is rewritten first: it sits after
+	 * mnt_id in the line, so shortening or growing it cannot move that one. */
+	if (or_fdinfo_find_dec(m, "ino:\t", 5, &pos, &len, &old) &&
+	    old && susfs_open_redirect_spoof_ids(old, &new_ino, &new_mnt) &&
+	    new_ino != old && or_fdinfo_write_dec(m, pos, len, new_ino))
+		rewrites++;
 
-	v = (unsigned int)new_ino;
-	while (v) {
-		digits[n++] = (char)('0' + v % 10);
-		v /= 10;
-	}
-	if (!n)
-		return 0;
-	/* The replacement can be LONGER than what it replaces: a redirected inode
-	 * number has no reason to be shorter than the target's, and the first version
-	 * of this only allowed shrinking, so `926498 -> 10166500` was refused and the
-	 * hook reported hits with zero rewrites.  Growing needs room in the seq_file
-	 * buffer; when there is none the line is left alone rather than truncated. */
-	if (n > len && count + (n - len) >= m->size)
-		return 0;
-	for (i = 0; i < n / 2; i++) {
-		char t = digits[i];
+	/* mnt_id, when a rule matched.  sus_mount rewrites this same label for the
+	 * ids in ITS table, and both probes are on the same function, so when an fd is
+	 * both "inside a hidden mount" and "the redirected file" the order of the two
+	 * return handlers decides which id wins.  Both answers are ids the caller
+	 * could have been shown, so this is a cosmetic race, not a leak - written
+	 * down because it is invisible in either module alone. */
+	if (new_mnt && or_fdinfo_find_dec(m, "mnt_id:\t", 8, &pos, &len, &old) &&
+	    old != new_mnt && or_fdinfo_write_dec(m, pos, len, new_mnt))
+		rewrites++;
 
-		digits[i] = digits[n - 1 - i];
-		digits[n - 1 - i] = t;
-	}
-	if (n != len)
-		memmove(buf + pos + n, buf + pos + len, count - (pos + len));
-	memcpy(buf + pos, digits, n);
-	m->count = count - len + n;
-	atomic_inc(&or_rev_fdinfo_rewrites);
+	if (rewrites)
+		atomic_inc(&or_rev_fdinfo_rewrites);
 	return 0;
 }
 
@@ -779,12 +828,13 @@ static int or_proc_show(struct seq_file *m, void *v)
 		for (i = 0; i < nor; i++) {
 			if (READ_ONCE(or_entries[i].dead))
 				continue;
-			seq_printf(m, "%s -> %s uid=%d (ino=%lu dev=%lu | rev: ino=%lu dev=%lu)\n",
+			seq_printf(m, "%s -> %s uid=%d (ino=%lu dev=%lu mnt=%lu | rev: ino=%lu dev=%lu)\n",
 				   or_entries[i].target_pathname,
 				   or_entries[i].redirected_pathname,
 				   or_entries[i].uid_scheme,
 				   or_entries[i].target_ino,
 				   (unsigned long)or_entries[i].target_dev,
+				   or_entries[i].target_mnt_id,
 				   or_entries[i].redirected_ino,
 				   (unsigned long)or_entries[i].redirected_dev);
 		}
@@ -967,6 +1017,7 @@ static int or_add(const char *target, const char *redirected, int scheme)
 	strscpy(e->redirected_pathname, redirected, OR_PATH_MAX);
 	e->target_ino = ti->i_ino;
 	e->target_dev = ti->i_sb->s_dev;
+	e->target_mnt_id = (unsigned long)real_mount(tp.mnt)->mnt_id;
 	e->redirected_ino = ri->i_ino;
 	e->redirected_dev = ri->i_sb->s_dev;
 	e->redirected_path = rp;   /* transfer the cached references */
