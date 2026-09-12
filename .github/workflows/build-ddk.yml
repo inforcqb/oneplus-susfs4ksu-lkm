@@ -83,3 +83,22 @@ jobs:
           name: susfs_sc
           path: /tmp/susfs_sc
           if-no-files-found: warn
+
+      # Micro-benchmark for the syscall layers (same freestanding shape as the
+      # client above).  Used to answer "what does the hook cost per call".
+      - name: Build syscall micro-benchmark
+        continue-on-error: true
+        run: |
+          clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
+                -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
+                -o /tmp/susfs_bench tools/susfs_bench.c
+          file /tmp/susfs_bench
+          ls -la /tmp/susfs_bench
+
+      - name: Upload micro-benchmark
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs_bench
+          path: /tmp/susfs_bench
+          if-no-files-found: warn
