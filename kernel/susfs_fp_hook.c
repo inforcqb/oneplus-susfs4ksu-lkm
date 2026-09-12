@@ -34,6 +34,8 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/errno.h>
+#include <linux/delay.h>
+#include <linux/rcupdate.h>
 #include <asm/unistd.h>
 
 #include "patch_memory.h"
