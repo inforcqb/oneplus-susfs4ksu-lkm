@@ -638,30 +638,30 @@ static void susfs_kstat_spoof_compat_statbuf(unsigned long statbuf)
 static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 {
 	unsigned long args[6];
-	unsigned long statbuf;
+	long nr;
 
 	if (ret != 0)
 		return;
 	syscall_get_arguments(current, regs, args);
-	statbuf = args[2];
-	if (!statbuf)
-		return;
+	nr = syscall_get_nr(current, regs);
 
+	/* The statbuf argument is NOT the same one for every syscall, so the NULL
+	 * check has to live inside each branch: fstat64(fd, statbuf) keeps it in
+	 * args[1], and checking args[2] first (as this did) made every 32-bit
+	 * fstat64() return early - the rule was applied to fstatat64 and silently
+	 * not to fstat64. */
 	if (is_compat_task()) {
-		/* Both of these fill struct stat64, but the buffer is a different
-		 * argument: fstatat64(dfd, path, statbuf, flag) vs fstat64(fd, statbuf).
-		 * Handling only the first number meant a 32-bit fstat64() was silently
-		 * left unspoofed. */
-		long nr = syscall_get_nr(current, regs);
-
+		/* Both of these fill struct stat64. */
 		if (nr == COMPAT_FSTATAT64_NR)
 			susfs_kstat_spoof_compat_statbuf((unsigned long)compat_ptr((u32)args[2]));
 		else if (nr == COMPAT_FSTAT64_NR)
 			susfs_kstat_spoof_compat_statbuf((unsigned long)compat_ptr((u32)args[1]));
 	} else {
-		if (syscall_get_nr(current, regs) != __NR_newfstatat)
+		if (nr != __NR_newfstatat)
 			return;
-		susfs_kstat_spoof_statbuf(statbuf);
+		if (!args[2])
+			return;
+		susfs_kstat_spoof_statbuf(args[2]);
 	}
 }
 
