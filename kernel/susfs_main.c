@@ -147,8 +147,17 @@ static int __init susfs_init(void)
      * only from non-root would leave a trace upstream does not have).  The
      * consequence is that `lsmod | grep susfs` is always empty, and a second
      * `insmod` fails with -EEXIST ("File exists"), which reads like a broken
-     * module.  Say where the truth is. */
-    SUSFS_LOGI("susfs_guard_lkm: loaded. This module is filtered out of /proc/modules for every caller including root, so `lsmod | grep susfs` stays empty - check /sys/module/%s instead (a second insmod fails with -EEXIST while it is loaded).\n",
+     * module.  Say where the truth is.
+     *
+     * THE ONE LINE THAT IGNORES THE LOG SWITCH.  Everything else the module says
+     * is informational and follows enable_log (see susfs_log.h); this line is the
+     * only evidence that the module came up, and it is the one thing an operator
+     * greps for - so it stays unconditional, including for a load that starts
+     * silent (`insmod ... enable_log=0`) and for CMD_SUSFS_ENABLE_LOG 0 later.
+     * Otherwise "loaded but logging off" is indistinguishable from "not loaded".
+     * Note the ordering: susfs_enable_log_init() runs above, so the parameter is
+     * already parsed by the time this prints. */
+    pr_info("susfs_guard_lkm: loaded. This module is filtered out of /proc/modules for every caller including root, so `lsmod | grep susfs` stays empty - check /sys/module/%s instead (a second insmod fails with -EEXIST while it is loaded).\n",
             SUSFS_LKM_MODULE_NAME);
 
     return 0;

@@ -23,6 +23,16 @@
 
 static bool log_enabled = true;
 
+/* Load-time switch, read-only in sysfs (the runtime switch is the /proc node and
+ * the supercall, because those are the interfaces upstream's userspace drives):
+ *
+ *     ksud insmod /data/local/tmp/susfs_guard_lkm.ko enable_log=0
+ *
+ * A load that starts silent is the only state in which the unconditional
+ * "loaded." line in susfs_main.c matters - without it, a loaded module with
+ * logging off would look exactly like a module that is not loaded. */
+module_param_named(enable_log, log_enabled, bool, 0444);
+
 bool susfs_log_enabled(void)
 {
 	return READ_ONCE(log_enabled);
