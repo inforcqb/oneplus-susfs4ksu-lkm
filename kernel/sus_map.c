@@ -183,6 +183,37 @@ static struct kprobe *const map_probes[] = {
 #define N_MAP_PROBES ARRAY_SIZE(map_probes)
 static bool map_probe_armed[N_MAP_PROBES];
 
+/* Registers whichever of the three are not up yet.  Called from init (when a rule
+ * already exists) and from the supercall that adds the first rule, so both paths
+ * arm exactly the same set. */
+static int sus_map_register_probes(void)
+{
+    int i, n = 0, first_err = 0;
+
+    for (i = 0; i < (int)N_MAP_PROBES; i++) {
+        int rc;
+
+        if (map_probe_armed[i])
+            continue;
+        rc = register_kprobe(map_probes[i]);
+        if (rc) {
+            pr_warn("sus_map: register_kprobe(%s) failed %d - that listing is not filtered\n",
+                    map_probes[i]->symbol_name, rc);
+            if (!first_err)
+                first_err = rc;
+            continue;
+        }
+        map_probe_armed[i] = true;
+        n++;
+    }
+
+    if (n)
+        pr_info("sus_map: %d/%d probes armed (%d rules)\n",
+                n, (int)N_MAP_PROBES, nmap);
+    map_registered = map_probe_armed[0];   /* show_map_vma is the required one */
+    return map_registered ? 0 : first_err;
+}
+
 static bool map_registered;
 
 int susfs_sus_map_init(void)
@@ -197,24 +228,9 @@ int susfs_sus_map_init(void)
 
     /* Every probe is optional on its own: without show_smap the maps listing is
      * still filtered, so one missing symbol must not take the rest down. */
-    {
-        int i, n = 0;
-
-        for (i = 0; i < (int)N_MAP_PROBES; i++) {
-            rc = register_kprobe(map_probes[i]);
-            if (rc) {
-                pr_warn("sus_map: register_kprobe(%s) failed %d - that listing is not filtered\n",
-                        map_probes[i]->symbol_name, rc);
-                continue;
-            }
-            map_probe_armed[i] = true;
-            n++;
-        }
-        map_registered = n > 0;
-        if (n)
-            pr_info("sus_map armed: %d rules, %d/%d probes\n",
-                    nmap, n, (int)N_MAP_PROBES);
-    }
+    rc = sus_map_register_probes();
+    if (rc)
+        return rc;
     return 0;
 }
 
@@ -283,15 +299,13 @@ void susfs_sus_map_supercall(void __user **arg)
             info.target_pathname, inode->i_ino);
     path_put(&p);
 
-    /* lazy-register the hook if this was the first rule */
+    /* lazy-register the hooks if this was the first rule */
     if (!map_registered) {
-        rc = register_kprobe(&kp_map);
+        rc = sus_map_register_probes();
         if (rc) {
-            pr_warn("register_kprobe(show_map_vma) failed %d\n", rc);
             info.err = rc;
             goto out;
         }
-        map_registered = true;
     }
     info.err = 0;
 out:
