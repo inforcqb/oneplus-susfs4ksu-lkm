@@ -668,6 +668,11 @@ static int or_proc_show(struct seq_file *m, void *v)
 
 static int or_proc_open(struct inode *inode, struct file *file)
 {
+	/* 0777 is deliberate (the ENOENT contract comes from sus_path's hidden set,
+	 * not from the mode), so refuse non-root callers here too - see the note in
+	 * susfs_enable_log.c's log_proc_open(). */
+	if (current_uid().val != 0)
+		return -ENOENT;
 	return single_open(file, or_proc_show, NULL);
 }
 

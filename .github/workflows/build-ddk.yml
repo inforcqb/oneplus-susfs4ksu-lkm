@@ -30,43 +30,73 @@ jobs:
       # Print the authoritative declarations instead of guessing them.
       - name: Show authoritative LSM hook signatures
         run: |
-          H=$KERNEL_SRC/include/linux/lsm_hooks.h
-          echo "=== header: $H ==="
-          echo "--- inode_permission ---"
-          grep -n -B3 -A3 "inode_permission)" "$H" || true
-          echo "--- inode_getattr ---"
-          grep -n -B2 -A2 "inode_getattr)" "$H" || true
+          set -e
+          # The tree moved between images ($KERNEL_SRC has pointed at
+          # /opt/ddk/kdir/... which does not exist, and the real one is under
+          # /opt/ddk/src), and the old step ended every grep with `|| true`, so it
+          # printed four "No such file or directory" errors and still went green.
+          # Find the tree, then fail if the greps do not actually produce output:
+          # this is the CFI-fragile part of the module (the prototypes have to
+          # match the kernel's hook types exactly).
+          H=""
+          for d in "${KERNEL_SRC:-}" "${KDIR:-}" /opt/ddk/src/android13-5.15 /opt/ddk/kdir/android13-5.15; do
+            if [ -n "$d" ] && [ -f "$d/include/linux/lsm_hooks.h" ]; then H="$d"; break; fi
+          done
+          if [ -z "$H" ]; then
+            echo "::error::no kernel tree with include/linux/lsm_hooks.h found (KERNEL_SRC=$KERNEL_SRC KDIR=$KDIR)"
+            exit 1
+          fi
+          echo "=== kernel tree: $H ==="
+          n=0
+          for pat in 'inode_permission)' 'inode_getattr)' 'inode_unlink)' 'sb_statfs)' 'path_notify)'; do
+            out=$(grep -n -B2 -A2 "$pat" "$H/include/linux/lsm_hooks.h" || true)
+            if [ -z "$out" ]; then
+              echo "::error::pattern '$pat' not found in $H/include/linux/lsm_hooks.h"
+              exit 1
+            fi
+            echo "--- $pat ---"; echo "$out"; n=$((n+1))
+          done
+          echo "checked $n hook prototypes"
+          echo "--- inode_permission implementation ---"
+          grep -n -A4 '^static int inode_permission' "$H/security/security.c" || true
           echo "--- selinux impls ---"
-          grep -n -A4 "^static int selinux_inode_permission" "$KERNEL_SRC/security/selinux/hooks.c" || true
-          grep -n -A3 "^static int selinux_inode_getattr" "$KERNEL_SRC/security/selinux/hooks.c" || true
+          grep -n -A4 '^static int selinux_inode_permission' "$H/security/selinux/hooks.c" || true
+          grep -n -A3 '^static int selinux_inode_getattr' "$H/security/selinux/hooks.c" || true
 
       - name: Build susfs_guard_lkm.ko (DDK way)
         run: |
           set -e
-          make -C $KDIR M=$PWD/kernel 
-               ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 
-               modules -j$(nproc) 2>&1 | tail -50
+          # One line on purpose: trailing backslashes followed by a blank line
+          # ended the shell continuation, so this used to run `make -C $KDIR
+          # M=.../kernel` with no ARCH/CC/LLVM and no `modules` target (the flags
+          # line became a no-op assignment and `modules` was "command not found",
+          # masked by the pipe into tail).  It only worked because the image
+          # exports ARCH/LLVM - i.e. the build silently depended on the image.
+          make -C "$KDIR" M="$PWD/kernel" ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules -j"$(nproc)"
           ls -la kernel/susfs_guard_lkm.ko
           file kernel/susfs_guard_lkm.ko
+
       - name: Verify sections (__versions / .BTF / cfi)
         run: |
+          set -e
           f=kernel/susfs_guard_lkm.ko
           readelf -S "$f" | grep -E "__versions|\.BTF|cfi|\.llvm_addrsig|\.plt|modinfo" || true
-          echo "--- vermagic"
+          echo "--- vermagic ---"
           modinfo "$f" 2>/dev/null | grep -E "vermagic|srcversion" || true
-
-      # Not part of the module: a freestanding aarch64 client for the supercall
-      # commands ksu_susfs does not expose (hide_sus_mnts_for_non_su_procs,
-      # add_sus_path_loop).  Build failure must not hide the module artifact, so
-      # this step is allowed to fail.
-      - name: Build userspace supercall client
-        continue-on-error: true
-        run: |
-          clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
-                -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
-                -o /tmp/susfs_sc tools/susfs_sc.c
-          file /tmp/susfs_sc
-          ls -la /tmp/susfs_sc
+          echo "--- KMI version-check state ---"
+          # modpost emits CRCs (and srcversion, and a module_layout dependency)
+          # only when Module.symvers carries them.  This DDK tree's __versions is
+          # empty, so the kernel's check_version() finds no entry for ANY imported
+          # symbol and load-time symbol version checking does not happen - i.e.
+          # "it loads" is not evidence that the KMI matches.  Fail loudly here
+          # rather than let that pass as a green build.
+          vs=$(readelf -SW "$f" | awk '/\] __versions/ {print $6}')
+          sv=$(readelf -p .modinfo "$f" | grep -c 'srcversion=' || true)
+          ml=$(nm -u "$f" | grep -c 'module_layout' || true)
+          echo "__versions size=${vs:-?} srcversion=${sv} module_layout=${ml}"
+          if [ "${vs:-0}" = "0" ] || [ "${sv:-0}" = "0" ] || [ "${ml:-0}" = "0" ]; then
+            echo "::warning::no symbol CRCs in this build tree: load-time version checks are inert (Module.symvers has no CRC entries)"
+          fi
 
       - name: Upload .ko
         uses: actions/upload-artifact@v4
@@ -75,6 +105,24 @@ jobs:
           path: |
             kernel/susfs_guard_lkm.ko
           if-no-files-found: error
+
+      # The tools come after the .ko upload on purpose: they are built
+      # freestanding by the same clang, and a broken tool now FAILS the job (it is
+      # the evidence-gathering half of this project - a tool that cannot compile or
+      # that reads the ABI wrong is how "verified" becomes wrong), while the
+      # module artifact has already been published by then.
+      #
+      # Not part of the module: a freestanding aarch64 client for the supercall
+      # commands ksu_susfs does not expose (hide_sus_mnts_for_non_su_procs,
+      # add_sus_path_loop).
+      - name: Build userspace supercall client
+        run: |
+          set -e
+          clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
+                -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
+                -o /tmp/susfs_sc tools/susfs_sc.c
+          file /tmp/susfs_sc
+          ls -la /tmp/susfs_sc
 
       - name: Upload userspace client
         continue-on-error: true
@@ -87,7 +135,6 @@ jobs:
       # Micro-benchmark for the syscall layers (same freestanding shape as the
       # client above).  Used to answer "what does the hook cost per call".
       - name: Build syscall micro-benchmark
-        continue-on-error: true
         run: |
           clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
                 -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
@@ -108,7 +155,6 @@ jobs:
       # because the child that runs dd has its own mm and therefore its own
       # addresses.
       - name: Build mmap/pagemap probe
-        continue-on-error: true
         run: |
           clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
                 -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
@@ -127,7 +173,6 @@ jobs:
       # The detector's view of a hidden mount: the mnt_id that /proc/self/fdinfo/N
       # prints and statx(2) returns, checked against the ids mountinfo lists.
       - name: Build mnt_id cross-check
-        continue-on-error: true
         run: |
           clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
                 -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \

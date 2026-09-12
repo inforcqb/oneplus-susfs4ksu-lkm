@@ -103,8 +103,20 @@ static void susfs_show_enabled_features(void __user **arg)
 	int i;
 
 	info = kzalloc(sizeof(*info), GFP_KERNEL);
-	if (!info)
+	if (!info) {
+		/* A struct-returning command that answers nothing at all leaves
+		 * whatever the caller had in the buffer - for the shipped clients that
+		 * is a zeroed struct, so userspace cannot tell "no memory" from "the
+		 * kernel said nothing".  Report it in the only field the ABI reserves
+		 * for it; task_work context, so the copy is allowed to sleep. */
+		struct st_susfs_enabled_features fallback = {0};
+
+		fallback.err = -ENOMEM;
+		if (copy_to_user((void __user *)*arg, &fallback, sizeof(fallback)))
+			pr_warn("susfs show_enabled_features copy_to_user failed\n");
+		pr_warn_ratelimited("susfs: show_enabled_features kzalloc failed, reported -ENOMEM\n");
 		return;
+	}
 
 	for (i = 0; i < ARRAY_SIZE(enabled_features); i++) {
 		const char *name = enabled_features[i].name;
@@ -142,7 +154,9 @@ static void susfs_tw_func(struct callback_head *cb)
 		break;
 	case CMD_SUSFS_ADD_SUS_PATH:
 	case CMD_SUSFS_ADD_SUS_PATH_LOOP:
-		sus_path_supercall(&arg);
+		/* The two commands answer a missing path differently upstream, so the
+		 * handler has to know which one it is. */
+		sus_path_supercall(tw->cmd, &arg);
 		break;
 	case CMD_SUSFS_ADD_SUS_MAP:
 		susfs_sus_map_supercall(&arg);
@@ -295,9 +309,64 @@ static struct kprobe reboot_kp = {
 
 static bool sc_registered;
 
+/* ---- ABI layout assertions ----
+ *
+ * The sizes and `err` offsets below ARE the userspace contract: ksu_susfs, ksud
+ * and tools/susfs_sc are compiled against these exact numbers, and a drift shows
+ * up as "the command returned 0 and userspace printed garbage" rather than as a
+ * build error.  The repository's own layout harness (abi_layout_check/) is not
+ * wired into any build step, so the cheap insurance is here: a compile-time trip
+ * wire for every struct that crosses the boundary.
+ *
+ * Values are aarch64 LP64, the only ABI any shipped client uses (upstream's
+ * structs have the same shapes: kernel_patches/include/linux/susfs.h).  If a
+ * struct is ever deliberately changed, this is the function that has to be
+ * updated together with the clients - which is exactly the reminder it exists
+ * to be. */
+static void __init susfs_abi_layout_check(void)
+{
+	BUILD_BUG_ON(sizeof(struct st_susfs_sus_path) != 260);
+	BUILD_BUG_ON(offsetof(struct st_susfs_sus_path, err) != 256);
+
+	BUILD_BUG_ON(sizeof(struct st_susfs_sus_map) != 260);
+	BUILD_BUG_ON(offsetof(struct st_susfs_sus_map, err) != 256);
+
+	BUILD_BUG_ON(sizeof(struct st_susfs_sus_kstat) != 376);
+	BUILD_BUG_ON(offsetof(struct st_susfs_sus_kstat, err) != 372);
+
+	BUILD_BUG_ON(sizeof(struct st_susfs_uname) != 136);
+	BUILD_BUG_ON(offsetof(struct st_susfs_uname, err) != 132);
+
+	BUILD_BUG_ON(sizeof(struct st_susfs_log) != 8);
+	BUILD_BUG_ON(offsetof(struct st_susfs_log, err) != 4);
+
+	BUILD_BUG_ON(sizeof(struct st_susfs_avc_log_spoofing) != 8);
+	BUILD_BUG_ON(offsetof(struct st_susfs_avc_log_spoofing, err) != 4);
+
+	BUILD_BUG_ON(sizeof(struct st_susfs_hide_sus_mnts_for_non_su_procs) != 8);
+	BUILD_BUG_ON(offsetof(struct st_susfs_hide_sus_mnts_for_non_su_procs, err) != 4);
+
+	BUILD_BUG_ON(sizeof(struct st_susfs_open_redirect) != 520);
+	BUILD_BUG_ON(offsetof(struct st_susfs_open_redirect, err) != 516);
+
+	BUILD_BUG_ON(sizeof(struct st_susfs_spoof_cmdline_or_bootconfig) != 8196);
+	BUILD_BUG_ON(offsetof(struct st_susfs_spoof_cmdline_or_bootconfig, err) != 8192);
+
+	BUILD_BUG_ON(sizeof(struct st_susfs_version) != 20);
+	BUILD_BUG_ON(offsetof(struct st_susfs_version, err) != 16);
+
+	BUILD_BUG_ON(sizeof(struct st_susfs_variant) != 20);
+	BUILD_BUG_ON(offsetof(struct st_susfs_variant, err) != 16);
+
+	BUILD_BUG_ON(sizeof(struct st_susfs_enabled_features) != 8196);
+	BUILD_BUG_ON(offsetof(struct st_susfs_enabled_features, err) != 8192);
+}
+
 int susfs_supercall_init(void)
 {
 	int rc;
+
+	susfs_abi_layout_check();
 
 	rc = register_kprobe(&reboot_kp);
 	if (rc) {

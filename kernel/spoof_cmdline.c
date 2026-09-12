@@ -23,7 +23,12 @@
 /* unexported static var; ksud insmod relocates it via kallsyms */
 extern char *saved_boot_config;
 
-static char param_bootconfig[256];
+/* The supercall's field is SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE (8192) wide, but
+ * this insmod parameter cannot be that large: module_param_string()'s value is
+ * written through a sysfs attribute, and a sysfs write is capped at one page.  So
+ * the parameter tops out at 4095 bytes where the supercall accepts 8191 - a
+ * difference worth knowing before setting a long bootconfig at load time. */
+static char param_bootconfig[4096];
 module_param_string(bootconfig, param_bootconfig, sizeof(param_bootconfig), 0644);
 
 static char *orig_boot_config;
@@ -116,10 +121,24 @@ void susfs_spoof_cmdline_exit(void)
 void susfs_spoof_cmdline_supercall(void __user **arg)
 {
 	struct st_susfs_spoof_cmdline_or_bootconfig *info;
+	int err;
 
 	info = kzalloc(sizeof(*info), GFP_KERNEL);
-	if (!info)
+	if (!info) {
+		/* The kprobe has already claimed the syscall and answered 0, so
+		 * returning silently leaves the caller's pre-seeded 126
+		 * (ERR_CMD_NOT_SUPPORTED) in place: the C tool then reports "please
+		 * enable SUSFS in kernel" for a command this kernel implements, and
+		 * ksud's err==126 check turns it into a silent success.  Upstream
+		 * writes -ENOMEM here (fs/susfs.c:707-713); this runs in task_work
+		 * context, so the writeback is safe. */
+		err = -ENOMEM;
+		if (copy_to_user(&((struct st_susfs_spoof_cmdline_or_bootconfig __user *)*arg)->err,
+				 &err, sizeof(err)))
+			pr_warn("cmdline supercall copy_to_user failed\n");
+		pr_warn_ratelimited("spoof_cmdline: kzalloc failed, reported -ENOMEM\n");
 		return;
+	}
 
 	if (copy_from_user(info, (void __user *)*arg, sizeof(*info))) {
 		info->err = -EFAULT;

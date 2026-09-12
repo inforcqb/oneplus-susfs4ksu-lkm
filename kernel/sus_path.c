@@ -2555,25 +2555,30 @@ void sus_path_exit(void)
  *                              susfs.c:134-172 - see the block above
  *                              sus_path_resolve_pending()).
  *
- * The dispatcher hands both commands to this one function without saying which
- * one arrived (susfs_supercall.c:143-146), so the permissive rule wins: a path
- * that does not exist yet is registered as PENDING instead of being rejected,
- * which is exactly what the _LOOP variant promises.  Only "not there yet"
- * (-ENOENT) is treated that way - a real lookup error (ENOTDIR, EACCES on a
- * parent, ELOOP) is still reported, and the tool's add_sus_path() runs
- * realpath() first, so its behaviour does not change either.
+ * The dispatcher hands both commands to this one function and now says which one
+ * arrived, because upstream's two commands answer a missing path differently:
+ *
+ *   CMD_SUSFS_ADD_SUS_PATH       kern_path() failure is the command's answer
+ *                                (-ENOENT, susfs.c:58-62) - nothing is registered
+ *   CMD_SUSFS_ADD_SUS_PATH_LOOP  empty-string check only, then "hidden from the
+ *                                moment it appears" (susfs.c:99-132)
+ *
+ * Treating both as pending made the plain command answer 0 for a path that does
+ * not exist, so a caller other than the stock tool (which realpath()s first)
+ * believed a rule was installed that upstream would have rejected.
  *
  * A pending rule is not dead weight: the path-string layer matches the
  * registered string, so open/stat/exec/readlink answer ENOENT from the moment
  * the path exists.  What the pending state delays is the by-inode layers (LSM
  * hooks, DAC probes) and the getdents64 filter, which are filled in as soon as
  * the inode resolves. */
-void sus_path_supercall(void __user **arg)
+void sus_path_supercall(unsigned int cmd, void __user **arg)
 {
     struct st_susfs_sus_path info = {0};
     struct sus_path_entry *e;
     struct path path = {0};
     struct inode *inode = NULL;
+    bool pending_ok = (cmd == CMD_SUSFS_ADD_SUS_PATH_LOOP);
     u64 dev = 0;
     u64 ino = 0;
     int rc;
@@ -2605,6 +2610,19 @@ void sus_path_supercall(void __user **arg)
     if (rc && rc != -ENOENT) {
         pr_warn("sus_path: failed opening '%s' (%d)\n", info.target_pathname, rc);
         info.err = rc;
+        goto out;
+    }
+    /* Upstream's plain ADD_SUS_PATH reports a missing path: its
+     * `err = kern_path(...)` IS the answer (fs/susfs.c:58-62).  Only the _LOOP
+     * variant accepts "not there yet" and resolves it later.  (Note that this
+     * kern_path() also runs into our own rule when the path is already hidden -
+     * upstream is no different, its rejection lives in walk_component(), so a
+     * caller that hides a path first and then tries to register something else on
+     * it gets the same -ENOENT from both implementations.) */
+    if (rc == -ENOENT && !pending_ok) {
+        pr_info("sus_path: '%s' does not exist and this is ADD_SUS_PATH (not _LOOP): reporting -ENOENT like upstream\n",
+                info.target_pathname);
+        info.err = -ENOENT;
         goto out;
     }
 

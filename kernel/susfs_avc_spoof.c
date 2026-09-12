@@ -29,6 +29,7 @@
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
 #include <linux/string.h>
+#include <linux/cred.h>	/* current_uid(), control-node gate */
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc */
@@ -109,6 +110,11 @@ static int avc_proc_show(struct seq_file *m, void *v)
 
 static int avc_proc_open(struct inode *inode, struct file *file)
 {
+	/* 0777 is deliberate (the ENOENT contract comes from sus_path's hidden set,
+	 * not from the mode), so refuse non-root callers here too - see the note in
+	 * susfs_enable_log.c's log_proc_open(). */
+	if (current_uid().val != 0)
+		return -ENOENT;
 	return single_open(file, avc_proc_show, NULL);
 }
 
@@ -117,6 +123,9 @@ static ssize_t avc_proc_write(struct file *file, const char __user *buf,
 {
 	char c;
 	int rc = 0;
+
+	if (current_uid().val != 0)
+		return -ENOENT;
 
 	if (copy_from_user(&c, buf, 1))
 		return -EFAULT;
@@ -130,6 +139,9 @@ static ssize_t avc_proc_write(struct file *file, const char __user *buf,
 	} else if (c == '0') {
 		avc_unregister();
 		avc_spoof_enabled = false;
+	} else {
+		/* Only '0' and '1' are the protocol. */
+		return -EINVAL;
 	}
 
 	if (rc)

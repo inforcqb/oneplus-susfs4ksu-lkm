@@ -13,6 +13,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
+#include <linux/cred.h>	/* current_uid(), control-node gate */
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc */
@@ -23,7 +24,10 @@ bool susfs_log_enabled(void)
 {
 	return READ_ONCE(log_enabled);
 }
-EXPORT_SYMBOL(susfs_log_enabled);
+/* Deliberately NOT EXPORT_SYMBOL'd: the only user is this module (susfs_log.h
+ * wraps it), and an exported name shows up as a [susfs_guard_lkm]-owned symbol in
+ * /proc/kallsyms - part of the module's outward surface that upstream SUSFS does
+ * not have. */
 
 static int log_proc_show(struct seq_file *m, void *v)
 {
@@ -33,6 +37,15 @@ static int log_proc_show(struct seq_file *m, void *v)
 
 static int log_proc_open(struct inode *inode, struct file *file)
 {
+	/* The node is created 0777 on purpose: the ENOENT contract for non-root
+	 * callers is delivered by sus_path's hidden set, and a restrictive mode
+	 * would answer EACCES instead - which leaks that the node exists.  That
+	 * makes sus_path's hook the only thing between an app and this interface,
+	 * so the handler refuses non-root callers itself as well.  ENOENT keeps the
+	 * same answer the hidden set gives, and costs nothing for the intended
+	 * caller (ksu_susfs runs as root). */
+	if (current_uid().val != 0)
+		return -ENOENT;
 	return single_open(file, log_proc_show, NULL);
 }
 
@@ -41,12 +54,23 @@ static ssize_t log_proc_write(struct file *file, const char __user *buf,
 {
 	char c;
 
+	/* Same reason as the open check: an fd opened before the process dropped
+	 * privileges must not become a way in. */
+	if (current_uid().val != 0)
+		return -ENOENT;
+
 	if (copy_from_user(&c, buf, 1))
 		return -EFAULT;
 
+	/* Only '0' and '1' are the protocol.  The old code accepted every other
+	 * byte, still reported len, and toggled nothing - a typo was
+	 * indistinguishable from success. */
+	if (c != '0' && c != '1')
+		return -EINVAL;
+
 	if (c == '1')
 		WRITE_ONCE(log_enabled, true);
-	else if (c == '0')
+	else
 		WRITE_ONCE(log_enabled, false);
 
 	pr_info("susfs: %s logging to kernel\n", log_enabled ? "enable" : "disable");

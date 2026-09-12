@@ -44,7 +44,19 @@ typedef long s64;
 #define KSU_INSTALL_MAGIC1 0xDEADBEEF
 #define SUSFS_MAGIC 0xFAFAFAFA
 
-#define PAYLOAD_MAX 4096
+/* Large enough for the biggest payload struct in the ABI
+ * (st_susfs_spoof_cmdline_or_bootconfig and st_susfs_enabled_features are 8196:
+ * a 4096-byte buffer here made the kernel copy 4 KB past its end). */
+#define PAYLOAD_MAX 8196
+
+/* Every reply struct in kernel/susfs_abi.h ends with its `int err` as the LAST
+ * field, and all twelve have sizeof - offsetof(err) == 4 (260/256, 376/372,
+ * 136/132, 8/4, 520/516, 8196/8192, 20/16), so when the caller supplies the
+ * whole struct as hex the err lives at len-4.  Reading it as
+ * `*(unsigned long *)(payload + ((len - 8) & ~7))` - which this tool used to do -
+ * rounds DOWN to an 8-byte boundary and therefore prints the four bytes BEFORE
+ * err for every struct whose size is 4 mod 8, i.e. for most of them. */
+#define ERR_SEED 126		/* ERR_CMD_NOT_SUPPORTED, like the C tool */
 
 static char payload[PAYLOAD_MAX] __attribute__((aligned(16)));
 static char out[256];
@@ -95,6 +107,31 @@ static void say_hex(unsigned long v)
 	for (i = 60; i >= 0; i -= 4)
 		*p++ = d[(v >> i) & 0xf];
 	*p++ = '\n';
+	puts_len(out, p - out);
+}
+
+static void say_dec(long v)
+{
+	char tmp[24];
+	char *p = out;
+	int n = 0;
+	unsigned long u;
+
+	if (v < 0) {
+		*p++ = '-';
+		u = (unsigned long)(-v);
+	} else {
+		u = (unsigned long)v;
+	}
+	if (!u) {
+		tmp[n++] = '0';
+	}
+	while (u) {
+		tmp[n++] = (char)('0' + (u % 10));
+		u /= 10;
+	}
+	while (n)
+		*p++ = tmp[--n];
 	puts_len(out, p - out);
 }
 
@@ -153,6 +190,7 @@ int sc_main(long argc, char **argv)
 {
 	long cmd, len;
 	long rc;
+	int err;
 
 	if (argc < 2) {
 		say("usage: susfs_sc <cmd-hex> [payload-hex]\n");
@@ -166,12 +204,23 @@ int sc_main(long argc, char **argv)
 
 	len = 0;
 	if (argc > 2) {
+		/* parse_hex() returns -1 when the input does not fit in the buffer, so
+		 * an oversized struct is refused here instead of being handed to the
+		 * kernel truncated (the kernel would copy_from_user the full struct and
+		 * read past the end of this buffer). */
 		len = parse_hex(argv[2], payload, PAYLOAD_MAX);
 		if (len < 0) {
-			say("susfs_sc: bad payload hex\n");
+			say("susfs_sc: bad or oversized payload hex\n");
 			return 2;
 		}
 	}
+
+	/* Seed 126 like the stock C tool does: if the kernel does not recognise the
+	 * command it leaves the buffer untouched, and "still 126" is how userspace
+	 * detects "not supported".  Without the seed this client could never show
+	 * that, which was the whole point of its err readback. */
+	if (len >= 4)
+		*(int *)(payload + len - 4) = ERR_SEED;
 
 	say("susfs_sc: cmd ");
 	say_hex((unsigned long)cmd);
@@ -179,16 +228,17 @@ int sc_main(long argc, char **argv)
 		  (long)payload);
 	say("susfs_sc: reboot() returned ");
 	say_hex((unsigned long)rc);
-	if (len >= 8) {
-		/* Most SUSFS reply structs end with an int err; echo it either way.
-		 * On a NEGATIVE syscall result the caller seeded err with 126 and
-		 * must still see 126 - that is how "command not supported" is
-		 * detected - so printing it only on success would hide the very
-		 * thing this client exists to check. */
-		say("susfs_sc: payload tail: ");
-		say_hex(*(unsigned long *)(payload + ((len - 8) & ~7L)));
-	}
-	return rc == 0 ? 0 : 1;
+	err = (len >= 4) ? *(int *)(payload + len - 4) : 0;
+	say("susfs_sc: err=");
+	say_dec(err);
+	say(" (");
+	say_hex((unsigned long)(long)err);
+	say(")\n");
+	if (len >= 4 && err == ERR_SEED)
+		say("susfs_sc: err is still the 126 sentinel: this kernel did not answer that command\n");
+	/* Non-zero when either half of the contract failed: the syscall result or
+	 * the err the kernel wrote back. */
+	return (rc == 0 && err == 0) ? 0 : 1;
 }
 
 __asm__(
