@@ -97,7 +97,7 @@ static int __init susfs_init(void)
 {
     int ret;
 
-    SUSFS_LOGI("susfs_guard_lkm: init v%s\n", SUSFS_LKM_VERSION);
+    SUSFS_LOGI("init v%s\n", SUSFS_LKM_VERSION);
     ksu_init_symbol_resolver();
     ksu_lsm_hook_init();
 
@@ -156,8 +156,10 @@ static int __init susfs_init(void)
      * silent (`insmod ... enable_log=0`) and for CMD_SUSFS_ENABLE_LOG 0 later.
      * Otherwise "loaded but logging off" is indistinguishable from "not loaded".
      * Note the ordering: susfs_enable_log_init() runs above, so the parameter is
-     * already parsed by the time this prints. */
-    pr_info("susfs_guard_lkm: loaded. This module is filtered out of /proc/modules for every caller including root, so `lsmod | grep susfs` stays empty - check /sys/module/%s instead (a second insmod fails with -EEXIST while it is loaded).\n",
+     * already parsed by the time this prints.  The prefix comes from pr_fmt
+     * (susfs_log.h), so the message itself must not repeat it - it used to print
+     * "susfs_guard_lkm: susfs_guard_lkm: loaded." */
+    pr_info("loaded. This module is filtered out of /proc/modules for every caller including root, so `lsmod | grep susfs` stays empty - check /sys/module/%s instead (a second insmod fails with -EEXIST while it is loaded).\n",
             SUSFS_LKM_MODULE_NAME);
 
     return 0;
