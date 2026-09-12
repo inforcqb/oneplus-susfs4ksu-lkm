@@ -382,7 +382,12 @@ static bool sus_mount_fdinfo_replace_mntid(struct seq_file *m)
         digits[n++] = (char)('0' + v % 10);
         v /= 10;
     }
-    if (!n || n > len)			/* never grow the buffer */
+    if (!n)
+        return false;
+    /* In practice a KSU-range id is replaced by a small host id, so this shrinks -
+     * but the room check is here so a rule with an unexpectedly long host id
+     * cannot overwrite past the seq_file buffer. */
+    if (n > len && count + (n - len) >= m->size)
         return false;
     for (i = 0; i < n / 2; i++) {
         char t = digits[i];

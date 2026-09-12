@@ -567,7 +567,14 @@ static int or_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 		digits[n++] = (char)('0' + v % 10);
 		v /= 10;
 	}
-	if (!n || n > len)		/* never grow the buffer */
+	if (!n)
+		return 0;
+	/* The replacement can be LONGER than what it replaces: a redirected inode
+	 * number has no reason to be shorter than the target's, and the first version
+	 * of this only allowed shrinking, so `926498 -> 10166500` was refused and the
+	 * hook reported hits with zero rewrites.  Growing needs room in the seq_file
+	 * buffer; when there is none the line is left alone rather than truncated. */
+	if (n > len && count + (n - len) >= m->size)
 		return 0;
 	for (i = 0; i < n / 2; i++) {
 		char t = digits[i];
