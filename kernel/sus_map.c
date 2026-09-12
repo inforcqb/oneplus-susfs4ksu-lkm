@@ -41,20 +41,10 @@
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact, for the walk ops */
 
 #define SUS_MAP_MAX 64
-/* Path comparison happens on a kernel-rendered path (d_path output), so this is
- * PATH_MAX-ish rather than NAME_MAX.  It costs 64 * 256 bytes of .bss. */
-#define SUS_MAP_PATH_LEN 256
 
 struct sus_map_entry {
     unsigned long target_ino;
     dev_t target_dev;
-    /* The registered path, kept for the one surface that can only be judged by
-     * name: /proc/<pid>/map_files/<start>-<end> is a symlink whose target the
-     * kernel renders as a path string (proc_map_files_get_link -> d_path), with no
-     * inode of ours to compare against - the inode the hook sees belongs to
-     * procfs, not to the mapped file.  Empty for rules added through the map_ino
-     * parameter, which never had a path. */
-    char path[SUS_MAP_PATH_LEN];
 };
 
 static struct sus_map_entry map_entries[SUS_MAP_MAX];
@@ -79,7 +69,7 @@ module_param_named(map_ino, param_map_ino, ulong, 0644);
 
 /* dev==0 means "any filesystem" (only reachable through the map_ino parameter,
  * which cannot know the device).  `path` may be NULL/empty (same parameter). */
-static int sus_map_add_full(unsigned long ino, dev_t dev, const char *path)
+static int sus_map_add_full(unsigned long ino, dev_t dev)
 {
     unsigned long flags;
     int rc = 0;
@@ -92,9 +82,6 @@ static int sus_map_add_full(unsigned long ino, dev_t dev, const char *path)
     if (nmap < SUS_MAP_MAX) {
         map_entries[nmap].target_ino = ino;
         map_entries[nmap].target_dev = dev;
-        map_entries[nmap].path[0] = '\0';
-        if (path && path[0])
-            strscpy(map_entries[nmap].path, path, SUS_MAP_PATH_LEN);
         smp_store_release(&nmap, nmap + 1);
     } else {
         rc = -ENOSPC;
@@ -105,7 +92,7 @@ static int sus_map_add_full(unsigned long ino, dev_t dev, const char *path)
 
 static void sus_map_add(unsigned long ino)
 {
-    sus_map_add_full(ino, 0, NULL);
+    sus_map_add_full(ino, 0);
 }
 
 static bool sus_map_lookup(unsigned long ino, dev_t dev)
@@ -119,29 +106,6 @@ static bool sus_map_lookup(unsigned long ino, dev_t dev)
         if (map_entries[i].target_dev && map_entries[i].target_dev != dev)
             continue;
         return true;
-    }
-    return false;
-}
-
-/* Name-based lookup, for the map_files symlink only (see the struct's `path`).
- *
- * A rule registered through the map_ino parameter has no path and never matches
- * here - it is still hidden everywhere the inode is available.  The comparison is
- * a plain string compare against what the kernel renders for the mapped file, so
- * a rule registered through a symlink whose textual form differs from d_path's
- * output will not match: a miss, never a wrong hide. */
-static bool sus_map_path_lookup(const char *path)
-{
-    int n = smp_load_acquire(&nmap);
-    int i;
-
-    if (!path || path[0] != '/')
-        return false;
-    for (i = 0; i < n; i++) {
-        if (!map_entries[i].path[0])
-            continue;
-        if (!strcmp(map_entries[i].path, path))
-            return true;
     }
     return false;
 }
@@ -508,27 +472,51 @@ static struct kprobe kp_map_walk_vma = {
 
 /* ---- /proc/<pid>/map_files/<start>-<end> ----
  *
- * Each of those entries is a symlink to the file mapped at that range, and its
- * target is rendered by proc_map_files_get_link() -> d_path(), so `ls -l` and
- * `readlink` name a sus_map-registered file outright - measured: that is how the
- * a4 tests found the address of a mapping the maps listing had already dropped.
+ * Each of those entries is a symlink to the file mapped at that range, so `ls -l`
+ * and `readlink` name a sus_map-registered file outright - measured: that is how
+ * the a4 tests found the address of a mapping the maps listing had already
+ * dropped, i.e. this listing undid the hiding.
  *
  * Upstream skips the entry in proc_map_files_readdir() (patch:1088-1095), so for
  * upstream the name never appears at all.  A kprobe cannot skip one entry of a
- * readdir - the decision lives in the middle of that function, on a local - so
+ * readdir - the decision is made on a local in the middle of that function - so
  * this covers the other half: the symlink still exists, but resolving it answers
- * ENOENT, which is the same answer a checker gets for a file that is not there.
- * The residual difference (the range is still listed) is recorded in
+ * ENOENT, the same answer a checker gets for a file that is not there.  The
+ * residual difference (the range is still listed) is recorded in
  * TECHNICAL_NOTES.md; closing it would need the readdir loop itself.
  *
- * The hook only ever fails a call that would have succeeded, so it is safe: the
- * consumer in vfs_readlink() handles ERR_PTR from ->get_link() by design. */
-static int sus_map_getlink_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+ * WHICH function to hook is not guessable, and the first attempt got it wrong:
+ * `proc_map_files_get_link` (the i_op) registered fine and was never called.  Two
+ * facts from this kernel's fs/proc/base.c explain why:
+ *
+ *   - do_readlinkat() calls i_op->readlink FIRST and only falls back to
+ *     vfs_readlink() (-> get_link) when it is NULL.  proc_map_files uses
+ *     `.readlink = proc_pid_readlink`, so readlink(2) never touches get_link;
+ *     `ls -l` uses readlink(2) too.
+ *   - proc_pid_readlink() ends up in the per-inode callback
+ *     `ei->op.proc_get_link` = map_files_get_link(dentry, struct path *path) -
+ *     which is the one place that hands over the MAPPED file's path.
+ *
+ * So the hook sits on map_files_get_link and judges by inode (path->dentry),
+ * which is exact: no path string to compare, no spelling to get wrong.  It only
+ * ever fails a call that would have succeeded - the caller checks its return
+ * value and treats a negative one as "no link". */
+static int sus_map_maplink_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    const char *target = (const char *)regs_return_value(regs);
+    /* struct path *path is the output argument; it is only filled in by the time
+     * the function returns, so remember it here and read it there. */
+    *(unsigned long *)ri->data = regs->regs[1];
+    return 0;
+}
+
+static int sus_map_maplink_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    unsigned long outp = *(unsigned long *)ri->data;
+    const struct path *p;
+    struct inode *inode;
 
     atomic_inc(&n_getlink_calls);
-    if (!target || IS_ERR(target)) {
+    if ((long)regs_return_value(regs) != 0 || !outp) {
         atomic_inc(&n_getlink_skip);
         return 0;
     }
@@ -536,25 +524,33 @@ static int sus_map_getlink_ret(struct kretprobe_instance *ri, struct pt_regs *re
         atomic_inc(&n_getlink_skip);
         return 0;
     }
-    if (!sus_map_path_lookup(target)) {
-        /* Printed (a couple of times, then ratelimited) because a miss here is
-         * indistinguishable from "the hook never ran": the path d_path renders may
-         * not be byte-identical to the path the rule was registered with. */
+    p = (const struct path *)outp;
+    if (!p->dentry) {
+        atomic_inc(&n_getlink_skip);
+        return 0;
+    }
+    inode = d_inode(p->dentry);
+    if (!inode) {
+        atomic_inc(&n_getlink_skip);
+        return 0;
+    }
+    if (!sus_map_lookup(inode->i_ino, inode->i_sb->s_dev)) {
         atomic_inc(&n_getlink_nomatch);
-        pr_info_ratelimited("sus_map: map_files target not matched: '%s'\n", target);
         return 0;
     }
 
     atomic_inc(&n_map_files_hides);
-    pr_info_ratelimited("sus_map: hid map_files symlink to '%s' (uid=%u)\n",
-                        target, current_uid().val);
-    regs_set_return_value(regs, (unsigned long)ERR_PTR(-ENOENT));
+    pr_info_ratelimited("sus_map: hid map_files symlink to ino=%lu (uid=%u)\n",
+                        inode->i_ino, current_uid().val);
+    regs_set_return_value(regs, (unsigned long)(long)-ENOENT);
     return 0;
 }
 
 static struct kretprobe kr_map_files = {
-    .kp.symbol_name = "proc_map_files_get_link",
-    .handler = sus_map_getlink_ret,
+    .kp.symbol_name = "map_files_get_link",
+    .entry_handler = sus_map_maplink_entry,
+    .handler = sus_map_maplink_ret,
+    .data_size = sizeof(unsigned long),	/* the output struct path * */
     .maxactive = 16,
 };
 static bool kr_map_files_ok;
@@ -729,7 +725,7 @@ void susfs_sus_map_supercall(void __user **arg)
      * which returns early when ino==0, and then wrote map_entries[nmap-1]
      * unconditionally - indexing -1 at worst, or corrupting the previous rule's
      * device at best. */
-    rc = sus_map_add_full(inode->i_ino, inode->i_sb->s_dev, info.target_pathname);
+    rc = sus_map_add_full(inode->i_ino, inode->i_sb->s_dev);
     if (rc) {
         path_put(&p);
         info.err = rc;
