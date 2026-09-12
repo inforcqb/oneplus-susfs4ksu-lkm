@@ -63,7 +63,7 @@
 #include "susfs_fp_hook.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact, for optional compat probes */
-#include "susfs_inline_hook.h"	/* entry patching, replaces the hot kprobes */
+
 #include "lsm_hook.h"
 
 /* Bounce buffer for the getdents64 rewrite.  One record at a time is moved
@@ -1127,73 +1127,37 @@ static int kp_sys_path_answer(struct pt_regs *regs, int argno)
 
 SUSFS_SYS_PROBE(__arm64_sys_openat, 1);
 SUSFS_SYS_PROBE(__arm64_sys_openat2, 1);
-SUSFS_SYS_PROBE(__arm64_sys_newfstatat, 1);
 SUSFS_SYS_PROBE(__arm64_sys_statx, 1);
-SUSFS_SYS_PROBE(__arm64_sys_faccessat, 1);
-SUSFS_SYS_PROBE(__arm64_sys_faccessat2, 1);
 SUSFS_SYS_PROBE(__arm64_sys_readlinkat, 1);
 SUSFS_SYS_PROBE(__arm64_sys_execve, 0);
 
 static struct kprobe *sys_path_probes[] = {
     &kp___arm64_sys_openat,
     &kp___arm64_sys_openat2,
-    &kp___arm64_sys_newfstatat,
     &kp___arm64_sys_statx,
-    &kp___arm64_sys_faccessat,
-    &kp___arm64_sys_faccessat2,
     &kp___arm64_sys_readlinkat,
     &kp___arm64_sys_execve,
 };
 
-/* KernelSU hooks these by replacing the syscall table entry and calling the
- * original wrapper from its own hook (kallsyms has ksu_hook_faccessat,
- * ksu_hook_newfstatat, ksu_hook_execve, ksu_hook_setresuid).  An entry hook on
- * the wrapper breaks that call - measured:
+/* No kprobe for newfstatat / faccessat / faccessat2.
+ *
+ * KernelSU replaces those syscall TABLE entries with ksu_syscall_dispatcher and
+ * calls the original wrapper back from its own hook (kallsyms lists
+ * ksu_hook_newfstatat, ksu_hook_faccessat, ksu_hook_execve, ksu_hook_setresuid),
+ * so hooking such a wrapper's entry interferes with that call - measured:
  *
  *     Internal error: Oops - FPAC: 0000000072000000
  *     pc : __arm64_sys_faccessat+0x2c4/0x848
  *     lr : ksu_hook_faccessat+0x44/0x58 [kernelsu]
  *     Kernel panic - not syncing: Oops - FPAC: Fatal exception
  *
- * faccessat, faccessat2 and newfstatat have no side effect, so they need no entry
- * hook at all: sus_path_sys_exit() replaces their answer with ENOENT on the way
- * out, in a tracepoint that is registered anyway.  execve does have effects and
- * cannot be undone after the fact, so it keeps a kprobe - a BRK is the kernel's
- * own mechanism and ksu_hook's call to the original returns normally through it. */
-static struct kprobe *fallback_syscall_probes[] = {
-    &kp___arm64_sys_execve,
-};
-
-#define N_FALLBACK_PROBES ARRAY_SIZE(fallback_syscall_probes)
-static bool fallback_probes_registered[N_FALLBACK_PROBES];
-
-static void sus_path_syscall_fallback_register(void)
-{
-    int i, n = 0;
-
-    for (i = 0; i < N_FALLBACK_PROBES; i++) {
-        if (register_kprobe(fallback_syscall_probes[i])) {
-            pr_warn("sus_path: fallback kprobe(%s) failed\n",
-                    fallback_syscall_probes[i]->symbol_name);
-            continue;
-        }
-        fallback_probes_registered[i] = true;
-        n++;
-    }
-    pr_info("sus_path: %d syscall(s) KernelSU also hooks keep a probe instead\n", n);
-}
-
-static void sus_path_syscall_fallback_unregister(void)
-{
-    int i;
-
-    for (i = 0; i < N_FALLBACK_PROBES; i++) {
-        if (!fallback_probes_registered[i])
-            continue;
-        unregister_kprobe(fallback_syscall_probes[i]);
-        fallback_probes_registered[i] = false;
-    }
-}
+ * The fp layer answers them instead (susfs_fp_hook.c): it replaces the table
+ * entry, not the instructions, so KernelSU's call through the same array lands in
+ * our wrapper and then in the .cfi_jt stub as before.  If that layer cannot be
+ * armed at all, sus_path_sys_exit() rewrites their answer to ENOENT on the way
+ * out.  execve keeps its kprobe either way - it has real effects and cannot be
+ * answered after the fact - and a BRK is the kernel's own mechanism, which
+ * KernelSU's call into the original returns through normally (measured). */
 
 /* 32-bit (AArch32) callers.
  *
@@ -1584,29 +1548,26 @@ static void sus_path_path_unregister(void)
  * The LSM hooks are exempt: they are pointer swaps, already cost-free. */
 static bool path_registered;
 static bool hooks_armed;
-/* Serialises the first rule's arming.  ih_hooks[] is global state: two rules
- * arriving at once (a supercall task_work and a module_init caller) would both
- * pass the hooks_armed check and the second one would read an entry that the
- * first already patched, copy the patched instructions into h->orig, fail the
- * prologue check and then register kprobes on top of live inline hooks. */
+/* Serialises the first rule's arming.  The hook table it fills is global state:
+ * two rules arriving at once (a supercall task_work and a module_init caller)
+ * would both pass the hooks_armed check, and the second arm would stack a second
+ * layer on top of the first one's. */
 static DEFINE_MUTEX(sus_path_arm_lock);
 
 /* The tracepoint callback and the filter it drives are defined below. */
 static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret);
 
-/* Inline hooks are defined further down; armed from sus_path_hooks_arm(). */
-static int sus_path_ih_register(void);
-static void sus_path_ih_unregister(void);
 /* fp layer (sys_call_table entries), defined with its wrapper table below.
  *
- * This is the replacement for the inline hooks (see susfs_fp_hook.c for why):
- * the table entry is a data pointer, so nothing here can break the PAC/BTI
+ * The table entry is a data pointer, so nothing here can break the PAC/BTI
  * pairing of the wrapper, and KernelSU - which reads the very same array when it
- * wants the original behaviour - ends up calling through us automatically.
+ * wants the original behaviour - ends up calling through us automatically.  That
+ * is what replaced the entry-patching layer (see susfs_fp_hook.c).
  *
- * fp_test=N installs only the n-th entry of fp_hooks[] (1-based), fp_all installs
- * all of them.  Either one takes over from the inline hooks and from the kprobe
- * layer, which is what makes the two comparable on the same build. */
+ * fp_enabled=0 falls back to the kprobe layer; fp_test=N installs only the n-th
+ * entry of fp_hooks[] (1-based), fp_all installs all of them. */
+static int fp_enabled = 1;
+module_param(fp_enabled, int, 0644);
 static int fp_test;
 module_param(fp_test, int, 0644);
 static bool fp_all;
@@ -1617,6 +1578,10 @@ module_param(fp_all, bool, 0644);
 static int fp_dump;
 module_param(fp_dump, int, 0644);
 static void sus_path_fp_arm(void);
+static void sus_path_fp_dump(void);
+/* Non-zero while the fp layer owns the syscall entries; the sys_exit rewrite in
+ * sus_path_sys_exit() is only a backstop for the entries it could not take. */
+static int sus_path_fp_armed;
 static void sus_path_fp_disarm(void);
 
 static void sus_path_tracepoint_register(void)
@@ -1643,41 +1608,33 @@ static void sus_path_hooks_arm(void)
     if (!no_extra) {
         sus_path_tracepoint_register();
     } else {
-        /* no_extra is the isolation switch: with the tracepoint gone, faccessat,
-         * faccessat2 and newfstatat have NO layer at all - they are answered by
-         * sus_path_sys_exit() precisely because KernelSU owns their entries. */
-        pr_warn("sus_path: no_extra - sys_exit rewrite off, faccessat/newfstatat uncovered\n");
+        /* no_extra is the isolation switch: with the tracepoint gone the dirent
+         * filter is off, and so is the sys_exit rewrite that backstops the
+         * syscalls KernelSU also hooks. */
+        pr_warn("sus_path: no_extra - dirent filter and sys_exit rewrite off\n");
     }
 
-    /* fp layer: the syscall entries are replaced, so neither the entry hooks nor
-     * the syscall kprobes may be installed - a kprobe would write its BRK into
-     * the very wrapper we no longer touch, and the inline hooks would fight over
-     * the same table entries. */
-    if (fp_test > 0 || fp_all || fp_dump) {
-        sus_path_fp_arm();
-        pr_info("sus_path: hooks armed (fp layer, first rule registered)\n");
+    if (fp_dump) {
+        sus_path_fp_dump();
+        pr_info("sus_path: hooks armed (fp_dump, read-only)\n");
         mutex_unlock(&sus_path_arm_lock);
         return;
     }
 
-    /* Entry-decision and onLeave hooks: patch the entries if we can, otherwise
-     * probe them.  Never both - a kprobe owns the first instruction of its
-     * target.  getname is in the patched set too now: its stub returns to
-     * itself after the original ran, which is what the kretprobe used to do. */
-    if (sus_path_ih_register()) {
-        pr_info("sus_path: syscall/path/getname use inline hooks\n");
-        /* The inline hooks cover the eight native wrappers (and getname).
-         * Everything else targets a DIFFERENT symbol, so it keeps its probe:
-         * a kprobe and an inline hook only collide on the same entry.  Without
-         * this the 32-bit wrappers and the path layer would silently lose their
-         * coverage the moment the inline hooks came up. */
+    /* The fp layer first: replacing the sys_call_table entry is the entry layer
+     * that can live next to KernelSU's dispatcher, because it rewrites no
+     * instruction at all (see susfs_fp_hook.c).  The kprobe layer stays as the
+     * fallback for a kernel where the table cannot be resolved. */
+    if (fp_enabled && sus_path_fp_arm() > 0) {
+        /* These target DIFFERENT symbols, so they keep their probes: the 32-bit
+         * wrappers go through compat_sys_call_table, the path layer hooks
+         * filename_lookup / do_filp_open / user_path_at_empty, and getname_flags
+         * is an onLeave hook that an entry layer cannot express. */
         sus_path_path_register();
         sus_path_compat_register();
-        /* entry-hooked syscalls must not also get a kprobe (a kprobe would write
-         * its BRK over the patched entry).  Only the ones that are deliberately
-         * NOT patched - because KernelSU hooks them - get a probe here. */
-        sus_path_syscall_fallback_register();
+        sus_path_getname_register();
     } else {
+        pr_warn("sus_path: fp layer unavailable, falling back to kprobes\n");
         sus_path_syscall_register();
         sus_path_path_register();
         sus_path_getname_register();
@@ -1689,45 +1646,6 @@ static void sus_path_hooks_arm(void)
     mutex_unlock(&sus_path_arm_lock);
 }
 
-/* ---- inline hooks ----
- *
- * The entry points below are the ones where a decision can be made at the
- * ENTRY: read the caller's path, answer ENOENT, or let the call run.  They are
- * patched instead of kprobed, because arm64 kprobe is a brk trap on every hit
- * while this is a branch (see INLINE_HOOK.md).
- *
- * Entries that need to run the original function and inspect its RESULT
- * (getname's struct filename, vfs_getattr's kstat, the getdents64 tracepoint)
- * keep their probe: that is an onLeave hook, not an entry decision.
- *
- * A kprobe and an inline hook cannot share an entry - the kprobe replaces the
- * first instruction with brk - so if inline hooking fails for any entry, all of
- * them are rolled back and the kprobes are used instead.
- */
-extern void susfs_ih_stub_openat(void);
-extern void susfs_ih_stub_openat2(void);
-extern void susfs_ih_stub_newfstatat(void);
-extern void susfs_ih_stub_statx(void);
-extern void susfs_ih_stub_faccessat(void);
-extern void susfs_ih_stub_faccessat2(void);
-extern void susfs_ih_stub_readlinkat(void);
-extern void susfs_ih_stub_execve(void);
-extern void susfs_ih_stub_filename_lookup(void);
-extern void susfs_ih_stub_do_filp_open(void);
-extern void susfs_ih_stub_user_path_at_empty(void);
-extern void susfs_ih_stub_getname(void);
-extern u64 susfs_ih_tramp_openat;
-extern u64 susfs_ih_tramp_openat2;
-extern u64 susfs_ih_tramp_newfstatat;
-extern u64 susfs_ih_tramp_statx;
-extern u64 susfs_ih_tramp_faccessat;
-extern u64 susfs_ih_tramp_faccessat2;
-extern u64 susfs_ih_tramp_readlinkat;
-extern u64 susfs_ih_tramp_execve;
-extern u64 susfs_ih_tramp_filename_lookup;
-extern u64 susfs_ih_tramp_do_filp_open;
-extern u64 susfs_ih_tramp_user_path_at_empty;
-extern u64 susfs_ih_tramp_getname;
 
 
 
@@ -1741,37 +1659,10 @@ extern u64 susfs_ih_tramp_getname;
 
 
 
-
-/* onLeave handler for getname(): the stub calls this after the original ran, with
- * the original arguments and its return value (in x2).  Returning a different
- * value replaces it - which is how a kretprobe's job is done with a patched
- * entry.
- *
- * On a hit the filename is NOT replaced with an error pointer: it keeps being a
- * perfectly good struct filename, only pointing at a name that cannot exist (see
- * sus_path_spoof_name).  Callers that pass the object on without looking - and
- * do_linkat() really does hand getname()'s result straight to
- * filename_lookup() - then just get the ENOENT they asked for from the normal
- * lookup path, instead of exposing every downstream hook to an error pointer. */
-__attribute__((visibility("hidden"))) u64 susfs_ih_after_getname(u64 a0, u64 a1, u64 ret)
-{
-	struct filename *f = (struct filename *)ret;
-
-	if (IS_ERR_OR_NULL(f) || !f->name)
-		return ret;
-	if (!sus_path_match_path(f->name))
-		return ret;
-
-	pr_info_ratelimited("sus_path: getname hit '%s' (uid=%u)\n",
-			    f->name, current_uid().val);
-	atomic_inc(&n_enoent_path);
-	sus_path_spoof_name(f);
-	return ret;
-}
-
-/* Called from the syscall stubs: x0 is the wrapper's pt_regs, argno the register
- * holding the pathname. */
-__attribute__((visibility("hidden"))) int susfs_ih_decide(u64 uregs_arg, int argno)
+/* Called from the fp wrappers: x0 (the wrapper's only argument) is the caller's
+ * pt_regs, argno the register holding the pathname.  Returns 1 to answer ENOENT
+ * without running the original syscall. */
+__attribute__((visibility("hidden"))) int sus_path_fp_decide(u64 uregs_arg, int argno)
 {
 	const struct pt_regs *uregs = (const struct pt_regs *)uregs_arg;
 	const char __user *up;
@@ -1807,76 +1698,16 @@ __attribute__((visibility("hidden"))) int susfs_ih_decide(u64 uregs_arg, int arg
 	/* Same accounting as the kprobe path, so the counters and the log stay
 	 * usable no matter which layer answered. */
 	atomic_inc(&n_enoent_path);
-	pr_info_ratelimited("sus_path: path hit (openat family) '%s' (uid=%u) [ih]\n",
+	pr_info_ratelimited("sus_path: path hit '%s' (uid=%u) [fp]\n",
 			    buf, current_uid().val);
 	return 1;
 }
-
-/* Called from the name-taking stubs: mode 0 = struct filename (already copied
- * into kernel memory, so no uaccess at all), mode 1 = __user pointer. */
-__attribute__((visibility("hidden"))) int susfs_ih_decide_name(u64 p, int mode)
-{
-	char buf[SUS_PATH_LEN];
-	long n;
-
-	if (!p || !current_uid().val)
-		return 0;
-
-	if (mode == 0) {
-		const struct filename *f = (const struct filename *)p;
-
-		/* Same trap as the filename_lookup kprobe: the caller may hand the
-		 * callee an error pointer and expect it to be checked there. */
-		if (IS_ERR_OR_NULL(f) || !f->name)
-			return 0;
-		if (!sus_path_match_path(f->name))
-			return 0;
-	} else {
-		n = strncpy_from_user(buf, (const char __user *)p,
-				      sizeof(buf) - 1);
-		if (n <= 0)
-			return 0;
-		buf[n] = '\0';
-		if (!sus_path_match_path(buf))
-			return 0;
-	}
-
-	atomic_inc(&n_enoent_path);
-	pr_info_ratelimited("sus_path: path hit '%s' (uid=%u) [ih]\n",
-			    mode == 0 ? ((const struct filename *)p)->name : buf,
-			    current_uid().val);
-	return 1;
-}
-
-/* On by default: the patched entries replace the kprobes for the syscalls whose
- * decision can be made at ENTRY.  The freeze that kept this off was the allow
- * path losing the caller's LR (see INLINE_HOOK.md 5.8): every hooked call went
- * through the trampoline with a PAC signed over the C helper's return address,
- * which is why an entry as hot as __arm64_sys_openat took the box down
- * immediately while the standalone test module looked fine.  With x30 restored
- * all eight entries install, answer, restore and unload cleanly.  Set
- * ih_enabled=0 to force the kprobe path. */
-static int ih_enabled = 1;
-/* Bisect knob: install only the n-th entry (1-based): 0 = none, -1 = all,
- * anything else implies enabled. */
-static int ih_only = -1;
-module_param(ih_only, int, 0644);
-/* Kernel-side timed rollback: restore the entries after n seconds and stop
- * hooking altogether.  Unlike a test script this keeps running when the
- * triggering process is wedged, and if only part of the box is stuck the worker
- * on another CPU still gets the entries back, so no reboot is needed. */
-static int ih_secs;
-module_param(ih_secs, int, 0644);
-static void ih_restore_work(struct work_struct *w);
-static DECLARE_DELAYED_WORK(ih_restore_wq, ih_restore_work);
-
-module_param(ih_enabled, int, 0644);
 
 #define SUSFS_FP_WRAPPER(w, argno)					\
 	static susfs_syscall_fn_t susfs_fp_orig_##w;			\
 	static __nocfi long susfs_fp_##w(const struct pt_regs *regs)	\
 	{								\
-		if (susfs_ih_decide((u64)(unsigned long)regs, argno))	\
+		if (sus_path_fp_decide((u64)(unsigned long)regs, argno))	\
 			return -ENOENT;					\
 		return READ_ONCE(susfs_fp_orig_##w)(regs);		\
 	}
@@ -1905,28 +1736,27 @@ static struct susfs_fp_hook fp_hooks[] = {
 
 #define N_FP_HOOKS ARRAY_SIZE(fp_hooks)
 
-static void sus_path_fp_arm(void)
+/* Read-only run: what the table holds for every entry we would replace, next to
+ * the plain and .cfi_jt symbols, and the first instruction of every wrapper. */
+static void sus_path_fp_dump(void)
 {
-	int i, n = 0;
+	int i;
 
-	if (!fp_test && !fp_all && !fp_dump)
-		return;
-
-	/* One dump before anything is replaced: it answers "is the table entry the
-	 * plain symbol or the .cfi_jt stub" for this exact kernel, and whether our
-	 * wrappers carry the BTI landing pad an indirect call needs. */
-	if (fp_dump) {
-		if (susfs_fp_init()) {
-			pr_warn("sus_path: fp_dump: sys_call_table unavailable, nothing to dump\n");
-			return;
-		}
-		for (i = 0; i < (int)N_FP_HOOKS; i++) {
-			susfs_fp_dump_entry(fp_hooks[i].nr, fp_hooks[i].sym);
-			susfs_fp_dump_wrapper(fp_hooks[i].name, (const void *)fp_hooks[i].wrapper);
-		}
-		pr_info("sus_path: fp_dump finished, nothing installed\n");
+	if (susfs_fp_init()) {
+		pr_warn("sus_path: fp_dump: sys_call_table unavailable, nothing to dump\n");
 		return;
 	}
+	for (i = 0; i < (int)N_FP_HOOKS; i++) {
+		susfs_fp_dump_entry(fp_hooks[i].nr, fp_hooks[i].sym);
+		susfs_fp_dump_wrapper(fp_hooks[i].name, (const void *)fp_hooks[i].wrapper);
+	}
+	pr_info("sus_path: fp_dump finished, nothing installed\n");
+}
+
+/* Returns how many entries were replaced; 0 means the caller must fall back. */
+static int sus_path_fp_arm(void)
+{
+	int i, n = 0;
 
 	for (i = 0; i < (int)N_FP_HOOKS; i++) {
 		if (!fp_all && fp_test != i + 1)
@@ -1936,6 +1766,8 @@ static void sus_path_fp_arm(void)
 	}
 	pr_info("sus_path: fp layer armed (%d/%d syscall table entries replaced)\n",
 		n, (int)N_FP_HOOKS);
+	sus_path_fp_armed = n > 0;
+	return n;
 }
 
 static void sus_path_fp_disarm(void)
@@ -1955,110 +1787,6 @@ static void sus_path_fp_disarm(void)
 		susfs_fp_drain();
 }
 
-static struct {
-	const char *sym;
-	void *stub;
-	u64 *tramp;
-} ih_table[] = {
-	{ "__arm64_sys_openat",        susfs_ih_stub_openat,        &susfs_ih_tramp_openat },
-	{ "__arm64_sys_openat2",       susfs_ih_stub_openat2,       &susfs_ih_tramp_openat2 },
-	{ "__arm64_sys_statx",         susfs_ih_stub_statx,         &susfs_ih_tramp_statx },
-	{ "__arm64_sys_readlinkat",    susfs_ih_stub_readlinkat,    &susfs_ih_tramp_readlinkat },
-	/* NOT newfstatat, faccessat, faccessat2 or execve.
-	 *
-	 * kallsyms lists ksu_hook_newfstatat, ksu_hook_faccessat, ksu_hook_execve and
-	 * ksu_hook_setresuid (with .cfi_jt entries), all installed by
-	 * ksu_syscall_table_hook(): KernelSU replaces those syscall TABLE entries with
-	 * ksu_syscall_dispatcher and calls the original wrapper from its own hook.
-	 * Patching the wrapper's entry breaks that call - measured:
-	 *
-	 *     Internal error: Oops - FPAC: 0000000072000000
-	 *     pc : __arm64_sys_faccessat+0x2c4/0x848
-	 *     lr : ksu_hook_faccessat+0x44/0x58 [kernelsu]
-	 *     Kernel panic - not syncing: Oops - FPAC: Fatal exception
-	 *
-	 * The same hook covers faccessat and faccessat2, so both are left alone even
-	 * though only the first one was seen to crash.  Neither has a side effect, so
-	 * neither needs an entry hook: sus_path_sys_exit() replaces their answer with
-	 * ENOENT on the way out.  execve has real effects and cannot be undone after
-	 * the fact, so it keeps a kprobe (a BRK is the kernel's own mechanism and
-	 * KernelSU's call to the original returns through it normally) -
-	 * see fallback_syscall_probes[]. */
-	/* onLeave: getname_flags gets no entry decision - the stub lets the original
-	 * run and inspects the struct filename it returned (INLINE_HOOK.md 5.9).
-	 *
-	 * The symbol is getname_flags, not getname: getname() only forwards to it
-	 * and LTO inlines that away, so patching getname installed cleanly and then
-	 * never ran - measured, the after-handler counted zero hits while the
-	 * kretprobe on getname_flags had been answering all along. */
-	{ "getname_flags",             susfs_ih_stub_getname,       &susfs_ih_tramp_getname },
-};
-
-#define N_IH_HOOKS ARRAY_SIZE(ih_table)
-static struct susfs_ih_hook ih_hooks[N_IH_HOOKS];
-
-/* The stubs cannot take a module symbol address themselves - the assembler folds
- * adrp/add (and :got:) into movz/movk, which cannot hold an address the loader
- * has not chosen yet.  So they call in with their index and the C compiler emits
- * the addressing.  Must be the first stub helper: the .S order matches ih_table. */
-__attribute__((visibility("hidden"))) u64 susfs_ih_get_tramp(int idx)
-{
-	if (idx < 0 || idx >= (int)N_IH_HOOKS)
-		return 0;
-	return (u64)(unsigned long)ih_hooks[idx].tramp;
-}
-
-/* Returns the number installed, or 0 if inline hooking is unavailable/disabled. */
-static int sus_path_ih_register(void)
-{
-	int i, n = 0;
-
-	if (!ih_enabled && ih_only <= 0)
-		return 0;
-	if (susfs_ih_init())
-		return 0;
-
-	for (i = 0; i < N_IH_HOOKS; i++) {
-		if (ih_only > 0 && i != ih_only - 1)
-			continue;
-		pr_info("susfs_ih: trying #%d/%d %s", i + 1, (int)N_IH_HOOKS, ih_table[i].sym);
-		if (susfs_ih_install(&ih_hooks[i], ih_table[i].sym, ih_table[i].stub,
-				     ih_table[i].tramp))
-			break;
-		n++;
-	}
-
-	if (n != (ih_only > 0 ? 1 : (int)N_IH_HOOKS)) {
-		pr_warn("sus_path: inline hooks incomplete (%d/%d), rolling back to kprobes\n",
-			n, (int)N_IH_HOOKS);
-		while (n-- > 0)
-			susfs_ih_uninstall(&ih_hooks[n]);
-		return 0;
-	}
-
-	pr_info("sus_path: inline hooks armed (%d entries patched)\n", n);
-
-	if (ih_secs > 0) {
-		pr_info("susfs_ih: restoring in %d s (diagnostic)\n", ih_secs);
-		schedule_delayed_work(&ih_restore_wq, ih_secs * HZ);
-	}
-	return n;
-}
-
-static void ih_restore_work(struct work_struct *w)
-{
-	pr_info("susfs_ih: %d s elapsed - entries restored, no longer hooking\n",
-		ih_secs);
-	sus_path_ih_unregister();
-}
-
-static void sus_path_ih_unregister(void)
-{
-	int i;
-
-	for (i = 0; i < N_IH_HOOKS; i++)
-		susfs_ih_uninstall(&ih_hooks[i]);
-}
 
 /* Rewrite the dirent chain the kernel just produced, dropping the entries whose
  * (d_ino, name) pair is registered; returns the byte count the caller may parse.
@@ -2225,10 +1953,15 @@ static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret)
 
     nr = syscall_get_nr(current, regs);
 
-    /* ---- the syscalls KernelSU also hooks: answer them on the way OUT ----
+    /* ---- backstop for the syscalls KernelSU also hooks ----
      *
-     * KernelSU replaces these syscall table entries and calls the original
-     * wrapper from its own hook, so an entry hook here breaks that call:
+     * The fp layer normally answers these at their entry (it owns the table
+     * entries).  This branch is what is left when that layer could not be armed -
+     * fp_enabled=0, or a kernel whose sys_call_table we cannot resolve - and it is
+     * also the reason those three syscalls never get an entry hook of their own:
+     * KernelSU replaces their table entries and calls the original wrapper back
+     * from ksu_hook_faccessat / ksu_hook_newfstatat, so touching that wrapper's
+     * instructions breaks the call.  Measured:
      *
      *     Internal error: Oops - FPAC: 0000000072000000
      *     pc : __arm64_sys_faccessat+0x2c4/0x848
@@ -2236,13 +1969,11 @@ static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret)
      *
      * None of these three has a side effect, so replacing the answer here is
      * indistinguishable from never running the call - and this tracepoint is
-     * registered anyway for the dirent filter, so it costs a comparison plus the
-     * argument read.  execve is NOT handled this way: it has real effects, so it
-     * is stopped at its entry instead.
+     * registered anyway for the dirent filter.
      *
      * syscall_get_arguments() gives the raw registers, with args[1] being the
      * original x1 (the pathname) - x0 in regs no longer holds it at exit. */
-    if (!is_compat_task() &&
+    if (!sus_path_fp_armed && !is_compat_task() &&
         (nr == __NR_faccessat ||
 #ifdef __NR_faccessat2
          nr == __NR_faccessat2 ||
@@ -2518,7 +2249,6 @@ void sus_path_exit(void)
     /* Unregister the hooks FIRST: after this nothing can match, so the entries
      * (and their inode references) can be torn down safely. */
     sus_path_getname_unregister();
-    cancel_delayed_work_sync(&ih_restore_wq);
     /* The retry timer must be off, and no resolution pass may be in flight while
      * the table is emptied below: a pass re-finds its entry under the lock and
      * never frees anything, but it may not run past the teardown either.  It is
@@ -2528,11 +2258,9 @@ void sus_path_exit(void)
     mutex_unlock(&sus_path_pending_lock);
     /* No walk can be in flight now, so the borrowed creds are ours to release. */
     sus_path_drop_caller_cred();
-	sus_path_ih_unregister();
     sus_path_fp_disarm();
     sus_path_cand_unregister();
     sus_path_syscall_unregister();
-    sus_path_syscall_fallback_unregister();
     sus_path_path_unregister();
     sus_path_dac_unregister();
     if (sus_path_perm_hook.entry)
