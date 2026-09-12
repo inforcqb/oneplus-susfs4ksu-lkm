@@ -252,6 +252,14 @@ static bool sus_map_walk_ops_done;
 static atomic_t n_walk_skip = ATOMIC_INIT(0);
 static atomic_t n_walk_seen = ATOMIC_INIT(0);		/* walk_page_range calls */
 static atomic_t n_walk_seen_vma = ATOMIC_INIT(0);	/* walk_page_vma calls  */
+/* Why a walk that reached the probe was not skipped, one counter per step of the
+ * resolution - "the probe did not match" has four very different causes and only
+ * the counters can tell them apart. */
+static atomic_t n_walk_ops_hit = ATOMIC_INIT(0);	/* ops was ours */
+static atomic_t n_walk_scan_fail = ATOMIC_INIT(0);	/* no vma for (mm,start) */
+static atomic_t n_walk_nofile = ATOMIC_INIT(0);		/* vma has no vm_file */
+static atomic_t n_walk_nomatch = ATOMIC_INIT(0);	/* inode is not a rule */
+static atomic_t n_walk_dbg_left = ATOMIC_INIT(4);
 
 /* walk_dbg: name every ops pointer that reaches the two primitives, once per
  * distinct value.  Off by default - it costs a linear scan per call. */
@@ -341,13 +349,19 @@ static bool sus_map_walk_answer(struct kprobe *kp, struct pt_regs *regs,
     /* Defence in depth, like the vma handler: a real vma is never below a page. */
     if ((unsigned long)vma < PAGE_SIZE)
         return false;
-    if (!vma->vm_file)
+    if (!vma->vm_file) {
+        atomic_inc(&n_walk_nofile);
         return false;
+    }
     inode = file_inode(vma->vm_file);
-    if (!inode)
+    if (!inode) {
+        atomic_inc(&n_walk_nofile);
         return false;
-    if (!sus_map_lookup(inode->i_ino, inode->i_sb->s_dev))
+    }
+    if (!sus_map_lookup(inode->i_ino, inode->i_sb->s_dev)) {
+        atomic_inc(&n_walk_nomatch);
         return false;
+    }
 
     atomic_inc(&n_walk_skip);
     pr_info_ratelimited("sus_map: skipped %s walk for ino=%lu dev=%lu uid=%u\n",
@@ -360,6 +374,22 @@ static bool sus_map_walk_answer(struct kprobe *kp, struct pt_regs *regs,
     regs_set_return_value(regs, 0);
     regs->pc = regs->regs[30];
     return true;
+}
+
+/* walk_dbg >= 2: dump the resolution of the first few walks that got past the ops
+ * test, so "no vma for (mm, start)" can be told apart from "the vma is not the
+ * one we expected" without guessing. */
+static void sus_map_walk_dbg_log(const char *what, struct mm_struct *mm,
+                                 unsigned long start, struct vm_area_struct *vma)
+{
+    if (walk_dbg < 2)
+        return;
+    if (atomic_dec_if_positive(&n_walk_dbg_left) < 0)
+        return;
+    pr_info("sus_map: %s mm=%px start=%lx mmap=%px vma=%px %lx-%lx file=%px\n",
+            what, mm, start, mm ? mm->mmap : NULL, vma,
+            vma ? vma->vm_start : 0UL, vma ? vma->vm_end : 0UL,
+            (vma && vma->vm_file) ? vma->vm_file : NULL);
 }
 
 /* walk_page_range(mm, start, end, ops, private): the vma has to be resolved from
@@ -379,20 +409,26 @@ static int sus_map_skip_walk_pre(struct kprobe *kp, struct pt_regs *regs)
     if (!sus_map_walk_ops_ours(ops))
         return 0;
 
+    atomic_inc(&n_walk_ops_hit);
     if (!sus_map_gate_ok())
         return 0;
 
     mm = (struct mm_struct *)regs->regs[0];
     start = (unsigned long)regs->regs[1];
-    if ((unsigned long)mm < PAGE_SIZE)
+    if (!mm)
         return 0;
 
     for (vma = mm->mmap; vma; vma = vma->vm_next) {
         if (start < vma->vm_end)
             break;
     }
-    if (!vma || start < vma->vm_start)
-        return 0;			/* start is in a gap: nothing to hide */
+    if (!vma || start < vma->vm_start) {
+        /* start is in a gap: nothing to hide */
+        atomic_inc(&n_walk_scan_fail);
+        sus_map_walk_dbg_log("walk_page_range: no vma", mm, start, NULL);
+        return 0;
+    }
+    sus_map_walk_dbg_log("walk_page_range: vma", mm, start, vma);
 
     return sus_map_walk_answer(kp, regs, vma) ? 1 : 0;
 }
@@ -408,6 +444,7 @@ static int sus_map_skip_walk_vma_pre(struct kprobe *kp, struct pt_regs *regs)
     if (!sus_map_walk_ops_ours(ops))
         return 0;
 
+    atomic_inc(&n_walk_ops_hit);
     if (!sus_map_gate_ok())
         return 0;
 
@@ -449,10 +486,13 @@ static int sus_map_stat_show(char *buf, const struct kernel_param *kp)
 
     return scnprintf(buf, PAGE_SIZE,
                      "rules=%d armed=%d/%d walk_seen=%d walk_vma=%d walk_skipped=%d "
+                     "ops_hit=%d scan_fail=%d nofile=%d nomatch=%d\n"
                      "ops: smaps=%px smaps_shmem=%px pagemap=%px\n",
                      nmap, armed, (int)N_MAP_PROBES,
                      atomic_read(&n_walk_seen), atomic_read(&n_walk_seen_vma),
                      atomic_read(&n_walk_skip),
+                     atomic_read(&n_walk_ops_hit), atomic_read(&n_walk_scan_fail),
+                     atomic_read(&n_walk_nofile), atomic_read(&n_walk_nomatch),
                      sus_map_ops_smaps, sus_map_ops_smaps_shmem,
                      sus_map_ops_pagemap);
 }
