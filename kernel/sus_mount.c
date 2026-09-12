@@ -94,7 +94,7 @@
 #include "symbol_resolver.h"
 #include "susfs_abi.h"
 #include "susfs_log.h"
-#include "susfs.h"	/* sus_path_lsm_active, susfs_open_redirect_spoof_ino */
+#include "susfs.h"	/* module-wide declarations */
 
 #define DEFAULT_KSU_MNT_ID 2000000000ULL
 
@@ -330,7 +330,6 @@ struct sus_mount_kretprobe_state {
 
 static atomic_t n_fdinfo_entry = ATOMIC_INIT(0);
 static atomic_t n_fdinfo_nolabel = ATOMIC_INIT(0);
-static atomic_t n_fdinfo_ino_rewrites = ATOMIC_INIT(0);
 
 static int sus_mount_fdinfo_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
@@ -341,24 +340,25 @@ static int sus_mount_fdinfo_entry(struct kretprobe_instance *ri, struct pt_regs 
     return 0;
 }
 
-/* Replaces the decimal that follows `label` in the seq_file's already formatted
- * buffer, when `mode` says the old number has a disguise:
- *   mode 0 - mnt_id: sus_mount's own id table (KSU-range id -> host id)
- *   mode 1 - ino: open_redirect's reverse direction (redirected ino -> target ino)
- * Returns true when the buffer was rewritten.  The replacement never grows, so
- * the buffer is only ever shortened and m->count stays consistent. */
-static bool sus_mount_fdinfo_replace(struct seq_file *m, const char *label,
-                                     size_t label_len, int mode)
+/* Replaces the decimal that follows the mnt_id label in the seq_file's already
+ * formatted buffer, when the id has a disguise in sus_mount's table (KSU-range id
+ * -> the host id).  Returns true when the buffer was rewritten.  The replacement
+ * never grows, so the buffer is only ever shortened and m->count stays consistent.
+ *
+ * The other half of the same fdinfo line (the ino) belongs to open_redirect and is
+ * rewritten by that feature's own kretprobe - it must fire whether or not this
+ * feature's hide switch is on, and this probe is only registered while it is. */
+static bool sus_mount_fdinfo_replace_mntid(struct seq_file *m)
 {
     char *buf = m->buf, digits[12];
     size_t count = m->count, i, pos = 0, len = 0, n = 0;
-    unsigned long old = 0, new_val = 0;
-    bool known;
+    unsigned long old = 0;
+    int shown;
     unsigned int v;
 
-    for (i = 0; i + label_len < count; i++) {
-        if (!memcmp(buf + i, label, label_len)) {
-            pos = i + label_len;
+    for (i = 0; i + SUS_MOUNT_MNTID_LABEL_LEN < count; i++) {
+        if (!memcmp(buf + i, SUS_MOUNT_MNTID_LABEL, SUS_MOUNT_MNTID_LABEL_LEN)) {
+            pos = i + SUS_MOUNT_MNTID_LABEL_LEN;
             break;
         }
     }
@@ -373,18 +373,11 @@ static bool sus_mount_fdinfo_replace(struct seq_file *m, const char *label,
     if (!len)
         return false;
 
-    if (mode == 0) {
-        int shown = sus_mount_shown_for((int)old);
-
-        known = (shown > 0);
-        new_val = (unsigned long)shown;
-    } else {
-        known = susfs_open_redirect_spoof_ino(old, &new_val);
-    }
-    if (!known)
+    shown = sus_mount_shown_for((int)old);
+    if (shown <= 0)
         return false;
 
-    v = (unsigned int)new_val;
+    v = (unsigned int)shown;
     while (v) {
         digits[n++] = (char)('0' + v % 10);
         v /= 10;
@@ -420,19 +413,10 @@ static int sus_mount_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *r
 
     atomic_inc(&n_fdinfo_hits);
 
-    /* mnt_id first: it appears before ino, and replace() rescans the buffer, so
-     * shortening the first one cannot make the second lookup miss. */
-    if (sus_mount_fdinfo_replace(m, SUS_MOUNT_MNTID_LABEL, SUS_MOUNT_MNTID_LABEL_LEN, 0))
+    if (sus_mount_fdinfo_replace_mntid(m))
         atomic_inc(&n_fdinfo_rewrites);
     else
         atomic_inc(&n_fdinfo_nolabel);
-
-    /* The other half of the same disguise: fdinfo names the inode the fd points
-     * at, and for an open_redirect rule that is the redirected file - naming it
-     * would hand a detector the file the redirection really opened.  Upstream
-     * covers this in the same function (susfs_open_redirect_spoof_seq_show). */
-    if (sus_mount_fdinfo_replace(m, "ino:\t", 5, 1))
-        atomic_inc(&n_fdinfo_ino_rewrites);
     return 0;
 }
 
@@ -565,12 +549,12 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
 {
     return scnprintf(buf, PAGE_SIZE,
                      "idmap=%d  hide=%d su_domain=%d\n"
-                     "fdinfo: entry=%d hits=%d mntid_rewrites=%d ino_rewrites=%d nolabel=%d\n"
+                     "fdinfo: entry=%d hits=%d rewrites=%d nolabel=%d\n"
                      "statx: entry=%d ret=%d hits=%d rewrites=%d nobuf=%d err=%d copyfail=%d nomap=%d "
                      "(sys=%d do=%d)\n",
                      n_idmap, mount_registered, (int)sus_mount_is_su_domain(),
                      atomic_read(&n_fdinfo_entry), atomic_read(&n_fdinfo_hits),
-                     atomic_read(&n_fdinfo_rewrites), atomic_read(&n_fdinfo_ino_rewrites),
+                     atomic_read(&n_fdinfo_rewrites),
                      atomic_read(&n_fdinfo_nolabel),
                      atomic_read(&n_statx_entry), atomic_read(&n_statx_ret),
                      atomic_read(&n_statx_hits), atomic_read(&n_statx_rewrites),

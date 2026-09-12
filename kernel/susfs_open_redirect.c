@@ -496,6 +496,102 @@ static struct kprobe kp_or_vma_hdr = {
 	.pre_handler = or_vma_hdr_pre,
 };
 
+/* ---- reverse face 4: /proc/<pid>/fdinfo/N ----
+ *
+ * fdinfo prints "ino:\t<i>" for the file an fd points at, and for a rule that file
+ * is the REDIRECTED one - so a detector holding an fd on the target is handed the
+ * inode of the file the redirection really opened.  Upstream rewrites it in the
+ * same function it rewrites mnt_id in (susfs_open_redirect_spoof_seq_show,
+ * patch:1171-1200).
+ *
+ * It belongs to THIS feature, not to sus_mount's: it has to fire as soon as one
+ * rule exists, whether or not the mount-hiding switch is on.  The first version
+ * lived in sus_mount's seq_show kretprobe, which is only registered when that
+ * feature is enabled - measured with a rule present and hide off: fdinfo kept
+ * naming the redirected inode and the probe had entry=0.
+ *
+ * fdinfo has no device column, so the lookup is by ino alone, and it refuses when
+ * two rules share a redirected ino: disguising an unrelated file would be worse
+ * than missing one.  State is per-instance (ri->data) because seq_show() may
+ * sleep inside seq_printf() and the task can migrate CPUs there. */
+static atomic_t or_rev_fdinfo_hits = ATOMIC_INIT(0);
+static atomic_t or_rev_fdinfo_rewrites = ATOMIC_INIT(0);
+
+static int or_fdinfo_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct seq_file **slot = (struct seq_file **)ri->data;
+
+	*slot = (struct seq_file *)regs->regs[0];
+	return 0;
+}
+
+static int or_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct seq_file *m = *(struct seq_file **)ri->data;
+	char *buf, digits[12];
+	size_t count, i, pos = 0, len = 0, n = 0;
+	unsigned long old = 0, new_ino = 0;
+	unsigned int v;
+
+	if (!m || (long)regs_return_value(regs) != 0)
+		return 0;
+	if (!m->buf || !m->count)
+		return 0;
+	if (!or_reverse_visible())
+		return 0;
+
+	buf = m->buf;
+	count = m->count;
+	atomic_inc(&or_rev_fdinfo_hits);
+
+	for (i = 0; i + 5 < count; i++) {
+		if (!memcmp(buf + i, "ino:\t", 5)) {
+			pos = i + 5;
+			break;
+		}
+	}
+	if (!pos)
+		return 0;
+	while (pos + len < count && len < 10 &&
+	       buf[pos + len] >= '0' && buf[pos + len] <= '9') {
+		old = old * 10 + (unsigned long)(buf[pos + len] - '0');
+		len++;
+	}
+	if (!len)
+		return 0;
+	if (!susfs_open_redirect_spoof_ino(old, &new_ino) || new_ino == old)
+		return 0;
+
+	v = (unsigned int)new_ino;
+	while (v) {
+		digits[n++] = (char)('0' + v % 10);
+		v /= 10;
+	}
+	if (!n || n > len)		/* never grow the buffer */
+		return 0;
+	for (i = 0; i < n / 2; i++) {
+		char t = digits[i];
+
+		digits[i] = digits[n - 1 - i];
+		digits[n - 1 - i] = t;
+	}
+	if (n != len)
+		memmove(buf + pos + n, buf + pos + len, count - (pos + len));
+	memcpy(buf + pos, digits, n);
+	m->count = count - len + n;
+	atomic_inc(&or_rev_fdinfo_rewrites);
+	return 0;
+}
+
+static struct kretprobe kr_or_fdinfo = {
+	.kp.symbol_name = "seq_show",		/* fs/proc/fd.c */
+	.entry_handler = or_fdinfo_entry,
+	.handler = or_fdinfo_ret,
+	.data_size = sizeof(struct seq_file *),
+	.maxactive = 16,
+};
+static bool or_fdinfo_registered;
+
 static bool or_registered;
 static bool or_dpath_registered;
 static bool or_statfs_registered;
@@ -558,10 +654,24 @@ static void or_register_reverse(void)
 			pr_info("susfs_open_redirect: reverse hook installed (show_vma_header_prefix)\n");
 		}
 	}
+	if (!or_fdinfo_registered) {
+		rc = register_kretprobe(&kr_or_fdinfo);
+		if (rc)
+			pr_warn("open_redirect: register_kretprobe(seq_show) failed %d - fdinfo names the redirected inode\n",
+				rc);
+		else {
+			or_fdinfo_registered = true;
+			pr_info("susfs_open_redirect: reverse hook installed (seq_show/fdinfo)\n");
+		}
+	}
 }
 
 static void or_unregister(void)
 {
+	if (or_fdinfo_registered) {
+		unregister_kretprobe(&kr_or_fdinfo);
+		or_fdinfo_registered = false;
+	}
 	if (or_vma_hdr_registered) {
 		unregister_kprobe(&kp_or_vma_hdr);
 		or_vma_hdr_registered = false;
@@ -676,19 +786,22 @@ static int or_proc_show(struct seq_file *m, void *v)
 	 * not "reached".  A hook whose counter stays 0 across a real read means
 	 * GKI inlined its call sites and that surface is NOT disguised.
 	 *
-	 * /proc/<pid>/fdinfo/N (upstream: patch:1145-1217, susfs.c:1048-1064) is
-	 * the one surface with no reachable hook here: its mnt_id/ino are values
-	 * passed straight to seq_printf() from fs/proc/fd.c's static seq_show(),
-	 * so there is no path to swap and no function to intercept that would not
-	 * also have to rewrite the already-printed line.  The data it needs
-	 * (spoofed_mnt_id = target's mnt_id, and the target's ino) is what
-	 * `rev: ino`/the target ino above carry, should that ever be attempted. */
-	seq_printf(m, "hooks: open=%d dpath=%d statfs=%d vma_hdr=%d | rev hits: dpath=%d statfs=%d vma_hdr=%d | su_sid=%u\n",
+	 * /proc/<pid>/fdinfo/N (upstream: patch:1145-1217, susfs.c:1048-1064) used
+	 * to be the one surface with no reachable hook here: its mnt_id/ino are
+	 * values passed straight to seq_printf() from fs/proc/fd.c's static
+	 * seq_show().  It is covered now by rewriting the already-printed line from a
+	 * kretprobe on that function (see or_fdinfo_ret) - so the counters below
+	 * matter twice over: fdinfo=<registered> and the fdinfo hit/rewrite pair.
+	 * mnt_id is NOT rewritten here: that id belongs to sus_mount's table, and the
+	 * fdinfo line for a mount is only ever wrong when that feature is hidden. */
+	seq_printf(m, "hooks: open=%d dpath=%d statfs=%d vma_hdr=%d fdinfo=%d | rev hits: dpath=%d statfs=%d vma_hdr=%d fdinfo=%d/%d | su_sid=%u\n",
 		   or_registered, or_dpath_registered, or_statfs_registered,
-		   or_vma_hdr_registered,
+		   or_vma_hdr_registered, or_fdinfo_registered,
 		   atomic_read(&or_rev_dpath_hits),
 		   atomic_read(&or_rev_statfs_hits),
 		   atomic_read(&or_rev_vma_hits),
+		   atomic_read(&or_rev_fdinfo_hits),
+		   atomic_read(&or_rev_fdinfo_rewrites),
 		   or_su_sid);
 	mutex_unlock(&or_lock);
 	return 0;
