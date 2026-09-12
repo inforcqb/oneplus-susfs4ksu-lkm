@@ -684,6 +684,59 @@ static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_permission),
 					   typeof(&sus_path_inode_permission)),
 	      "inode_permission hook signature mismatch");
 
+/* ---- name-based operations ----
+ *
+ * unlink/rmdir/rename/link never permission-check the FILE: they check the PARENT
+ * directory (may_delete/may_create), so inode_permission never sees the target and
+ * an app that can write the containing directory can delete or rename a hidden file
+ * straight out of hiding - the code below used to say so and leave it at that.
+ *
+ * The kernel already has a hook for each of those operations, and each gets the
+ * target's dentry, so the same inode match answers them:
+ *
+ *     vfs_unlink -> security_inode_unlink(dir, dentry)
+ *     vfs_rmdir  -> security_inode_rmdir(dir, dentry)
+ *     vfs_rename -> security_inode_rename(old_dir, old_dentry, new_dir, new_dentry)
+ *     vfs_link   -> security_inode_link(old_dentry, dir, new_dentry)
+ *
+ * Upstream does this earlier, inside namei, which also covers the case of a parent
+ * directory that itself denies the caller.  Being after DAC is enough for the case
+ * that matters here (a writable parent) and costs nothing otherwise.
+ *
+ * The create family (inode_create/mkdir/mknod/symlink) is deliberately not here:
+ * the target does not exist yet, so there is no inode to match against. */
+static int sus_path_inode_unlink(struct inode *dir, struct dentry *dentry);
+static int sus_path_inode_rmdir(struct inode *dir, struct dentry *dentry);
+static int sus_path_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
+				 struct inode *new_dir, struct dentry *new_dentry);
+static int sus_path_inode_link(struct dentry *old_dentry, struct inode *dir,
+			       struct dentry *new_dentry);
+
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_unlink),
+					   typeof(&sus_path_inode_unlink)),
+	      "inode_unlink hook signature mismatch");
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_rmdir),
+					   typeof(&sus_path_inode_rmdir)),
+	      "inode_rmdir hook signature mismatch");
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_rename),
+					   typeof(&sus_path_inode_rename)),
+	      "inode_rename hook signature mismatch");
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_link),
+					   typeof(&sus_path_inode_link)),
+	      "inode_link hook signature mismatch");
+
+static struct ksu_lsm_hook sus_path_unlink_hook = KSU_LSM_HOOK_INIT(
+	inode_unlink, "selinux_inode_unlink", (void *)sus_path_inode_unlink, 0);
+
+static struct ksu_lsm_hook sus_path_rmdir_hook = KSU_LSM_HOOK_INIT(
+	inode_rmdir, "selinux_inode_rmdir", (void *)sus_path_inode_rmdir, 0);
+
+static struct ksu_lsm_hook sus_path_rename_hook = KSU_LSM_HOOK_INIT(
+	inode_rename, "selinux_inode_rename", (void *)sus_path_inode_rename, 0);
+
+static struct ksu_lsm_hook sus_path_link_hook = KSU_LSM_HOOK_INIT(
+	inode_link, "selinux_inode_link", (void *)sus_path_inode_link, 0);
+
 static struct ksu_lsm_hook sus_path_getattr_hook = KSU_LSM_HOOK_INIT(
 	inode_getattr, "selinux_inode_getattr",
 	(void *)sus_path_inode_getattr, 0);
@@ -814,6 +867,79 @@ static int sus_path_inode_permission(struct inode *inode, int mask)
     if (!orig)
         return 0;
     return orig(inode, mask);
+}
+
+/* The name-based ops share one counter: they answer the same question ("may this
+ * name be used at all") and the interesting fact is that they fire at all. */
+static atomic_t n_enoent_nameop = ATOMIC_INIT(0);
+
+/* A negative dentry has no inode, which is exactly the "not hidden" answer. */
+static bool sus_path_dentry_hidden(const struct dentry *dentry)
+{
+    struct inode *inode;
+
+    if (!dentry)
+        return false;
+    inode = d_inode(dentry);
+    return inode && sus_path_inode_hidden(inode);
+}
+
+static int sus_path_nameop_hit(void)
+{
+    atomic_inc(&n_enoent_nameop);
+    return -ENOENT;
+}
+
+static int sus_path_inode_unlink(struct inode *dir, struct dentry *dentry)
+{
+    int (*orig)(struct inode *, struct dentry *) = (void *)sus_path_unlink_hook.original;
+
+    if (sus_path_dentry_hidden(dentry))
+        return sus_path_nameop_hit();
+    if (!orig)
+        return 0;
+    return orig(dir, dentry);
+}
+
+static int sus_path_inode_rmdir(struct inode *dir, struct dentry *dentry)
+{
+    int (*orig)(struct inode *, struct dentry *) = (void *)sus_path_rmdir_hook.original;
+
+    if (sus_path_dentry_hidden(dentry))
+        return sus_path_nameop_hit();
+    if (!orig)
+        return 0;
+    return orig(dir, dentry);
+}
+
+static int sus_path_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
+				 struct inode *new_dir, struct dentry *new_dentry)
+{
+    int (*orig)(struct inode *, struct dentry *, struct inode *, struct dentry *) =
+        (void *)sus_path_rename_hook.original;
+
+    /* Both ends matter: moving a hidden file out of hiding is the obvious one, and
+     * overwriting a hidden file through its target name is the other. */
+    if (sus_path_dentry_hidden(old_dentry) || sus_path_dentry_hidden(new_dentry))
+        return sus_path_nameop_hit();
+    if (!orig)
+        return 0;
+    return orig(old_dir, old_dentry, new_dir, new_dentry);
+}
+
+static int sus_path_inode_link(struct dentry *old_dentry, struct inode *dir,
+			       struct dentry *new_dentry)
+{
+    int (*orig)(struct dentry *, struct inode *, struct dentry *) =
+        (void *)sus_path_link_hook.original;
+
+    /* A hard link is a second name for the same inode - create one while the file
+     * is hidden and the new name is not. */
+    if (sus_path_dentry_hidden(old_dentry))
+        return sus_path_nameop_hit();
+    if (!orig)
+        return 0;
+    return orig(old_dentry, dir, new_dentry);
 }
 
 /* ---- DAC layer ----
@@ -2293,10 +2419,11 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
     int i;
 
     n += scnprintf(buf + n, PAGE_SIZE - n,
-                   "hide_from_apps=%d  enoent: getattr=%d perm=%d dac=%d gper=%d path=%d "
+                   "hide_from_apps=%d  enoent: getattr=%d perm=%d nameop=%d dac=%d gper=%d path=%d "
                    "(fp=%d kp=%d getname=%d exit=%d)\n",
                    hide_from_apps, atomic_read(&n_enoent_getattr),
-                   atomic_read(&n_enoent_perm), atomic_read(&n_enoent_dac),
+                   atomic_read(&n_enoent_perm), atomic_read(&n_enoent_nameop),
+                   atomic_read(&n_enoent_dac),
                    atomic_read(&n_enoent_gper), atomic_read(&n_enoent_path),
                    atomic_read(&n_hit_fp), atomic_read(&n_hit_kp),
                    atomic_read(&n_hit_getname), atomic_read(&n_hit_exit));
@@ -2477,6 +2604,25 @@ int sus_path_init(void)
         pr_info("sus_path: perm hook armed, orig=%ps\n",
                 sus_path_perm_hook.original);
 
+    /* Name-based operations: without these, an app that can write the parent
+     * directory can delete or rename a hidden file. */
+    {
+        struct ksu_lsm_hook *nameops[] = {
+            &sus_path_unlink_hook, &sus_path_rmdir_hook,
+            &sus_path_rename_hook, &sus_path_link_hook,
+        };
+        int i;
+
+        for (i = 0; i < (int)ARRAY_SIZE(nameops); i++) {
+            rc = ksu_register_lsm_hook(nameops[i]);
+            if (rc)
+                pr_warn("sus_path: %s hook failed %d\n", nameops[i]->head_name, rc);
+            else
+                pr_info("sus_path: %s hook armed, orig=%ps\n",
+                        nameops[i]->head_name, nameops[i]->original);
+        }
+    }
+
     /* The DAC layer is NOT registered here any more.
      *
      * It exists for one case: DAC runs before the LSM chain, so a file whose mode
@@ -2515,6 +2661,18 @@ void sus_path_exit(void)
     sus_path_dac_unregister();
     if (sus_path_perm_hook.entry)
         ksu_unregister_lsm_hook(&sus_path_perm_hook);
+    {
+        struct ksu_lsm_hook *nameops[] = {
+            &sus_path_unlink_hook, &sus_path_rmdir_hook,
+            &sus_path_rename_hook, &sus_path_link_hook,
+        };
+        int i;
+
+        for (i = 0; i < (int)ARRAY_SIZE(nameops); i++) {
+            if (nameops[i]->entry)
+                ksu_unregister_lsm_hook(nameops[i]);
+        }
+    }
     if (sus_path_getattr_hook.entry)
         ksu_unregister_lsm_hook(&sus_path_getattr_hook);
 
