@@ -52,8 +52,11 @@
  * rewriting the line the function has already formatted, from a kretprobe on
  * that function's return:
  *
- *   d_path()                 <- do_proc_readlink() and seq_path() (the maps
- *                               name column) both d_path() the file's f_path
+ *   d_path()                 <- do_proc_readlink() (readlink of /proc/<pid>/fd/N)
+ *   __d_path()               <- seq_path() (the maps NAME column).  NOT the same
+ *                               function: fs/seq_file.c calls __d_path directly,
+ *                               so a d_path probe alone left the maps name as the
+ *                               redirected path while the numbers were the target's
  *   show_map_vma() (return)  <- its line carries "maj:min ino" from the
  *                               redirected inode; rewritten to the target's
  *   vfs_statfs()             <- fstatfs()/statfs()
@@ -165,6 +168,7 @@ static DEFINE_MUTEX(or_lock);
  * against a symbol's out-of-line copy, which GKI's full LTO may leave with no
  * live call sites (AUDIT_FINDINGS.md: five probes registered, zero hits). */
 static atomic_t or_rev_dpath_hits = ATOMIC_INIT(0);
+static atomic_t or_rev_dpath_seq_hits = ATOMIC_INIT(0);	/* __d_path: the maps name column */
 static atomic_t or_rev_statfs_hits = ATOMIC_INIT(0);
 
 /* Cached paths are per-entry and released once, at unload.
@@ -387,44 +391,64 @@ static int or_vfs_open_pre(struct kprobe *kp, struct pt_regs *regs)
 	return 0;
 }
 
-/* ---- reverse: d_path(path, buf, buflen) ----
+/* ---- reverse: the two path-rendering primitives ----
  *
- * Covers the two surfaces whose name comes from a path walk:
- *   - readlink("/proc/<pid>/fd/N"): proc_pid_readlink() -> do_proc_readlink()
- *     -> d_path(&path, tmp, PAGE_SIZE) (fs/proc/base.c:1825-1848, upstream
- *     spoofs it at patch:1062-1083);
- *   - the /proc/<pid>/maps name column: show_map_vma() -> seq_file_path()
- *     -> seq_path() -> d_path(&file->f_path, ...) (fs/seq_file.c:486-500,
- *     upstream spoofs it inside show_map_vma, patch:1257-1288).
+ * readlink("/proc/<pid>/fd/N") -> proc_pid_readlink() -> do_proc_readlink()
+ *   -> d_path(&path, tmp, PAGE_SIZE)   (fs/proc/base.c, upstream: patch:1062-1083)
  *
- * Both hand d_path() a path that points at the redirected file, so replacing it
- * with the target's cached path makes d_path render the target name - the same
- * mechanism the forward direction uses.  Divergence to know about: upstream
- * returns the literal string it was given at add time, while d_path() renders the
- * canonical name of the cached target path in the *reader's* namespace, so a
- * rule registered through a symlink (or from another mount namespace) can read
- * back differently.  See the report; the literal string is in the entry
- * (target_pathname) if that ever needs to be exact. */
-static int or_dpath_pre(struct kprobe *kp, struct pt_regs *regs)
+ * the /proc/<pid>/maps name column -> show_map_vma() -> seq_file_path()
+ *   -> seq_path() -> __d_path(&file->f_path, root, buf, size)
+ *
+ * The second one is NOT d_path(): fs/seq_file.c:514-517 calls seq_path(), which
+ * goes straight to __d_path() and never through d_path() - so a probe on d_path
+ * alone left the maps name column showing the REDIRECTED path.  Measured with the
+ * first version of the maps fix: the line read
+ *
+ *   ... fe:17 10166500  /data/local/tmp/ormaps/redirected
+ *
+ * i.e. the target's numbers next to the redirected name - the exact inconsistency
+ * the other half of this fix removes.  Both primitives take the path in x0, so one
+ * handler body serves both; the hit counters are kept apart because "which landing
+ * point fired" is the thing that has to stay visible.
+ *
+ * Divergence to know about: upstream returns the literal string it was given at add
+ * time, while these render the canonical name of the cached target path in the
+ * *reader's* namespace, so a rule registered through a symlink (or from another
+ * mount namespace) can read back differently.  The literal string is kept in the
+ * entry (target_pathname) if that ever needs to be exact. */
+static bool or_dpath_swap(struct pt_regs *regs)
 {
 	const struct path *path = (const struct path *)regs->regs[0];
 	struct inode *inode;
 	struct sus_or_entry *e;
 
 	if (!READ_ONCE(nor) || IS_ERR_OR_NULL(path) || !path->dentry)
-		return 0;
+		return false;
 	if (!or_reverse_visible())
-		return 0;
+		return false;
 	inode = d_backing_inode(path->dentry);
 	if (!inode)
-		return 0;
+		return false;
 
 	e = or_find_by_redirected_inode(inode->i_ino, inode->i_sb->s_dev);
 	if (!e)
-		return 0;
+		return false;
 
-	atomic_inc(&or_rev_dpath_hits);
 	regs->regs[0] = (unsigned long)&e->target_path;
+	return true;
+}
+
+static int or_dpath_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	if (or_dpath_swap(regs))
+		atomic_inc(&or_rev_dpath_hits);
+	return 0;
+}
+
+static int or_dpath_seq_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	if (or_dpath_swap(regs))
+		atomic_inc(&or_rev_dpath_seq_hits);
 	return 0;
 }
 
@@ -464,6 +488,13 @@ static struct kprobe kp_or = {
 static struct kprobe kp_or_dpath = {
 	.symbol_name = "d_path",
 	.pre_handler = or_dpath_pre,
+};
+
+/* seq_path() calls __d_path() directly, so the maps name column needs this one -
+ * see the note above the handler. */
+static struct kprobe kp_or_dpath_seq = {
+	.symbol_name = "__d_path",
+	.pre_handler = or_dpath_seq_pre,
 };
 
 static struct kprobe kp_or_vfs_statfs = {
@@ -729,6 +760,7 @@ static bool or_fdinfo_registered;
 
 static bool or_registered;
 static bool or_dpath_registered;
+static bool or_dpath_seq_registered;
 static bool or_statfs_registered;
 
 /* The forward hook is the feature: a rule that cannot fire is worse than no
@@ -761,11 +793,21 @@ static void or_register_reverse(void)
 	if (!or_dpath_registered) {
 		rc = register_kprobe(&kp_or_dpath);
 		if (rc)
-			pr_warn("open_redirect: register_kprobe(d_path) failed %d - readlink/maps name not disguised (or already inlined)\n",
+			pr_warn("open_redirect: register_kprobe(d_path) failed %d - readlink not disguised (or already inlined)\n",
 				rc);
 		else {
 			or_dpath_registered = true;
 			SUSFS_LOGI("susfs_open_redirect: reverse hook installed (d_path)\n");
+		}
+	}
+	if (!or_dpath_seq_registered) {
+		rc = register_kprobe(&kp_or_dpath_seq);
+		if (rc)
+			pr_warn("open_redirect: register_kprobe(__d_path) failed %d - the maps name column stays the redirected path (or already inlined)\n",
+				rc);
+		else {
+			or_dpath_seq_registered = true;
+			SUSFS_LOGI("susfs_open_redirect: reverse hook installed (__d_path: maps name)\n");
 		}
 	}
 	if (!or_statfs_registered) {
@@ -817,6 +859,10 @@ static void or_unregister(void)
 	if (or_dpath_registered) {
 		unregister_kprobe(&kp_or_dpath);
 		or_dpath_registered = false;
+	}
+	if (or_dpath_seq_registered) {
+		unregister_kprobe(&kp_or_dpath_seq);
+		or_dpath_seq_registered = false;
 	}
 	if (!or_registered)
 		return;
@@ -929,10 +975,11 @@ static int or_proc_show(struct seq_file *m, void *v)
 	 * matter twice over: fdinfo=<registered> and the fdinfo hit/rewrite pair.
 	 * mnt_id is NOT rewritten here: that id belongs to sus_mount's table, and the
 	 * fdinfo line for a mount is only ever wrong when that feature is hidden. */
-	seq_printf(m, "hooks: open=%d dpath=%d statfs=%d maps=%d fdinfo=%d | rev hits: dpath=%d statfs=%d maps=%d/%d fdinfo=%d/%d | su_sid=%u\n",
-		   or_registered, or_dpath_registered, or_statfs_registered,
-		   or_maps_registered, or_fdinfo_registered,
+	seq_printf(m, "hooks: open=%d dpath=%d dpath_seq=%d statfs=%d maps=%d fdinfo=%d | rev hits: dpath=%d dpath_seq=%d statfs=%d maps=%d/%d fdinfo=%d/%d | su_sid=%u\n",
+		   or_registered, or_dpath_registered, or_dpath_seq_registered,
+		   or_statfs_registered, or_maps_registered, or_fdinfo_registered,
 		   atomic_read(&or_rev_dpath_hits),
+		   atomic_read(&or_rev_dpath_seq_hits),
 		   atomic_read(&or_rev_statfs_hits),
 		   atomic_read(&or_rev_maps_hits),
 		   atomic_read(&or_rev_maps_rewrites),
