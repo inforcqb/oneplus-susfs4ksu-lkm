@@ -31,10 +31,12 @@ typedef long s64;
 
 #define SYS_openat    56
 #define SYS_close     57
+#define SYS_getdents64 61
 #define SYS_lseek     62
 #define SYS_read      63
 #define SYS_write     64
 #define SYS_pread64   67
+#define SYS_readlinkat 78
 #define SYS_exit      93
 #define SYS_mmap      222
 
@@ -203,6 +205,60 @@ static const char *basename_of(const char *p)
 	return b;
 }
 
+/* /proc/self/map_files/<start>-<end> is a symlink per mapping, and resolving it
+ * names the mapped file - which is how the a4 tests located a mapping the maps
+ * listing had already dropped.  Count the entries, how many of them still NAME
+ * the file this tool mapped, and how many answer ENOENT (the disguise). */
+struct linux_dirent64_min {
+	u64 d_ino;
+	s64 d_off;
+	unsigned short d_reclen;
+	unsigned char d_type;
+	char d_name[];
+};
+
+static void check_map_files(const char *base, u64 *entries, u64 *named, u64 *enoent)
+{
+	char dbuf[4096], path[256], link[512];
+	long fd, n;
+
+	*entries = *named = *enoent = 0;
+	fd = sys6(SYS_openat, AT_FDCWD, (long)"/proc/self/map_files", O_RDONLY, 0, 0, 0);
+	if (fd < 0)
+		return;
+
+	while ((n = sys6(SYS_getdents64, fd, (long)dbuf, (long)sizeof(dbuf), 0, 0, 0)) > 0) {
+		long off = 0;
+
+		while (off < n) {
+			struct linux_dirent64_min *d = (void *)(dbuf + off);
+			u64 pos;
+			long r;
+
+			if (d->d_reclen < 20 || off + d->d_reclen > n)
+				break;
+			if (d->d_name[0] != '.') {
+				pos = put(path, 0, "/proc/self/map_files/");
+				pos = put(path, pos, d->d_name);
+				path[pos] = 0;
+				(*entries)++;
+				r = sys6(SYS_readlinkat, AT_FDCWD, (long)path, (long)link,
+					 (long)(sizeof(link) - 1), 0, 0);
+				if (r < 0) {
+					if (r == -2)	/* -ENOENT: the disguise */
+						(*enoent)++;
+				} else {
+					link[r] = 0;
+					if (count_name(link, r, base))
+						(*named)++;
+				}
+			}
+			off += d->d_reclen;
+		}
+	}
+	sys6(SYS_close, fd, 0, 0, 0, 0, 0);
+}
+
 __asm__(
 ".text\n"
 ".global _start\n"
@@ -281,6 +337,19 @@ void mmap_main(long argc, char **argv)
 	pos = put(out, pos, "smaps_name_hits=");
 	pos = putnum(out, pos, (n > 0) ? count_name(fbuf, n, base) : 0);
 	pos = put(out, pos, "\n");
+
+	{
+		u64 entries, named, enoent;
+
+		check_map_files(base, &entries, &named, &enoent);
+		pos = put(out, pos, "map_files_entries=");
+		pos = putnum(out, pos, entries);
+		pos = put(out, pos, " map_files_named_target=");
+		pos = putnum(out, pos, named);
+		pos = put(out, pos, " map_files_enoent=");
+		pos = putnum(out, pos, enoent);
+		pos = put(out, pos, "\n");
+	}
 
 	sys6(SYS_write, 1, (long)out, pos, 0, 0, 0);
 }
