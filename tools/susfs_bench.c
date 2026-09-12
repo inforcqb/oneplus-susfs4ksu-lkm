@@ -155,8 +155,8 @@ void bench_main(long argc, char **argv);
 void bench_main(long argc, char **argv)
 {
 	const char *path = "/data/local/tmp/dac_probe/visible";
-	u64 iters = 200000;
-	u64 i, t0, t1;
+	u64 iters = 100000;
+	u64 i, r, t0, t1, took, best;
 	long rc = 0;
 
 	if (argc > 1)
@@ -169,34 +169,59 @@ void bench_main(long argc, char **argv)
 	for (i = 0; i < 1000; i++)
 		sys6(SYS_newfstatat, AT_FDCWD, (long)path, (long)statbuf, 0, 0, 0);
 
-	t0 = now_ns();
-	for (i = 0; i < iters; i++)
-		rc += sys6(SYS_faccessat, AT_FDCWD, (long)path, 0, 0, 0, 0);
-	t1 = now_ns();
-	report("faccessat", iters, t1 - t0);
-
-	t0 = now_ns();
-	for (i = 0; i < iters; i++)
-		rc += sys6(SYS_newfstatat, AT_FDCWD, (long)path, (long)statbuf, 0, 0, 0);
-	t1 = now_ns();
-	report("newfstatat", iters, t1 - t0);
-
-	t0 = now_ns();
-	for (i = 0; i < iters; i++)
-		rc += sys6(SYS_statx, AT_FDCWD, (long)path, 0, STATX_BASIC_STATS,
-			   (long)statbuf, 0);
-	t1 = now_ns();
-	report("statx", iters, t1 - t0);
-
-	t0 = now_ns();
-	for (i = 0; i < iters; i++) {
-		long fd = sys6(SYS_openat, AT_FDCWD, (long)path, O_RDONLY, 0, 0, 0);
-
-		if (fd >= 0)
-			sys6(SYS_close, fd, 0, 0, 0, 0, 0);
+	/* The interesting difference is a few hundred nanoseconds on a phone that is
+	 * also running Android, so a single pass is mostly noise.  Take the best of
+	 * several: the minimum is the run that was least disturbed, which is the
+	 * number the layer itself is responsible for. */
+#define ROUNDS 5
+	best = ~0ull;
+	for (r = 0; r < ROUNDS; r++) {
+		t0 = now_ns();
+		for (i = 0; i < iters; i++)
+			rc += sys6(SYS_faccessat, AT_FDCWD, (long)path, 0, 0, 0, 0);
+		took = now_ns() - t0;
+		if (took < best)
+			best = took;
 	}
-	t1 = now_ns();
-	report("openat+close", iters, t1 - t0);
+	report("faccessat", iters, best);
+
+	best = ~0ull;
+	for (r = 0; r < ROUNDS; r++) {
+		t0 = now_ns();
+		for (i = 0; i < iters; i++)
+			rc += sys6(SYS_newfstatat, AT_FDCWD, (long)path, (long)statbuf, 0, 0, 0);
+		took = now_ns() - t0;
+		if (took < best)
+			best = took;
+	}
+	report("newfstatat", iters, best);
+
+	best = ~0ull;
+	for (r = 0; r < ROUNDS; r++) {
+		t0 = now_ns();
+		for (i = 0; i < iters; i++)
+			rc += sys6(SYS_statx, AT_FDCWD, (long)path, 0, STATX_BASIC_STATS,
+				   (long)statbuf, 0);
+		took = now_ns() - t0;
+		if (took < best)
+			best = took;
+	}
+	report("statx", iters, best);
+
+	best = ~0ull;
+	for (r = 0; r < ROUNDS; r++) {
+		t0 = now_ns();
+		for (i = 0; i < iters; i++) {
+			long fd = sys6(SYS_openat, AT_FDCWD, (long)path, O_RDONLY, 0, 0, 0);
+
+			if (fd >= 0)
+				sys6(SYS_close, fd, 0, 0, 0, 0, 0);
+		}
+		took = now_ns() - t0;
+		if (took < best)
+			best = took;
+	}
+	report("openat+close", iters, best);
 
 	/* Keep the compiler honest: rc is used so the loops cannot be optimised
 	 * away, and its value is not interesting. */
