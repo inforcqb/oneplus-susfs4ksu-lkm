@@ -436,7 +436,11 @@ static int sus_mount_statx_ret(struct kretprobe_instance *ri, struct pt_regs *re
         return 0;
     }
     if (!ubuf) {
+        /* Which of the two landing points has no user pointer in argument 5 is
+         * worth knowing: the other one is the one doing the work. */
         atomic_inc(&n_statx_nobuf);
+        pr_info_ratelimited("sus_mount: statx at %s has no buffer in x4\n",
+                            ri->rp->kp.symbol_name);
         return 0;
     }
     if (sus_mount_is_su_domain())
