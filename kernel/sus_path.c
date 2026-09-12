@@ -1774,14 +1774,14 @@ static void sus_path_fp_cover_gap(unsigned int base_ns)
 		return READ_ONCE(susfs_fp_orig_##w)(regs);		\
 	}
 
-SUSFS_FP_WRAPPER(newfstatat, 1, 1300)
-SUSFS_FP_WRAPPER(statx, 1, 1150)
-SUSFS_FP_WRAPPER(faccessat, 1, 1700)
-SUSFS_FP_WRAPPER(faccessat2, 1, 1700)
-SUSFS_FP_WRAPPER(openat, 1, 1900)
-SUSFS_FP_WRAPPER(openat2, 1, 1900)
-SUSFS_FP_WRAPPER(readlinkat, 1, 1700)
-SUSFS_FP_WRAPPER(execve, 0, 2200)
+SUSFS_FP_WRAPPER(newfstatat, 1, 1150)
+SUSFS_FP_WRAPPER(statx, 1, 1000)
+SUSFS_FP_WRAPPER(faccessat, 1, 1550)
+SUSFS_FP_WRAPPER(faccessat2, 1, 1550)
+SUSFS_FP_WRAPPER(openat, 1, 1750)
+SUSFS_FP_WRAPPER(openat2, 1, 1750)
+SUSFS_FP_WRAPPER(readlinkat, 1, 1550)
+SUSFS_FP_WRAPPER(execve, 0, 1950)
 
 static struct susfs_fp_hook fp_hooks[] = {
 	{ __NR_newfstatat,  "susfs_fp_newfstatat",  "__arm64_sys_newfstatat",  susfs_fp_newfstatat,  &susfs_fp_orig_newfstatat,  NULL, false },
