@@ -1632,6 +1632,15 @@ static void sus_path_fp_dump(void);
 /* Non-zero while the fp layer owns the syscall entries; the sys_exit rewrite in
  * sus_path_sys_exit() is only a backstop for the entries it could not take. */
 static int sus_path_fp_armed;
+/* Whether the sys_exit rewrite for faccessat/faccessat2/newfstatat is needed.
+ *
+ * It exists because KernelSU owns those table entries, so the kprobe fallback
+ * cannot hook them - but that is only true when the kprobe layer is what answers.
+ * With the fp layer armed the entry is refused before the syscall runs, and with
+ * lsm_only the LSM layer already decides on the same rule table, so in both cases
+ * the rewrite would be a full strncpy_from_user + rule match on every single
+ * faccessat/stat call for nothing (measured: exit=1001000 while lsm_only). */
+static bool sus_path_exit_rewrite;
 static void sus_path_fp_disarm(void);
 
 static void sus_path_tracepoint_register(void)
@@ -1674,7 +1683,9 @@ static void sus_path_hooks_arm(void)
     if (lsm_only) {
         /* Nothing is armed on purpose: the LSM hooks came up with the module and
          * the getdents64 tracepoint above is the only other layer.  Whatever the
-         * app sees now is the LSM layer's own coverage. */
+         * app sees now is the LSM layer's own coverage - and the sys_exit rewrite
+         * stays off, because the LSM layer decides on the same rule table. */
+        sus_path_exit_rewrite = false;
         pr_info("sus_path: hooks armed (lsm_only: LSM + getdents64 only)\n");
         sus_path_cand_register();
         mutex_unlock(&sus_path_arm_lock);
@@ -1702,11 +1713,15 @@ static void sus_path_hooks_arm(void)
          * single-step on every ordinary, non-hidden call.  They are registered in
          * the fallback branch below, which is the only case where they can help. */
         sus_path_compat_register();
+        sus_path_exit_rewrite = false;
     } else {
         pr_warn("sus_path: fp layer unavailable, falling back to kprobes\n");
         sus_path_syscall_register();
         sus_path_path_register();
         sus_path_getname_register();
+        /* The kprobe layer cannot take faccessat/faccessat2/newfstatat (KernelSU
+         * owns those entries), so those three are answered on the way out. */
+        sus_path_exit_rewrite = true;
         /* Only here: with no entry layer in front of it, DAC is the first thing
          * that would refuse a hidden file, and it answers EACCES.  With the fp
          * layer armed this never fires (measured: dac=0), so it is not armed.
@@ -2097,7 +2112,7 @@ static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret)
      *
      * syscall_get_arguments() gives the raw registers, with args[1] being the
      * original x1 (the pathname) - x0 in regs no longer holds it at exit. */
-    if (!sus_path_fp_armed && !is_compat_task() &&
+    if (sus_path_exit_rewrite && !is_compat_task() &&
         (nr == __NR_faccessat ||
 #ifdef __NR_faccessat2
          nr == __NR_faccessat2 ||
