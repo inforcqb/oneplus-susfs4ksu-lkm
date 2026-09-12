@@ -90,6 +90,19 @@ void susfs_fp_dump_entry(int nr, const char *sym)
 		((READ_ONCE(sys_call_table_ptr[nr]) == (susfs_syscall_fn_t)plain) ? "plain match" : "neither"));
 }
 
+static bool fp_has_landing_pad(const void *fn);
+
+void susfs_fp_dump_wrapper(const char *name, const void *fn)
+{
+	if (!fn) {
+		pr_warn("susfs_fp: %s: no wrapper\n", name);
+		return;
+	}
+	pr_info("susfs_fp: %s at %px first insn 0x%08x (%s)\n", name, fn,
+		READ_ONCE(*(const u32 *)fn),
+		fp_has_landing_pad(fn) ? "bti c" : "NO LANDING PAD");
+}
+
 /* An indirect call into us is checked against the target's BTI landing pad, so a
  * wrapper that does not start with 'bti c' would give "Oops - BTI" instead of
  * hiding anything.  The kernel itself is built with
@@ -128,6 +141,15 @@ int susfs_fp_install(struct susfs_fp_hook *h)
 		return -ENOENT;
 	}
 
+	/* Publish the original BEFORE the table points at us: the wrapper reads this
+	 * slot, so a table entry that is live while the slot is still NULL would jump
+	 * to zero on another CPU.  The slot is never cleared again for the same
+	 * reason - once the entry is restored, nothing calls the wrapper any more. */
+	h->orig = old;
+	if (h->orig_slot)
+		WRITE_ONCE(*h->orig_slot, old);
+	smp_wmb();
+
 	err = ksu_patch_text(&sys_call_table_ptr[h->nr], &h->wrapper,
 			     sizeof(h->wrapper), KSU_PATCH_TEXT_FLUSH_DCACHE);
 	if (err) {
@@ -142,11 +164,6 @@ int susfs_fp_install(struct susfs_fp_hook *h)
 		return -EIO;
 	}
 
-	/* Published only after the table is live, and with a barrier so the wrapper
-	 * cannot read a stale slot. */
-	h->orig = old;
-	if (h->orig_slot)
-		WRITE_ONCE(*h->orig_slot, old);
 	h->installed = true;
 
 	pr_info("susfs_fp: nr %d (%s) armed: table=%px -> %px, original %px\n",
@@ -168,9 +185,6 @@ void susfs_fp_remove(struct susfs_fp_hook *h)
 		return;
 	}
 
-	if (h->orig_slot)
-		WRITE_ONCE(*h->orig_slot, NULL);
-
 	err = ksu_patch_text(&sys_call_table_ptr[h->nr], &h->orig,
 			     sizeof(h->orig), KSU_PATCH_TEXT_FLUSH_DCACHE);
 	if (err)
@@ -180,4 +194,36 @@ void susfs_fp_remove(struct susfs_fp_hook *h)
 			h->nr, h->name, (void *)h->orig);
 
 	h->installed = false;
+}
+
+/* Wait until nothing can be inside a wrapper before the module text goes away.
+ *
+ * Restoring the table entry only stops NEW calls: a task that already picked the
+ * wrapper out of the table is running module code right now, and rmmod would free
+ * it under its feet.  synchronize_rcu() alone does not cover it - the syscall
+ * path is not an RCU read-side section for this purpose - so the same
+ * synchronize_rcu_tasks() drain the LSM layer uses is repeated here (resolved at
+ * runtime and called through a __nocfi wrapper; a delay is the fallback). */
+static void (*fp_sync_rcu_tasks_fn)(void);
+static bool fp_sync_looked_up;
+
+static __nocfi void fp_call_drain(void (*fn)(void))
+{
+	fn();
+}
+
+void susfs_fp_drain(void)
+{
+	if (!fp_sync_looked_up) {
+		fp_sync_rcu_tasks_fn = (void *)find_kernel_symbol_exact("synchronize_rcu_tasks");
+		fp_sync_looked_up = true;
+		if (!fp_sync_rcu_tasks_fn)
+			pr_warn("susfs_fp: synchronize_rcu_tasks not found, using a delay\n");
+	}
+
+	synchronize_rcu();
+	if (fp_sync_rcu_tasks_fn)
+		fp_call_drain(fp_sync_rcu_tasks_fn);
+	else
+		msleep(50);
 }

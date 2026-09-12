@@ -18,6 +18,7 @@ typedef long (*susfs_syscall_fn_t)(const struct pt_regs *regs);
 struct susfs_fp_hook {
 	int nr;					/* __NR_* */
 	const char *name;			/* our wrapper, for logs */
+	const char *sym;			/* the kernel's wrapper symbol, for logs */
 	susfs_syscall_fn_t wrapper;		/* what we put into the table */
 	susfs_syscall_fn_t *orig_slot;		/* where the wrapper reads the original */
 	susfs_syscall_fn_t orig;		/* the entry we replaced */
@@ -32,7 +33,14 @@ unsigned long susfs_fp_syscall_table(void);
 int susfs_fp_install(struct susfs_fp_hook *h);
 void susfs_fp_remove(struct susfs_fp_hook *h);
 
+/* Blocks until no CPU can still be inside a wrapper; call before the module text
+ * may go away (i.e. once, after all entries are restored). */
+void susfs_fp_drain(void);
+
 /* Prints table[nr] next to the plain and the .cfi_jt symbol for one entry. */
 void susfs_fp_dump_entry(int nr, const char *sym);
+
+/* Prints the first instruction of a wrapper - 'bti c' or nothing. */
+void susfs_fp_dump_wrapper(const char *name, const void *fn);
 
 #endif /* __SUSFS_FP_HOOK_H */

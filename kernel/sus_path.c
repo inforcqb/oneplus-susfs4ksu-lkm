@@ -1611,6 +1611,11 @@ static int fp_test;
 module_param(fp_test, int, 0644);
 static bool fp_all;
 module_param(fp_all, bool, 0644);
+/* Read-only diagnostic: print what the table holds for every entry we would
+ * replace, and the first instruction of every wrapper, then install nothing.
+ * This is the zero-risk first run on a new kernel (no write, no BTI/PAC bet). */
+static int fp_dump;
+module_param(fp_dump, int, 0644);
 static void sus_path_fp_arm(void);
 static void sus_path_fp_disarm(void);
 
@@ -1648,7 +1653,7 @@ static void sus_path_hooks_arm(void)
      * the syscall kprobes may be installed - a kprobe would write its BRK into
      * the very wrapper we no longer touch, and the inline hooks would fight over
      * the same table entries. */
-    if (fp_test > 0 || fp_all) {
+    if (fp_test > 0 || fp_all || fp_dump) {
         sus_path_fp_arm();
         pr_info("sus_path: hooks armed (fp layer, first rule registered)\n");
         mutex_unlock(&sus_path_arm_lock);
@@ -1886,16 +1891,16 @@ SUSFS_FP_WRAPPER(readlinkat, 1)
 SUSFS_FP_WRAPPER(execve, 0)
 
 static struct susfs_fp_hook fp_hooks[] = {
-	{ __NR_newfstatat,  "susfs_fp_newfstatat",  susfs_fp_newfstatat,  &susfs_fp_orig_newfstatat,  NULL, false },
-	{ __NR_statx,       "susfs_fp_statx",       susfs_fp_statx,       &susfs_fp_orig_statx,       NULL, false },
-	{ __NR_faccessat,   "susfs_fp_faccessat",   susfs_fp_faccessat,   &susfs_fp_orig_faccessat,   NULL, false },
+	{ __NR_newfstatat,  "susfs_fp_newfstatat",  "__arm64_sys_newfstatat",  susfs_fp_newfstatat,  &susfs_fp_orig_newfstatat,  NULL, false },
+	{ __NR_statx,       "susfs_fp_statx",       "__arm64_sys_statx",       susfs_fp_statx,       &susfs_fp_orig_statx,       NULL, false },
+	{ __NR_faccessat,   "susfs_fp_faccessat",   "__arm64_sys_faccessat",   susfs_fp_faccessat,   &susfs_fp_orig_faccessat,   NULL, false },
 #ifdef __NR_faccessat2
-	{ __NR_faccessat2,  "susfs_fp_faccessat2",  susfs_fp_faccessat2,  &susfs_fp_orig_faccessat2,  NULL, false },
+	{ __NR_faccessat2,  "susfs_fp_faccessat2",  "__arm64_sys_faccessat2",  susfs_fp_faccessat2,  &susfs_fp_orig_faccessat2,  NULL, false },
 #endif
-	{ __NR_openat,      "susfs_fp_openat",      susfs_fp_openat,      &susfs_fp_orig_openat,      NULL, false },
-	{ __NR_openat2,     "susfs_fp_openat2",     susfs_fp_openat2,     &susfs_fp_orig_openat2,     NULL, false },
-	{ __NR_readlinkat,  "susfs_fp_readlinkat",  susfs_fp_readlinkat,  &susfs_fp_orig_readlinkat,  NULL, false },
-	{ __NR_execve,      "susfs_fp_execve",      susfs_fp_execve,      &susfs_fp_orig_execve,      NULL, false },
+	{ __NR_openat,      "susfs_fp_openat",      "__arm64_sys_openat",      susfs_fp_openat,      &susfs_fp_orig_openat,      NULL, false },
+	{ __NR_openat2,     "susfs_fp_openat2",     "__arm64_sys_openat2",     susfs_fp_openat2,     &susfs_fp_orig_openat2,     NULL, false },
+	{ __NR_readlinkat,  "susfs_fp_readlinkat",  "__arm64_sys_readlinkat",  susfs_fp_readlinkat,  &susfs_fp_orig_readlinkat,  NULL, false },
+	{ __NR_execve,      "susfs_fp_execve",      "__arm64_sys_execve",      susfs_fp_execve,      &susfs_fp_orig_execve,      NULL, false },
 };
 
 #define N_FP_HOOKS ARRAY_SIZE(fp_hooks)
@@ -1904,12 +1909,20 @@ static void sus_path_fp_arm(void)
 {
 	int i, n = 0;
 
-	if (!fp_test && !fp_all)
+	if (!fp_test && !fp_all && !fp_dump)
 		return;
 
 	/* One dump before anything is replaced: it answers "is the table entry the
-	 * plain symbol or the .cfi_jt stub" for this exact kernel. */
-	susfs_fp_dump_entry(__NR_newfstatat, "__arm64_sys_newfstatat");
+	 * plain symbol or the .cfi_jt stub" for this exact kernel, and whether our
+	 * wrappers carry the BTI landing pad an indirect call needs. */
+	if (fp_dump) {
+		for (i = 0; i < (int)N_FP_HOOKS; i++) {
+			susfs_fp_dump_entry(fp_hooks[i].nr, fp_hooks[i].sym);
+			susfs_fp_dump_wrapper(fp_hooks[i].name, (const void *)fp_hooks[i].wrapper);
+		}
+		pr_info("sus_path: fp_dump finished, nothing installed\n");
+		return;
+	}
 
 	for (i = 0; i < (int)N_FP_HOOKS; i++) {
 		if (!fp_all && fp_test != i + 1)
@@ -1923,10 +1936,19 @@ static void sus_path_fp_arm(void)
 
 static void sus_path_fp_disarm(void)
 {
-	int i;
+	int i, n = 0;
 
-	for (i = (int)N_FP_HOOKS - 1; i >= 0; i--)
+	for (i = (int)N_FP_HOOKS - 1; i >= 0; i--) {
+		if (!fp_hooks[i].installed)
+			continue;
 		susfs_fp_remove(&fp_hooks[i]);
+		n++;
+	}
+	/* Restoring a table entry only stops NEW calls: a CPU that already picked a
+	 * wrapper out of the table is running module text right now, so wait that out
+	 * before the module can go away.  Same drain the LSM layer uses. */
+	if (n)
+		susfs_fp_drain();
 }
 
 static struct {
