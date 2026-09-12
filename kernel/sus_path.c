@@ -62,7 +62,6 @@
 #include <linux/atomic.h>
 #include "susfs_abi.h"
 #include "susfs_log.h"
-#include "susfs_fp_hook.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact, for optional compat probes */
 
@@ -1284,11 +1283,10 @@ static void sus_path_dac_unregister(void)
  * questions: which layer refused, and - when the fp layer is off - how many layers
  * saw the same call.  In the default configuration only one of them can fire for
  * a given call (the fp wrapper refuses before the real syscall runs, so nothing
- * downstream is reached), but with fp_enabled=0 the syscall kprobe, the path
- * probes and the getname kretprobe can all match the same string, and a single
- * aggregate number would hide that. */
+ * downstream is reached, so a single aggregate number is enough - the per-layer
+ * counters below exist to show which layer answered, not to detect double
+ * counting. */
 static atomic_t n_enoent_path = ATOMIC_INIT(0);		/* all of them */
-static atomic_t n_hit_fp = ATOMIC_INIT(0);
 static atomic_t n_hit_kp = ATOMIC_INIT(0);
 static atomic_t n_hit_getname = ATOMIC_INIT(0);
 static atomic_t n_hit_exit = ATOMIC_INIT(0);
@@ -1298,16 +1296,12 @@ static atomic_t n_hit_exit = ATOMIC_INIT(0);
  * same shortcut shape the fp wrapper takes, so they need the same timing cover.
  * One value for all of them: a path probe does not know which syscall is walking,
  * and this layer only carries calls when the fp layer is off. */
-#define SUS_PATH_KP_COVER_NS 1500
-static void sus_path_fp_cover_gap(unsigned int base_ns);
 /* Diagnostic: arm nothing but the LSM hooks (registered at init) and the
  * getdents64 tracepoint - no fp layer, no kprobes, no path probes, no getname.
  * It is how the LSM layer's own coverage gets measured instead of guessed: the
  * entry layers otherwise refuse first and hide what the LSM layer can or cannot
  * see.  Useful together with a chmod 777 on the target, which is the other half of
  * an LSM-only design (DAC runs before the LSM chain and would answer EACCES). */
-static bool lsm_only;
-module_param(lsm_only, bool, 0644);
 
 static bool sus_path_match_path(const char *path)
 {
@@ -1361,7 +1355,6 @@ static int kp_path_answer(struct pt_regs *regs, const char *name, bool errptr)
      * running the lookup - so it needs the same timing cover, or the paths this
      * layer catches (the fp layer is off, or the caller came in through a kernel
      * internal path) would answer measurably faster than a real failure. */
-    sus_path_fp_cover_gap(SUS_PATH_KP_COVER_NS);
     if (errptr)
         regs_set_return_value(regs, (unsigned long)ERR_PTR(-ENOENT));
     else
@@ -1528,13 +1521,11 @@ static struct kprobe *sys_path_probes[] = {
  *     lr : ksu_hook_faccessat+0x44/0x58 [kernelsu]
  *     Kernel panic - not syncing: Oops - FPAC: Fatal exception
  *
- * The fp layer answers them instead (susfs_fp_hook.c): it replaces the table
- * entry, not the instructions, so KernelSU's call through the same array lands in
- * our wrapper and then in the .cfi_jt stub as before.  If that layer cannot be
- * armed at all, sus_path_sys_exit() rewrites their answer to ENOENT on the way
- * out.  execve keeps its kprobe either way - it has real effects and cannot be
- * answered after the fact - and a BRK is the kernel's own mechanism, which
- * KernelSU's call into the original returns through normally (measured). */
+ * The LSM slots answer all of them by inode, which is both earlier in the access
+ * (a permission check happens for every one of these syscalls) and immune to the
+ * spelling: faccessat/newfstatat reach inode_permission or inode_getattr, so
+ * nothing has to be done on their behalf at the syscall entry at all.  execve
+ * opens the binary through may_open, which is the same check. */
 
 /* 32-bit (AArch32) callers.
  *
@@ -1935,56 +1926,6 @@ static DEFINE_MUTEX(sus_path_arm_lock);
 /* The tracepoint callback and the filter it drives are defined below. */
 static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret);
 
-/* fp layer (sys_call_table entries), defined with its wrapper table below.
- *
- * The table entry is a data pointer, so nothing here can break the PAC/BTI
- * pairing of the wrapper, and KernelSU - which reads the very same array when it
- * wants the original behaviour - ends up calling through us automatically.  That
- * is what replaced the entry-patching layer (see susfs_fp_hook.c).
- *
- * fp_enabled=0 falls back to the kprobe layer; fp_test=N installs only the n-th
- * entry of fp_hooks[] (1-based), fp_all installs all of them. */
-static int fp_enabled = 1;
-module_param(fp_enabled, int, 0644);
-static int fp_test;
-module_param(fp_test, int, 0644);
-static bool fp_all;
-module_param(fp_all, bool, 0644);
-/* Read-only diagnostic: print what the table holds for every entry we would
- * replace, and the first instruction of every wrapper, then install nothing.
- * This is the zero-risk first run on a new kernel (no write, no BTI/PAC bet). */
-static int fp_dump;
-module_param(fp_dump, int, 0644);
-/* Timing cover for a refused path, in nanoseconds, plus its jitter - see
- * sus_path_fp_cover_gap().  fp_delay_ns is -1 for the per-syscall defaults
- * measured below, >= 0 to override all of them with one value, and 0 to switch
- * the cover off entirely. */
-static int fp_delay_ns = -1;
-module_param(fp_delay_ns, int, 0644);
-static int fp_delay_jitter_ns = 300;
-module_param(fp_delay_jitter_ns, int, 0644);
-/* Off by default: the log line is not free, and writing it on every hit both
- * skews the timing this delay is trying to match and records the access where a
- * root-level observer can read it back.  The counter in hide_list is enough. */
-static int fp_log_hits;
-module_param(fp_log_hits, int, 0644);
-static void sus_path_fp_cover_gap(unsigned int base_ns);
-static int sus_path_fp_arm(void);
-static void sus_path_fp_dump(void);
-/* Non-zero while the fp layer owns the syscall entries; the sys_exit rewrite in
- * sus_path_sys_exit() is only a backstop for the entries it could not take. */
-static int sus_path_fp_armed;
-/* Whether the sys_exit rewrite for faccessat/faccessat2/newfstatat is needed.
- *
- * It exists because KernelSU owns those table entries, so the kprobe fallback
- * cannot hook them - but that is only true when the kprobe layer is what answers.
- * With the fp layer armed the entry is refused before the syscall runs, and with
- * lsm_only the LSM layer already decides on the same rule table, so in both cases
- * the rewrite would be a full strncpy_from_user + rule match on every single
- * faccessat/stat call for nothing (measured: exit=1001000 while lsm_only). */
-static bool sus_path_exit_rewrite;
-static void sus_path_fp_disarm(void);
-
 static void sus_path_tracepoint_register(void)
 {
     int rc = register_trace_sys_exit(sus_path_sys_exit, NULL);
@@ -2006,77 +1947,34 @@ static void sus_path_hooks_arm(void)
     }
 
     hooks_armed = true;
-    if (no_extra) {
-        /* no_extra is the isolation switch: no dirent filter, no sys_exit
-         * rewrite, no LSM, no DAC. */
-        pr_warn("sus_path: no_extra - dirent filter and sys_exit rewrite off\n");
-    }
 
-    if (fp_dump) {
-        sus_path_fp_dump();
-        pr_info("sus_path: hooks armed (fp_dump, read-only)\n");
-        mutex_unlock(&sus_path_arm_lock);
-        return;
-    }
+    /* Two layers, and neither of them is a syscall entry:
+     *
+     *   the LSM slots (registered with the module, above) decide every path-based
+     *   access by inode - which is ABI-independent, so 32-bit callers are covered
+     *   by the same slots, and it cannot be dodged with a different spelling,
+     *   a symlink, a hard link or a bind mount;
+     *
+     *   the getdents64 exit does the listing filter, which no LSM hook can do:
+     *   the directory chain is built inside the filesystem and there is no
+     *   per-entry callback a module can hook.
+     *
+     * Nothing else is needed.  Entry-layer hooks (syscall table replacement or
+     * kprobes) matched the caller's path STRING, which the LSM match already
+     * covers more thoroughly, and every one of those syscalls ends up in an inode
+     * permission or attribute check anyway - so they were paying a per-call cost
+     * for coverage that was already there.
+     *
+     * no_extra is the isolation switch: no LSM, no dirent filter, no DAC. */
+    if (!no_extra)
+        sus_path_tracepoint_register();
+    else
+        pr_warn("sus_path: no_extra - dirent filter off\n");
 
-    if (lsm_only) {
-        /* Nothing entry-level is armed on purpose, so what the app sees is the LSM
-         * layer's own coverage.  The tracepoint stays because the listing filter
-         * lives there when the fp layer is not the one answering, and the sys_exit
-         * rewrite stays off: the LSM layer decides on the same rule table. */
-        sus_path_exit_rewrite = false;
-        if (!no_extra)
-            sus_path_tracepoint_register();
-        pr_info("sus_path: hooks armed (lsm_only: LSM + getdents64 only)\n");
-        sus_path_cand_register();
-        mutex_unlock(&sus_path_arm_lock);
-        return;
-    }
-
-    /* The fp layer first: replacing the sys_call_table entry is the entry layer
-     * that can live next to KernelSU's dispatcher, because it rewrites no
-     * instruction at all (see susfs_fp_hook.c).  The kprobe layer stays as the
-     * fallback for a kernel where the table cannot be resolved. */
-    if (fp_enabled && sus_path_fp_arm() > 0) {
-        /* The compat kprobes are still registered, but only for the entries the fp
-         * layer does not replace; getdents64 is one of them, so the listing filter
-         * no longer needs the sys_exit tracepoint and it stays unregistered - which
-         * is the point: a tracepoint is paid for by every syscall of every process,
-         * an entry by the one syscall that uses it.
-         *
-         * The path layer (filename_lookup / do_filp_open / user_path_at_empty) and
-         * the getname_flags kretprobe are deliberately NOT registered here: they
-         * read the same string as the fp wrapper and match it against the same
-         * rule table, while the fp wrapper refuses before the real syscall runs -
-         * so nothing they could catch is ever reachable through those spellings.
-         * Measured: after four spellings of a hidden path plus 3000 normal accesses,
-         * fp=2 and kp=0 getname=0.  What they did do was put a brk exception and a
-         * single-step on every ordinary, non-hidden call.  They are registered in
-         * the fallback branch below, which is the only case where they can help. */
-        sus_path_compat_register();
-        sus_path_exit_rewrite = false;
-    } else {
-        pr_warn("sus_path: fp layer unavailable, falling back to kprobes\n");
-        sus_path_syscall_register();
-        sus_path_path_register();
-        sus_path_getname_register();
-        /* The listing filter and the answer for faccessat/faccessat2/newfstatat
-         * (KernelSU owns those entries, so the kprobe layer cannot take them) both
-         * live on sys_exit - the only place they can be done without the fp layer. */
-        sus_path_exit_rewrite = true;
-        if (!no_extra)
-            sus_path_tracepoint_register();
-        /* Only here: with no entry layer in front of it, DAC is the first thing
-         * that would refuse a hidden file, and it answers EACCES.  With the fp
-         * layer armed this never fires (measured: dac=0), so it is not armed.
-         * no_extra still means what it says: no LSM, no DAC, no tracepoint. */
-        if (!no_extra)
-            sus_path_dac_register();
-    }
     /* Diagnostic only, and independent of any rule: it is about which path
      * walkers this kernel actually executes. */
     sus_path_cand_register();
-    pr_info("sus_path: hooks armed (first rule registered)\n");
+    pr_info("sus_path: hooks armed (LSM + getdents64)\n");
     mutex_unlock(&sus_path_arm_lock);
 }
 
@@ -2093,227 +1991,10 @@ static void sus_path_hooks_arm(void)
 
 
 
-/* Called from the fp wrappers: x0 (the wrapper's only argument) is the caller's
- * pt_regs, argno the register holding the pathname.  Returns 1 to answer ENOENT
- * without running the original syscall. */
-__attribute__((visibility("hidden"))) int sus_path_fp_decide(u64 uregs_arg, int argno)
-{
-	const struct pt_regs *uregs = (const struct pt_regs *)uregs_arg;
-	const char __user *up;
-	char buf[SUS_PATH_LEN];
-	long n;
-
-	if (!uregs || argno < 0 || argno > 5)
-		return 0;
-	/* Root is never hidden; for everyone else the per-rule gate decides (it has
-	 * to, because our own control nodes are hidden from all non-root callers,
-	 * not just from apps). */
-	if (!current_uid().val)
-		return 0;
-
-	up = (const char __user *)uregs->regs[argno];
-	if (is_compat_task()) {
-#ifdef CONFIG_COMPAT
-		up = compat_ptr((u32)uregs->regs[argno]);
-#else
-		return 0;
-#endif
-	}
-	if (!up)
-		return 0;
-
-	n = strncpy_from_user(buf, up, sizeof(buf) - 1);
-	if (n <= 0)
-		return 0;
-	buf[n] = '\0';
-	if (!sus_path_match_path(buf))
-		return 0;
-
-	/* Same accounting as the kprobe path, so the counters and the log stay
-	 * usable no matter which layer answered. */
-	atomic_inc(&n_enoent_path);
-	atomic_inc(&n_hit_fp);
-	if (fp_log_hits)
-		pr_info_ratelimited("sus_path: path hit '%s' (uid=%u) [fp]\n",
-				    buf, current_uid().val);
-	return 1;
-}
-
-/* Timing cover.
- *
- * Refusing at the syscall entry is measurably faster than letting the real path
- * lookup fail: measured on this device with a warm negative dentry in the same
- * directory, a hidden path answers in 269-276 ns while the absent path costs
- * 1680 ns (newfstatat), 1956 ns (statx), 2331 ns (faccessat) or 2415 ns
- * (openat).  That gap is a side channel - sample both a few hundred times and you
- * know the path exists but is hidden, which is the one thing this module exists to
- * prevent.  Upstream SUSFS has no such gap because it refuses inside
- * walk_component: the lookup runs and fails the normal way.
- *
- * So spend the difference where the refusal happens.  A busy wait (ndelay), not a
- * sleep, and that is deliberate: msleep() and usleep_range() hand the CPU to the
- * scheduler and the gap that opens is tens of microseconds and wildly variable -
- * far larger than what is being hidden, and a signature of its own.  Measured:
- * covering 3000 ns instead of 1000 makes the hidden path *slower* than the absent
- * one, so over-correction is its own tell.
- *
  * base_ns is per syscall because the four targets do not fail equally fast (the
  * numbers above); the jitter keeps "always exactly N" from becoming the next
  * fingerprint. */
-static void sus_path_fp_cover_gap(unsigned int base_ns)
-{
-	unsigned int ns = fp_delay_ns >= 0 ? (unsigned int)fp_delay_ns : base_ns;
-	unsigned int jitter = (unsigned int)(fp_delay_jitter_ns > 0 ? fp_delay_jitter_ns : 0);
-
-	if (!ns)
-		return;
-	if (jitter) {
-		int delta = (int)prandom_u32_max(jitter * 2 + 1) - (int)jitter;
-
-		if (delta > 0)
-			ns += (unsigned int)delta;
-		else if ((unsigned int)(-delta) < ns)
-			ns -= (unsigned int)(-delta);
-	}
-	ndelay(ns);
-}
-
-/* The base values are measured, not guessed: each is what the corresponding
- * syscall costs when it fails the real way on this device, minus the ~270 ns the
- * refusal already spends.  readlinkat and execve are estimates of the same shape
- * (a failed execve does more work than a failed stat). */
-/* getdents64 is the one entry that is not an entry decision: the kernel fills the
- * caller's buffer and we compact the chain afterwards.  That is why it used to sit
- * on the sys_exit tracepoint - and a tracepoint fires for *every* syscall of every
- * process, so the dirent filter was being paid for by the whole system.  On the
  * entry, only getdents64 pays. */
-static long sus_path_filter(unsigned long buf, long count);
-
-static susfs_syscall_fn_t susfs_fp_orig_getdents64;
-static susfs_syscall_fn_t susfs_fp_orig_compat_getdents64;
-
-static __nocfi long susfs_fp_getdents64(const struct pt_regs *regs)
-{
-	susfs_syscall_fn_t orig = is_compat_task() ?
-		READ_ONCE(susfs_fp_orig_compat_getdents64) :
-		READ_ONCE(susfs_fp_orig_getdents64);
-	unsigned long buf;
-	long ret;
-
-	if (!orig)
-		return -ENOSYS;
-
-	ret = orig(regs);
-	if (ret <= 0)
-		return ret;
-	/* The cheap test first: with no rules and no legacy name list there is
-	 * nothing that could match, and this runs on every listed directory. */
-	if (!READ_ONCE(sus_path_count) && !hide_name[0])
-		return ret;
-
-	/* regs still holds the entry arguments - the original ran against user memory
-	 * and only its result travels back through here. */
-	buf = (unsigned long)regs->regs[1];
-	if (is_compat_task())
-		buf = (unsigned long)compat_ptr((u32)buf);
-	if (!buf)
-		return ret;
-	return sus_path_filter(buf, ret);
-}
-
-#define SUSFS_FP_WRAPPER(w, argno, cover_ns)				\
-	static susfs_syscall_fn_t susfs_fp_orig_##w;			\
-	static __nocfi long susfs_fp_##w(const struct pt_regs *regs)	\
-	{								\
-		if (sus_path_fp_decide((u64)(unsigned long)regs, argno)) {	\
-			sus_path_fp_cover_gap(cover_ns);		\
-			return -ENOENT;					\
-		}							\
-		return READ_ONCE(susfs_fp_orig_##w)(regs);		\
-	}
-
-SUSFS_FP_WRAPPER(newfstatat, 1, 1150)
-SUSFS_FP_WRAPPER(statx, 1, 1000)
-SUSFS_FP_WRAPPER(faccessat, 1, 1550)
-SUSFS_FP_WRAPPER(faccessat2, 1, 1550)
-SUSFS_FP_WRAPPER(openat, 1, 1750)
-SUSFS_FP_WRAPPER(openat2, 1, 1750)
-SUSFS_FP_WRAPPER(readlinkat, 1, 1550)
-SUSFS_FP_WRAPPER(execve, 0, 1950)
-
-static struct susfs_fp_hook fp_hooks[] = {
-	/* Last field group is the compat one: .compat = true means the 32-bit entry
-	 * in compat_sys_call_table is replaced as well.  A 32-bit task never reads
-	 * sys_call_table, so without it the listing filter simply would not exist for
-	 * 32-bit callers - which is the whole reason the compat kprobes are there. */
-	{ __NR_getdents64,  "susfs_fp_getdents64",  "__arm64_sys_getdents64",  susfs_fp_getdents64,  &susfs_fp_orig_getdents64,  NULL, false,
-	  true,             &susfs_fp_orig_compat_getdents64, NULL },
-	{ __NR_newfstatat,  "susfs_fp_newfstatat",  "__arm64_sys_newfstatat",  susfs_fp_newfstatat,  &susfs_fp_orig_newfstatat,  NULL, false },
-	{ __NR_statx,       "susfs_fp_statx",       "__arm64_sys_statx",       susfs_fp_statx,       &susfs_fp_orig_statx,       NULL, false },
-	{ __NR_faccessat,   "susfs_fp_faccessat",   "__arm64_sys_faccessat",   susfs_fp_faccessat,   &susfs_fp_orig_faccessat,   NULL, false },
-#ifdef __NR_faccessat2
-	{ __NR_faccessat2,  "susfs_fp_faccessat2",  "__arm64_sys_faccessat2",  susfs_fp_faccessat2,  &susfs_fp_orig_faccessat2,  NULL, false },
-#endif
-	{ __NR_openat,      "susfs_fp_openat",      "__arm64_sys_openat",      susfs_fp_openat,      &susfs_fp_orig_openat,      NULL, false },
-	{ __NR_openat2,     "susfs_fp_openat2",     "__arm64_sys_openat2",     susfs_fp_openat2,     &susfs_fp_orig_openat2,     NULL, false },
-	{ __NR_readlinkat,  "susfs_fp_readlinkat",  "__arm64_sys_readlinkat",  susfs_fp_readlinkat,  &susfs_fp_orig_readlinkat,  NULL, false },
-	{ __NR_execve,      "susfs_fp_execve",      "__arm64_sys_execve",      susfs_fp_execve,      &susfs_fp_orig_execve,      NULL, false },
-};
-
-#define N_FP_HOOKS ARRAY_SIZE(fp_hooks)
-
-/* Read-only run: what the table holds for every entry we would replace, next to
- * the plain and .cfi_jt symbols, and the first instruction of every wrapper. */
-static void sus_path_fp_dump(void)
-{
-	int i;
-
-	if (susfs_fp_init()) {
-		pr_warn("sus_path: fp_dump: sys_call_table unavailable, nothing to dump\n");
-		return;
-	}
-	for (i = 0; i < (int)N_FP_HOOKS; i++) {
-		susfs_fp_dump_entry(fp_hooks[i].nr, fp_hooks[i].sym);
-		susfs_fp_dump_wrapper(fp_hooks[i].name, (const void *)fp_hooks[i].wrapper);
-	}
-	pr_info("sus_path: fp_dump finished, nothing installed\n");
-}
-
-/* Returns how many entries were replaced; 0 means the caller must fall back. */
-static int sus_path_fp_arm(void)
-{
-	int i, n = 0;
-
-	/* fp_test > 0 is the bisect knob: install only that one entry.  Otherwise all
-	 * of them - that is the default, and fp_all exists only to say it out loud. */
-	for (i = 0; i < (int)N_FP_HOOKS; i++) {
-		if (fp_test > 0 && fp_test != i + 1)
-			continue;
-		if (!susfs_fp_install(&fp_hooks[i]))
-			n++;
-	}
-	pr_info("sus_path: fp layer armed (%d/%d syscall table entries replaced)\n",
-		n, (int)N_FP_HOOKS);
-	sus_path_fp_armed = n > 0;
-	return n;
-}
-
-static void sus_path_fp_disarm(void)
-{
-	int i, n = 0;
-
-	for (i = (int)N_FP_HOOKS - 1; i >= 0; i--) {
-		if (!fp_hooks[i].installed)
-			continue;
-		susfs_fp_remove(&fp_hooks[i]);
-		n++;
-	}
-	/* Restoring a table entry only stops NEW calls: a CPU that already picked a
-	 * wrapper out of the table is running module text right now, so wait that out
-	 * before the module can go away.  Same drain the LSM layer uses. */
-	if (n)
-		susfs_fp_drain();
-}
 
 
 /* Rewrite the dirent chain the kernel just produced, dropping the entries whose
@@ -2481,66 +2162,6 @@ static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret)
 
     nr = syscall_get_nr(current, regs);
 
-    /* ---- backstop for the syscalls KernelSU also hooks ----
-     *
-     * The fp layer normally answers these at their entry (it owns the table
-     * entries).  This branch is what is left when that layer could not be armed -
-     * fp_enabled=0, or a kernel whose sys_call_table we cannot resolve - and it is
-     * also the reason those three syscalls never get an entry hook of their own:
-     * KernelSU replaces their table entries and calls the original wrapper back
-     * from ksu_hook_faccessat / ksu_hook_newfstatat, so touching that wrapper's
-     * instructions breaks the call.  Measured:
-     *
-     *     Internal error: Oops - FPAC: 0000000072000000
-     *     pc : __arm64_sys_faccessat+0x2c4/0x848
-     *     lr : ksu_hook_faccessat+0x44/0x58 [kernelsu]
-     *
-     * None of these three has a side effect, so replacing the answer here is
-     * indistinguishable from never running the call - and this tracepoint is
-     * registered anyway for the dirent filter.
-     *
-     * syscall_get_arguments() gives the raw registers, with args[1] being the
-     * original x1 (the pathname) - x0 in regs no longer holds it at exit. */
-    if (sus_path_exit_rewrite && !is_compat_task() &&
-        (nr == __NR_faccessat ||
-#ifdef __NR_faccessat2
-         nr == __NR_faccessat2 ||
-#endif
-         nr == __NR_newfstatat)) {
-        const char __user *up;
-        char name[SUS_PATH_LEN];
-        long n;
-
-        if (!READ_ONCE(sus_path_count))
-            return;
-
-        syscall_get_arguments(current, regs, args);
-        up = (const char __user *)args[1];
-        if (!up)
-            return;
-
-        /* Same rule as the dirent filter: a tracepoint runs with preemption
-         * disabled, so a uaccess that has to fault would sleep right here.
-         * Disabled, a non-resident page simply reports -EFAULT and the call is
-         * left alone.  The caller just wrote this string for the syscall, so it
-         * is resident in every ordinary case. */
-        pagefault_disable();
-        n = strncpy_from_user(name, up, sizeof(name) - 1);
-        pagefault_enable();
-
-        if (n <= 0)
-            return;
-        name[n] = '\0';
-
-        if (sus_path_match_path(name)) {
-            atomic_inc(&n_enoent_path);
-            atomic_inc(&n_hit_exit);
-            pr_info_ratelimited("sus_path: path hit (sys_exit rewrite) '%s' (uid=%u)\n",
-                                name, current_uid().val);
-            regs->regs[0] = (unsigned long)-ENOENT;   /* was ret, success or EACCES */
-        }
-        return;
-    }
 
     /* 32-bit tasks reach getdents64 through the compat table with a different
      * syscall number, but the dirent64 buffer layout is identical (v5.15 has no
@@ -2587,12 +2208,12 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
 
     n += scnprintf(buf + n, PAGE_SIZE - n,
                    "hide_from_apps=%d  enoent: getattr=%d perm=%d nameop=%d meta=%d dac=%d gper=%d path=%d "
-                   "(fp=%d kp=%d getname=%d exit=%d)\n",
+                   "(kp=%d getname=%d exit=%d)\n",
                    hide_from_apps, atomic_read(&n_enoent_getattr),
                    atomic_read(&n_enoent_perm), atomic_read(&n_enoent_nameop),
                    atomic_read(&n_enoent_meta), atomic_read(&n_enoent_dac),
                    atomic_read(&n_enoent_gper), atomic_read(&n_enoent_path),
-                   atomic_read(&n_hit_fp), atomic_read(&n_hit_kp),
+                   atomic_read(&n_hit_kp),
                    atomic_read(&n_hit_getname), atomic_read(&n_hit_exit));
     n += scnprintf(buf + n, PAGE_SIZE - n,
                    "dirent: rewrite-fail=%d  all-hidden=%d  pending=%d\n",
@@ -2827,7 +2448,6 @@ void sus_path_exit(void)
     mutex_unlock(&sus_path_pending_lock);
     /* No walk can be in flight now, so the borrowed creds are ours to release. */
     sus_path_drop_caller_cred();
-    sus_path_fp_disarm();
     sus_path_cand_unregister();
     sus_path_syscall_unregister();
     sus_path_path_unregister();
