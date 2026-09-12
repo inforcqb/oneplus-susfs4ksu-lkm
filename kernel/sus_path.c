@@ -110,8 +110,8 @@ struct linux_dirent64 {
  *   - the LSM hooks reject path-based access outright (by the ihold'ed inode
  *     pointer, which is what upstream's AS_FLAGS_SUS_PATH inode flag achieves).
  *
- * dev is kept for diagnostics only: a sys_exit tracepoint cannot recover the
- * listing's fd or superblock (regs->regs[0] already holds the return value).
+ * dev is kept for diagnostics only: the dirent filter only ever sees the buffer,
+ * never the listing's fd or superblock.
  */
 struct sus_path_entry {
     struct list_head list;
@@ -203,8 +203,8 @@ static char hide_name[NAME_MAX + 1];
 module_param_string(hide_name, hide_name, sizeof(hide_name), 0644);
 
 static char *dirent_tmp;
-/* Isolation test: with no_extra=1 the LSM replacement, the DAC probes and the
- * dirent kretprobes are not registered at all. */
+/* Isolation test: with no_extra=1 the LSM replacement and the dirent filter are
+ * not registered at all. */
 static int no_extra;
 module_param(no_extra, int, 0644);
 
@@ -228,11 +228,10 @@ static atomic_t n_dirent_all_hidden = ATOMIC_INIT(0);
  *
  * Every layer below answers "hidden" to whoever asks, and the background
  * resolution of a pending rule has to ask the VFS itself (kern_path).  That walk
- * passes through our own hooks, and the path-string layer matches the very rule
- * being resolved - it is registered, that is the whole point - so the walk gets
- * answered -ENOENT and the rule can never resolve.  Measured on the device: the
- * pending rule stays pending, while the same path is correctly hidden by the
- * string layer in the meantime.  Upstream has no such trap because its hiding is
+ * passes through our own hooks once the rule HAS an inode, so the walk would be
+ * answered -ENOENT and a re-resolution could never succeed.  Measured on the
+ * device: without the exemption the walk is refused and the rule stays pending
+ * forever.  Upstream has no such trap because its hiding is
  * a flag set on an inode rather than a refusal to answer, and because it walks
  * from the workqueue under override_creds(ksu_cred) (susfs.c:139, reverted at
  * susfs.c:171) - see sus_path_override_creds() below, which mirrors that.
@@ -418,12 +417,11 @@ static bool sus_path_is_hidden(u64 ino, const char *name)
     if (sus_path_is_resolver())
         return false;
 
-    /* A dirent is identified by (d_ino, name) and nothing else here - the
-     * sys_exit tracepoint has neither the fd nor the superblock.  A rule whose
-     * inode reports 0 therefore has no identity to match: d_ino 0 is what some
-     * filesystems use for "unknown", so matching it by name alone would hide
-     * unrelated entries.  Such a rule is hidden by the by-inode layers and by
-     * the path-string layer only - see the note in sus_path_supercall(). */
+    /* A dirent is identified by (d_ino, name) and nothing else here - the dirent
+     * filter never sees the fd or the superblock.  A rule whose inode reports 0
+     * therefore has no identity to match: d_ino 0 is what some filesystems use for
+     * "unknown", so matching it by name alone would hide unrelated entries.  Such a
+     * rule is hidden by the by-inode layers only - see sus_path_supercall(). */
     if (ino) {
         spin_lock(&sus_path_lock);
         list_for_each_entry(e, &sus_path_list, list) {
@@ -461,10 +459,10 @@ static bool sus_path_is_hidden(u64 ino, const char *name)
  * There is no attempt limit and no timeout upstream; the trigger is an event.
  *
  * The LKM has no zygote hook, so the equivalent is:
- *   - the rule is registered immediately with inode == NULL ("pending"), and
- *     the path-string layer hides it from the first moment the path exists -
- *     open/stat/exec/readlink already answer ENOENT, because that layer matches
- *     the registered string, not an inode;
+ *   - the rule is registered immediately with inode == NULL ("pending").  A
+ *     pending rule has no inode, so NOTHING hides it yet: the dirent filter needs
+ *     (ino, name) and the LSM slots need the inode.  What it does have is a place
+ *     in the table, so the path is hidden from the moment this loop resolves it;
  *   - sus_path_resolve_pending() retries the lookup in sleepable context: from
  *     sus_path_supercall() (every add is a retry opportunity, which is what the
  *     tool produces naturally when it registers a batch of rules) and from a
@@ -474,10 +472,10 @@ static bool sus_path_is_hidden(u64 ino, const char *name)
  *     below would refuse (sus_path_resolver, sus_path_override_creds(); upstream
  *     needs the creds half of this for its own workqueue walk, susfs.c:139).
  *
- * A rule that is still missing after the timer gives up keeps hiding the path
- * through the string layer; what it loses is only the getdents64 filter and the
- * by-inode layers, and the next add re-arms the timer - re-adding the same path
- * after it exists also completes the pending entry on the spot.
+ * A rule that is still missing after the timer gives up hides NOTHING until it
+ * resolves: there is no string layer to fall back on (the entry layers were
+ * deleted - see sus_path_init()).  The next add re-arms the timer, and re-adding
+ * the same path after it exists completes the pending entry on the spot.
  */
 
 /* Basename of a registered path: what the getdents64 filter compares d_name
@@ -656,7 +654,7 @@ static void sus_path_pending_work(struct work_struct *w)
         atomic_set(&sus_path_pending_tries, 0);     /* progress: keep trying */
 
     if (atomic_inc_return(&sus_path_pending_tries) > SUS_PATH_PENDING_TRIES) {
-        SUSFS_LOGI("sus_path: %d rule(s) still pending after %d retries (last walk rc=%d) - retry timer stops; the path layer keeps hiding them, the next add tries again\n",
+        SUSFS_LOGI("sus_path: %d rule(s) still pending after %d retries (last walk rc=%d) - retry timer stops; they hide nothing until they resolve, the next add tries again\n",
                 atomic_read(&sus_path_n_pending), SUS_PATH_PENDING_TRIES,
                 atomic_read(&sus_path_pend_last_rc));
         return;
@@ -884,10 +882,10 @@ static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path)
  * resolve to the FUSE inode (or, through /mnt/pass_through/..., to the backing
  * inode), each spelling is the object it resolves to, and upstream flags exactly
  * the same object for that spelling - it does not touch fi->backing_inode
- * either.  What covers the OTHER spellings of the same file here is the
- * path-string layer below, not the inode layer.
- *
- * The one FUSE property upstream's branch does not buy it either is the dirent
+ * either.  What covered the OTHER spellings of the same file was the path-string
+ * layer, which has since been deleted; the inode match covers them by itself
+ * (symlink, hard link, .., // and /proc/self/root/... all resolve to that inode).
+ * One FUSE property upstream's branch does not buy it either is the dirent
  * filter: upstream maps a dirent's d_ino back to an inode with
  * ilookup(buf->sb, ino), but a FUSE inode is hashed by nodeid (or by the backing
  * inode pointer when CONFIG_FUSE_BPF=y passthrough is in use - fs/fuse/inode.c:
@@ -1126,805 +1124,6 @@ static int sus_path_path_notify(const struct path *path, u64 mask, unsigned int 
     return orig(path, mask, obj_type);
 }
 
-/* ---- DAC layer ----
- *
- * Everything else in this file sits either after the DAC check (the LSM hooks)
- * or beside it (the dirent kretprobe, which runs after the whole listing is built).  inode_permission() is:
- *
- *     retval = sb_permission(...);
- *     retval = do_inode_permission(...);        DAC   <-- EACCES leaves HERE
- *     retval = devcgroup_inode_permission(...);
- *     return security_inode_permission(...);    our LSM hook
- *
- * So an inode the caller may not touch is answered EACCES before any hook of
- * ours runs - and "permission denied" also tells the caller the entry EXISTS,
- * which is precisely what sus_path must never say.  Reported from the device:
- * an app listing /data/adb/service.d got EACCES, while every earlier test had
- * passed because those used 0755 paths (/data/local/tmp) where DAC lets the
- * caller through and the LSM layer is reached.
- *
- * Upstream rewrites the answer inside fs/namei.c at the lookup level, i.e.
- * before the target inode is permission-checked at all.  An LKM cannot patch
- * namei: the helpers are inlined by this kernel's LTO (lookup_fast and
- * open_last_lookups have no symbol) and struct nameidata is defined inside
- * fs/namei.c rather than in a header.
- *
- * DAC, however, has exactly one entry point and it is exported: skip
- * inode_permission() itself for a hidden inode.  Being entered before a single
- * check runs, one kprobe covers every caller - including the path walk's own
- * MAY_EXEC check on a hidden directory, which is what makes
- * `ls /data/adb/service.d` answer ENOENT once /data/adb is registered.
- *
- * The limit no layer can remove: hiding a child of a directory that denies the
- * caller and is not itself registered still answers EACCES, because the walk
- * cannot reach the child's lookup at all.  Upstream behaves the same way -
- * register the directory. */
-static atomic_t n_enoent_dac = ATOMIC_INIT(0);      /* inode_permission */
-static atomic_t n_enoent_gper = ATOMIC_INIT(0);     /* generic_permission */
-
-/* The other layers' decision, reused so every layer agrees. */
-static bool sus_path_lookup_hit(struct inode *inode)
-{
-    if (!inode)
-        return false;
-    return sus_path_inode_hidden(inode);
-}
-
-/* 5.15 signature: inode_permission(struct user_namespace *mnt_userns,
- * struct inode *inode, int mask) - the inode is argument 2, i.e. x1.  If that
- * ever changes the lookup simply misses and nothing else is affected. */
-static int kp_dac_hit(struct pt_regs *regs, atomic_t *counter)
-{
-    struct inode *inode = (struct inode *)regs->regs[1];
-
-    if (!sus_path_lookup_hit(inode))
-        return 0;
-
-    atomic_inc(counter);
-    /* Says whether this probe is reached at all: on this kernel both DAC
-     * symbols look inlined, and only a hit proves otherwise. */
-    pr_info_ratelimited("sus_path: DAC hit on ino=%lu (uid=%u)\n",
-                        inode->i_ino, current_uid().val);
-    /* Answer "no such file" and skip the whole function: the DAC check inside
-     * it is what would otherwise answer EACCES. */
-    regs_set_return_value(regs, (unsigned long)-ENOENT);
-    regs->pc = regs->regs[30];
-    return 1;
-}
-
-static int kp_inode_permission_pre(struct kprobe *kp, struct pt_regs *regs)
-{
-    return kp_dac_hit(regs, &n_enoent_dac);
-}
-
-/* inode_permission() itself turns out to be a dead end on this kernel: the
- * 0600-file test (DAC denies the app, so the LSM layer can never be reached)
- * still answered EACCES, i.e. the kprobe never fired - GKI's LTO inlines the
- * function into its callers and the kallsyms entry is just the copy kept for
- * module references.  Patching its entry would be equally pointless.
- *
- * generic_permission() is where that DAC decision actually lands for any
- * filesystem without its own ->permission(), and it is NOT inlined (it has both
- * a symbol and a .cfi_jt entry).  Same handler, same answer. */
-static int kp_generic_permission_pre(struct kprobe *kp, struct pt_regs *regs)
-{
-    return kp_dac_hit(regs, &n_enoent_gper);
-}
-
-static struct kprobe kp_inode_permission = {
-    .symbol_name = "inode_permission",
-    .pre_handler = kp_inode_permission_pre,
-};
-
-static struct kprobe kp_generic_permission = {
-    .symbol_name = "generic_permission",
-    .pre_handler = kp_generic_permission_pre,
-};
-
-static struct kprobe *dac_probes[] = {
-    &kp_inode_permission,
-    &kp_generic_permission,
-};
-
-#define N_DAC_PROBES ARRAY_SIZE(dac_probes)
-static bool dac_registered[N_DAC_PROBES];
-
-/* Off means an app gets EACCES instead of ENOENT whenever the DAC check would
- * have denied it - i.e. the layer this exists for. */
-static int hide_by_dac = 1;
-module_param_named(hide_by_dac, hide_by_dac, int, 0644);
-
-static void sus_path_dac_register(void)
-{
-    int i;
-
-    if (!hide_by_dac)
-        return;
-
-    for (i = 0; i < N_DAC_PROBES; i++) {
-        int rc = register_kprobe(dac_probes[i]);
-
-        if (rc) {
-            pr_warn("sus_path: kprobe(%s) failed %d\n",
-                    dac_probes[i]->symbol_name, rc);
-            continue;
-        }
-        dac_registered[i] = true;
-    }
-    SUSFS_LOGI("sus_path: DAC layer armed (inode_permission=%d generic_permission=%d)\n",
-            dac_registered[0], dac_registered[1]);
-}
-
-static void sus_path_dac_unregister(void)
-{
-    int i;
-
-    for (i = 0; i < N_DAC_PROBES; i++) {
-        if (!dac_registered[i])
-            continue;
-        unregister_kprobe(dac_probes[i]);
-        dac_registered[i] = false;
-    }
-}
-
-/* ---- path-string layer ----
- *
- * Measured on this device: inode_permission, generic_permission, walk_component,
- * lookup_dcache and __lookup_slow all register as kprobes and then never fire.
- * GKI's full LTO inlines them into their callers, so their kallsyms entries are
- * only the out-of-line copies kept for module references - which is also the
- * answer to "why not patch a jump in instead of a kprobe": patching those
- * entries would rewrite code nothing executes.
- *
- * Every hook of ours that does work on this kernel is one that LTO cannot
- * inline: vfs_open, vfs_getattr, show_map_vma (called through a function
- * pointer) and __arm64_sys_reboot - i.e. functions called across compilation
- * units.  The path-resolution entry points are the same kind of citizen, and
- * they are where the answer has to be produced: before any permission check on
- * the target, so a hidden directory answers ENOENT instead of EACCES.
- *
- * They hand us the caller's path STRING (struct filename::name), not an inode,
- * so matching is string-based: an absolute path that equals a registered path,
- * or has one as a '/'-terminated prefix.  Upstream matches by inode instead,
- * which also catches symlinked spellings and relative paths; a relative path is
- * skipped here because it cannot be compared without the cwd - and reaching one
- * under a hidden directory requires the directory's MAY_EXEC first, which the
- * lookup on it does cover.
- *
- *   filename_lookup     stat/access/chdir and friends (kernel-side string)
- *   do_filp_open        open/openat (kernel-side string)
- *   user_path_at_empty  the same, one level up, in case the above are inlined
- *                       into it - takes a __user pointer, read with
- *                       strncpy_from_user
- */
-/* Counters for the path-string layer, one per hook, because they answer different
- * questions: which layer refused, and - when the fp layer is off - how many layers
- * saw the same call.  In the default configuration only one of them can fire for
- * a given call (the fp wrapper refuses before the real syscall runs, so nothing
- * downstream is reached, so a single aggregate number is enough - the per-layer
- * counters below exist to show which layer answered, not to detect double
- * counting. */
-static atomic_t n_enoent_path = ATOMIC_INIT(0);		/* all of them */
-static atomic_t n_hit_kp = ATOMIC_INIT(0);
-static atomic_t n_hit_getname = ATOMIC_INIT(0);
-static atomic_t n_hit_exit = ATOMIC_INIT(0);
-
-/* Defined with the fp layer further down, but the path probes need it too: they
- * refuse by rewriting the return value at the ENTRY of their target, which is the
- * same shortcut shape the fp wrapper takes, so they need the same timing cover.
- * One value for all of them: a path probe does not know which syscall is walking,
- * and this layer only carries calls when the fp layer is off. */
-/* Diagnostic: arm nothing but the LSM hooks (registered at init) and the
- * dirent kretprobes - no fp layer, no path probes, no getname.
- * It is how the LSM layer's own coverage gets measured instead of guessed: the
- * entry layers otherwise refuse first and hide what the LSM layer can or cannot
- * see.  Useful together with a chmod 777 on the target, which is the other half of
- * an LSM-only design (DAC runs before the LSM chain and would answer EACCES). */
-
-static bool sus_path_match_path(const char *path)
-{
-    struct sus_path_entry *e;
-    bool hit = false;
-
-    /* NOT a matching rule, an exemption: the task resolving a pending rule walks
-     * that rule's own path, so it must not be answered by it (see
-     * sus_path_resolver).  Everything below is unchanged. */
-    if (sus_path_is_resolver())
-        return false;
-
-    if (!path || path[0] != '/')    /* only absolute paths are comparable */
-        return false;
-    /* No gate here: the per-rule gate is applied below, once we know WHICH rule
-     * matched - our own control nodes are hidden from every non-root caller,
-     * while ordinary rules keep the uid>=10000 rule. */
-    if (!READ_ONCE(sus_path_count))
-        return false;
-
-    spin_lock(&sus_path_lock);
-    list_for_each_entry(e, &sus_path_list, list) {
-        unsigned int n = e->path_len;
-
-        if (!n || strncmp(path, e->path, n))
-            continue;
-        if (path[n] == '\0' || path[n] == '/') {
-            /* Owned-by-the-caller is answered the same way here as in the LSM
-             * layer: see sus_path_entry_gate_any(). */
-            if (!sus_path_entry_gate_any(e))
-                continue;
-            hit = true;
-            break;
-        }
-    }
-    spin_unlock(&sus_path_lock);
-    return hit;
-}
-
-/* Shared tail: count, log (so that "registered" and "reached" can be told
- * apart, which is exactly what the DAC probes above failed to do), answer
- * -ENOENT and skip the function. */
-static int kp_path_answer(struct pt_regs *regs, const char *name, bool errptr)
-{
-    if (!sus_path_match_path(name))
-        return 0;
-
-    atomic_inc(&n_enoent_path);
-    atomic_inc(&n_hit_kp);
-    pr_info_ratelimited("sus_path: path hit '%s' (uid=%u)\n",
-                        name, current_uid().val);
-    /* Refusing here is the same shortcut the fp wrapper takes - return, without
-     * running the lookup - so it needs the same timing cover, or the paths this
-     * layer catches (the fp layer is off, or the caller came in through a kernel
-     * internal path) would answer measurably faster than a real failure. */
-    if (errptr)
-        regs_set_return_value(regs, (unsigned long)ERR_PTR(-ENOENT));
-    else
-        regs_set_return_value(regs, (unsigned long)-ENOENT);
-    regs->pc = regs->regs[30];
-    return 1;
-}
-
-/* filename_lookup(dfd, struct filename *name, ...) and
- * do_filp_open(dfd, struct filename *pathname, ...): the name is argument 2 in
- * both, already a kernel string.
- *
- * The name can legitimately BE an error pointer, and that is not hypothetical:
- * do_linkat() passes getname()'s result straight to filename_lookup() with no
- * IS_ERR() of its own (fs/namei.c:4608), leaving the check to the callee - and
- * our own getname hook is what hands it ERR_PTR(-ENOENT) for a hidden path.  So
- * the very first "ln <hidden path> /tmp/x" from an app dereferenced
- * ERR_PTR(-2)->name here and took the device down (pc: kp_filename_pre+0x1c,
- * x8 = fffffffffffffffe, "ldr x20, [x8]").
- *
- * kprobes run BEFORE the callee, so we are the ones who have to look. */
-static bool sus_path_name_ok(const struct filename *f)
-{
-    return !IS_ERR_OR_NULL(f) && f->name;
-}
-
-static int kp_filename_pre(struct kprobe *kp, struct pt_regs *regs)
-{
-    struct filename *f = (struct filename *)regs->regs[1];
-
-    if (!sus_path_name_ok(f))
-        return 0;
-    return kp_path_answer(regs, f->name, false);
-}
-
-static int kp_filp_open_pre(struct kprobe *kp, struct pt_regs *regs)
-{
-    struct filename *f = (struct filename *)regs->regs[1];
-
-    if (!sus_path_name_ok(f))
-        return 0;
-    return kp_path_answer(regs, f->name, true);     /* returns struct file * */
-}
-
-/* user_path_at_empty(dfd, const char __user *name, ...) */
-static int kp_user_path_pre(struct kprobe *kp, struct pt_regs *regs)
-{
-    const char __user *uname = (const char __user *)regs->regs[1];
-    char buf[SUS_PATH_LEN];
-    long n;
-
-    if (IS_ERR_OR_NULL(uname))
-        return 0;
-    /* Bounded read of the caller's own path.  Fails harmlessly (-EFAULT) if the
-     * page is not there; this is the same uaccess the dirent filter
-     * already does in a context that cannot sleep. */
-    n = strncpy_from_user(buf, uname, sizeof(buf) - 1);
-    if (n <= 0)
-        return 0;
-    buf[n] = '\0';
-    return kp_path_answer(regs, buf, false);
-}
-
-static struct kprobe kp_filename_lookup = {
-    .symbol_name = "filename_lookup",
-    .pre_handler = kp_filename_pre,
-};
-
-static struct kprobe kp_filp_open = {
-    .symbol_name = "do_filp_open",
-    .pre_handler = kp_filp_open_pre,
-};
-
-static struct kprobe kp_user_path = {
-    .symbol_name = "user_path_at_empty",
-    .pre_handler = kp_user_path_pre,
-};
-
-/* ---- syscall-entry layer ----
- *
- * The measured rule on this kernel: only ABI entry points and a handful of
- * cross-unit functions survive LTO as symbols that are actually executed.
- * filename_lookup earns its keep (its hit log fired for stat), but do_filp_open
- * is called from do_sys_openat2 in the same file and was inlined, so `cat` on a
- * hidden 0600 file still answered EACCES.
- *
- * Syscall wrappers cannot be inlined - they ARE the ABI - which is why the
- * supercall probe on __arm64_sys_reboot has never missed.  Same treatment: read
- * the caller's path and answer -ENOENT straight away, before any permission
- * check runs.
- *
- * These wrappers take the user's registers as their only argument, so
- * regs->regs[0] is the pt_regs to read from (verified for this kernel by the
- * uname and supercall probes, which rely on the same fact); argno is the
- * x-register holding the pathname in the 64-bit ABI. */
-static int kp_sys_path_answer(struct pt_regs *regs, int argno)
-{
-    const struct pt_regs *uregs = (const struct pt_regs *)regs->regs[0];
-    unsigned long reg;
-    void __user *up;
-    char buf[SUS_PATH_LEN];
-    long n;
-
-    if (!uregs)
-        return 0;
-
-    reg = uregs->regs[argno];
-    /* A 32-bit task's registers are 32 bits wide: only the low half of the saved
-     * slot is meaningful, so mask it exactly like compat_ptr() does - otherwise
-     * whatever the upper half holds becomes part of a user pointer. */
-    if (is_compat_task()) {
-#ifdef CONFIG_COMPAT
-        up = compat_ptr((u32)reg);
-#else
-        return 0;
-#endif
-    } else {
-        up = (void __user *)reg;
-    }
-
-    n = strncpy_from_user(buf, (const char __user *)up, sizeof(buf) - 1);
-    if (n <= 0 && is_compat_task())
-        pr_info_ratelimited("sus_path: compat pathname unreadable (reg=%#lx) - the getname layer covers this\n",
-                            reg);
-    if (n <= 0)
-        return 0;
-    buf[n] = '\0';
-    return kp_path_answer(regs, buf, false);    /* syscalls return long */
-}
-
-#define SUSFS_SYS_PROBE(fn, argno)					\
-	static int kp_##fn##_pre(struct kprobe *kp, struct pt_regs *regs) \
-	{								\
-		return kp_sys_path_answer(regs, argno);			\
-	}								\
-	static struct kprobe kp_##fn = {				\
-		.symbol_name = #fn,					\
-		.pre_handler = kp_##fn##_pre,				\
-	}
-
-SUSFS_SYS_PROBE(__arm64_sys_openat, 1);
-SUSFS_SYS_PROBE(__arm64_sys_openat2, 1);
-SUSFS_SYS_PROBE(__arm64_sys_statx, 1);
-SUSFS_SYS_PROBE(__arm64_sys_readlinkat, 1);
-SUSFS_SYS_PROBE(__arm64_sys_execve, 0);
-
-static struct kprobe *sys_path_probes[] = {
-    &kp___arm64_sys_openat,
-    &kp___arm64_sys_openat2,
-    &kp___arm64_sys_statx,
-    &kp___arm64_sys_readlinkat,
-    &kp___arm64_sys_execve,
-};
-
-/* No kprobe for newfstatat / faccessat / faccessat2.
- *
- * KernelSU replaces those syscall TABLE entries with ksu_syscall_dispatcher and
- * calls the original wrapper back from its own hook (kallsyms lists
- * ksu_hook_newfstatat, ksu_hook_faccessat, ksu_hook_execve, ksu_hook_setresuid),
- * so hooking such a wrapper's entry interferes with that call - measured:
- *
- *     Internal error: Oops - FPAC: 0000000072000000
- *     pc : __arm64_sys_faccessat+0x2c4/0x848
- *     lr : ksu_hook_faccessat+0x44/0x58 [kernelsu]
- *     Kernel panic - not syncing: Oops - FPAC: Fatal exception
- *
- * The LSM slots answer all of them by inode, which is both earlier in the access
- * (a permission check happens for every one of these syscalls) and immune to the
- * spelling: faccessat/newfstatat reach inode_permission or inode_getattr, so
- * nothing has to be done on their behalf at the syscall entry at all.  execve
- * opens the binary through may_open, which is the same check. */
-
-/* 32-bit (AArch32) callers.
- *
- * Only the syscalls that need different semantics get their own wrapper: on
- * this kernel kallsyms has __arm64_compat_sys_openat, _execve and _execveat and
- * nothing else, which means the rest of the 32-bit table points at the very
- * __arm64_sys_* wrappers above and is already covered.  These entries are
- * registered only when the symbol exists, so a name that is absent on another
- * kernel is skipped silently instead of warning. */
-SUSFS_SYS_PROBE(__arm64_compat_sys_openat, 1);
-SUSFS_SYS_PROBE(__arm64_compat_sys_openat2, 1);
-SUSFS_SYS_PROBE(__arm64_compat_sys_fstatat64, 1);
-SUSFS_SYS_PROBE(__arm64_compat_sys_statx, 1);
-SUSFS_SYS_PROBE(__arm64_compat_sys_faccessat, 1);
-SUSFS_SYS_PROBE(__arm64_compat_sys_readlinkat, 1);
-SUSFS_SYS_PROBE(__arm64_compat_sys_execve, 0);
-
-static struct kprobe *compat_path_probes[] = {
-    &kp___arm64_compat_sys_openat,
-    &kp___arm64_compat_sys_openat2,
-    &kp___arm64_compat_sys_fstatat64,
-    &kp___arm64_compat_sys_statx,
-    &kp___arm64_compat_sys_faccessat,
-    &kp___arm64_compat_sys_readlinkat,
-    &kp___arm64_compat_sys_execve,
-};
-
-#define N_SYS_PATH_PROBES ARRAY_SIZE(sys_path_probes)
-#define N_COMPAT_PATH_PROBES ARRAY_SIZE(compat_path_probes)
-static bool sys_path_probes_registered[N_SYS_PATH_PROBES];
-static bool compat_path_probes_registered[N_COMPAT_PATH_PROBES];
-
-/* The 32-bit wrappers are their own symbols, so they keep their kprobes even
- * when the native ones are inline-hooked: a kprobe only conflicts with an inline
- * hook on the SAME entry.  Without this the 32-bit callers would lose the
- * syscall layer the moment ih took over the native wrappers. */
-static void sus_path_compat_register(void)
-{
-    int i, c = 0;
-
-    for (i = 0; i < N_COMPAT_PATH_PROBES; i++) {
-        const char *sym = compat_path_probes[i]->symbol_name;
-
-        /* Absent by design on kernels that share the native wrapper. */
-        if (!find_kernel_symbol_exact(sym))
-            continue;
-        if (register_kprobe(compat_path_probes[i])) {
-            pr_warn("sus_path: kprobe(%s) failed\n", sym);
-            continue;
-        }
-        compat_path_probes_registered[i] = true;
-        c++;
-    }
-
-    SUSFS_LOGI("sus_path: 32-bit syscall layer armed (%d/%d compat probes)\n",
-            c, (int)N_COMPAT_PATH_PROBES);
-}
-
-static void sus_path_syscall_register(void)
-{
-    int i, n = 0;
-
-    for (i = 0; i < N_SYS_PATH_PROBES; i++) {
-        int rc = register_kprobe(sys_path_probes[i]);
-
-        if (rc) {
-            pr_warn("sus_path: kprobe(%s) failed %d\n",
-                    sys_path_probes[i]->symbol_name, rc);
-            continue;
-        }
-        sys_path_probes_registered[i] = true;
-        n++;
-    }
-
-    SUSFS_LOGI("sus_path: syscall layer armed (%d/%d native probes)\n",
-            n, (int)N_SYS_PATH_PROBES);
-    sus_path_compat_register();
-}
-
-static void sus_path_syscall_unregister(void)
-{
-    int i;
-
-    for (i = 0; i < N_COMPAT_PATH_PROBES; i++) {
-        if (!compat_path_probes_registered[i])
-            continue;
-        unregister_kprobe(compat_path_probes[i]);
-        compat_path_probes_registered[i] = false;
-    }
-    for (i = 0; i < N_SYS_PATH_PROBES; i++) {
-        if (!sys_path_probes_registered[i])
-            continue;
-        unregister_kprobe(sys_path_probes[i]);
-        sys_path_probes_registered[i] = false;
-    }
-}
-
-/* ---- getname layer ----
- *
- * The syscall-entry layer reads the caller's pathname itself.  That works for
- * 64-bit callers, but not for 32-bit ones: measured, in that probe context
- * copy_from_user, get_user and strncpy_from_user all answered -EFAULT for a
- * pointer the kernel read without any trouble a moment later (the argument
- * registers were right: r0=0xffffff9c AT_FDCWD, r1=0x100f4, r2=0).
- *
- * getname() is where the kernel has just copied that pathname into kernel
- * memory, and it returns it as struct filename.  Hooking its return touches no
- * user memory at all and covers both ABIs, so this is where the decision is
- * really made; the syscall layer stays as the earlier, cheaper answer for
- * 64-bit callers and for anything that never goes through getname.
- *
- * Rewriting the return to ERR_PTR(-ENOENT) is what callers already handle
- * (IS_ERR is checked at every call site), but the filename just allocated would
- * then leak, so the original is released with putname() first.  When getname()
- * merely forwards getname_flags()' result, the inner probe has already done
- * this and the outer one sees ERR_PTR and stops. */
-/* ---- what a hidden path is rewritten to ----
- *
- * Upstream's namei patch makes the kernel re-look-up a name that cannot exist
- * (kernel_patches/fs/susfs.c:45, susfs_fake_qstr_name = QSTR_INIT("..5.u.S", 7),
- * "used to re-test the dcache lookup") instead of faking an error, and the same
- * reasoning applies here:
- *
- *   - the object handed back stays a valid struct filename, so a caller that
- *     passes it on without an IS_ERR() of its own - do_linkat() gives getname()'s
- *     result straight to filename_lookup(), fs/namei.c:4608 - never meets an
- *     error pointer it did not expect.  Getting this wrong is what took the
- *     device down once (pc kp_filename_pre+0x1c, x8 = fffffffffffffffe);
- *   - the ENOENT then comes from the ordinary lookup, at the point where the
- *     kernel itself decides the file does not exist, so no layer is left
- *     half-answered;
- *   - nothing needs putname(): the caller releases the filename as usual.
- *
- * The replacement is hex only, so nothing has to be computed at all - just an
- * ordinary-looking name that the kernel will look up and fail to find.
- * Deliberately NOT upstream's literal ("..5.u.S" is a marker anybody can grep a
- * running kernel for). */
-#define SUS_PATH_FAKE_CHARS "0123456789abcdef"
-
-/* Called from the getname layers on a hit, with the filename the kernel just
- * built.  The name is overwritten IN PLACE, with the same length it already had:
- *
- *  - putname() does `if (name->name != name->iname) kfree(name->name);`
- *    (fs/namei.c:257-267), so pointing name at a module constant would hand it a
- *    non-heap pointer to free.  Overwriting the buffer is the only safe move.
- *  - keeping the length identical means the write cannot run past the original
- *    buffer, whether that is the embedded iname[] (EMBEDDED_NAME_MAX, 5.15
- *    fs/namei.c:125) or the PATH_MAX block allocated for an over-long path.  It
- *    also leaves the terminating NUL where it was.
- *  - the replacement is hex only, so it can never be "." or "..", and contains
- *    no '/': the lookup that follows treats it as a plain relative name, which
- *    is exactly what makes it fail.
- *
- * A FNV-1a of the original seeds a per-position mix, so two different hidden
- * paths do not end up renamed to the same string. */
-static void sus_path_spoof_name(struct filename *f)
-{
-	char *name = (char *)f->name;	/* the buffer is kmalloc'ed, only const-qualified */
-	size_t len = strlen(name);
-	u32 h = 0x811c9dc5u;
-	size_t i;
-
-	if (!len)
-		return;
-
-	for (i = 0; i < len; i++)
-		h = (h ^ (u8)name[i]) * 16777619u;
-	for (i = 0; i < len; i++) {
-		h = h * 1103515245u + 12345u;
-		name[i] = SUS_PATH_FAKE_CHARS[(h >> 16) & 0xf];
-	}
-}
-
-static int kr_getname_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-    struct filename *f = (struct filename *)regs_return_value(regs);
-
-    if (IS_ERR_OR_NULL(f) || !f->name)
-        return 0;
-    if (!sus_path_match_path(f->name))
-        return 0;
-
-    atomic_inc(&n_enoent_path);
-    atomic_inc(&n_hit_getname);
-    pr_info_ratelimited("sus_path: getname hit '%s' (uid=%u)\n",
-                        f->name, current_uid().val);
-    sus_path_spoof_name(f);
-    return 0;
-}
-
-static struct kretprobe krp_getname = {
-    .kp.symbol_name = "getname",
-    .handler = kr_getname_ret,
-    .maxactive = 64,
-};
-
-static struct kretprobe krp_getname_flags = {
-    .kp.symbol_name = "getname_flags",
-    .handler = kr_getname_ret,
-    .maxactive = 64,
-};
-
-static struct kretprobe *getname_krps[] = {
-    &krp_getname,
-    &krp_getname_flags,
-};
-
-#define N_GETNAME_KRPS ARRAY_SIZE(getname_krps)
-static bool getname_registered[N_GETNAME_KRPS];
-
-static void sus_path_getname_register(void)
-{
-    int i, n = 0;
-
-    for (i = 0; i < N_GETNAME_KRPS; i++) {
-        if (!find_kernel_symbol_exact(getname_krps[i]->kp.symbol_name))
-            continue;       /* same sharing story as the compat wrappers */
-        if (register_kretprobe(getname_krps[i])) {
-            pr_warn("sus_path: kretprobe(%s) failed\n",
-                    getname_krps[i]->kp.symbol_name);
-            continue;
-        }
-        getname_registered[i] = true;
-        n++;
-    }
-    SUSFS_LOGI("sus_path: getname layer armed (%d/%d probes)\n", n,
-            (int)N_GETNAME_KRPS);
-}
-
-static void sus_path_getname_unregister(void)
-{
-    int i;
-
-    for (i = 0; i < N_GETNAME_KRPS; i++) {
-        if (!getname_registered[i])
-            continue;
-        unregister_kretprobe(getname_krps[i]);
-        getname_registered[i] = false;
-    }
-}
-
-static struct kprobe *path_probes[] = {
-    &kp_filename_lookup,
-    &kp_filp_open,
-    &kp_user_path,
-};
-
-#define N_PATH_PROBES ARRAY_SIZE(path_probes)
-static bool path_probes_registered[N_PATH_PROBES];
-
-/* ---- candidate scan (diagnostic) ----
- *
- * Upstream checks the inode INSIDE path walking - in walk_component() and
- * friends, where the dentry is resolved and d_inode is available, but before
- * may_lookup()/inode_permission() run.  That is the one place a hidden path can
- * be answered with ENOENT *and* matched by inode rather than by the caller's
- * spelling; both of our reachable layers have to give one of the two up.
- *
- * Whether we can use such a place on this kernel depends entirely on LTO: the
- * same functions that are a real out-of-line call here are inlined copies there,
- * and a kprobe on a copy that never runs registers fine and reports zero hits
- * (measured: inode_permission, generic_permission, walk_component,
- * lookup_dcache, __lookup_slow all did exactly that).
- *
- * So scan them, with probes that only COUNT and never look at the arguments -
- * the signature of a candidate is exactly what is not known in advance, and
- * dereferencing the wrong register is how this module crashed a device before.
- * cand_probe=1 arms them; the hit counts show which ones are reachable. */
-
-#define N_CAND 18
-static const char *const cand_syms[N_CAND] = {
-	"walk_component",	/* what upstream uses - reachable, but see below */
-	"link_path_walk",
-	"step_into",
-	"handle_mounts",
-	"lookup_fast",
-	"lookup_slow",
-	"__lookup_slow",
-	"may_lookup",
-	"path_lookupat",
-	"path_openat",
-	"open_last_lookups",
-	"filename_parentat",
-	"__filename_parentat",
-	"vfs_open",		/* known reachable, but after the DAC check */
-	/* The interesting ones: inode_permission() takes the inode as its SECOND
-	 * argument, and a kprobe at its entry runs before its own DAC check - i.e.
-	 * judged by inode AND earlier than DAC, which is the one thing neither of
-	 * the layers we have can do.  An earlier measurement reported zero hits
-	 * here, but the same measurement also reported zero for walk_component,
-	 * which is demonstrably executed - so that measurement does not count. */
-	"inode_permission",
-	"generic_permission",
-	"inode_getattr",
-	"may_open",
-};
-
-static struct kprobe cand_kps[N_CAND];
-static atomic_t cand_hits[N_CAND];
-static bool cand_registered[N_CAND];
-static int cand_probe;
-module_param(cand_probe, int, 0644);
-
-static int sus_path_cand_pre(struct kprobe *kp, struct pt_regs *regs)
-{
-	int i;
-
-	for (i = 0; i < N_CAND; i++) {
-		if (kp->symbol_name != cand_syms[i])
-			continue;
-		if (atomic_inc_return(&cand_hits[i]) <= 3)
-			SUSFS_LOGI("sus_path: cand %s hit (x0=%px x1=%px)\n",
-				cand_syms[i], (void *)regs->regs[0],
-				(void *)regs->regs[1]);
-		return 0;	/* observe only - never changes behaviour */
-	}
-	return 0;
-}
-
-static void sus_path_cand_register(void)
-{
-	int i;
-
-	if (!cand_probe)
-		return;
-	for (i = 0; i < N_CAND; i++) {
-		cand_kps[i].symbol_name = cand_syms[i];
-		cand_kps[i].pre_handler = sus_path_cand_pre;
-		if (register_kprobe(&cand_kps[i]))
-			SUSFS_LOGI("sus_path: cand %s not available\n", cand_syms[i]);
-		else
-			cand_registered[i] = true;
-	}
-	SUSFS_LOGI("sus_path: candidate scan armed (cand_probe=1) - see hide_list\n");
-}
-
-static void sus_path_cand_unregister(void)
-{
-	int i;
-
-	for (i = 0; i < N_CAND; i++) {
-		if (!cand_registered[i])
-			continue;
-		unregister_kprobe(&cand_kps[i]);
-		cand_registered[i] = false;
-	}
-}
-
-static void sus_path_path_register(void)
-{
-    int i;
-
-    for (i = 0; i < N_PATH_PROBES; i++) {
-        int rc = register_kprobe(path_probes[i]);
-
-        if (rc) {
-            pr_warn("sus_path: kprobe(%s) failed %d\n",
-                    path_probes[i]->symbol_name, rc);
-            continue;
-        }
-        path_probes_registered[i] = true;
-    }
-    SUSFS_LOGI("sus_path: path layer armed (filename_lookup=%d do_filp_open=%d user_path_at_empty=%d)\n",
-            path_probes_registered[0], path_probes_registered[1],
-            path_probes_registered[2]);
-}
-
-static void sus_path_path_unregister(void)
-{
-    int i;
-
-    for (i = 0; i < N_PATH_PROBES; i++) {
-        if (!path_probes_registered[i])
-            continue;
-        unregister_kprobe(path_probes[i]);
-        path_probes_registered[i] = false;
-    }
-}
-
 /* Every hook below the LSM layer is only worth its cost once something is
  * actually registered: kprobe/kretprobe entry costs a brk trap per hit, and the
  * dirent kretprobe costs a trap on every listing.  With no rules there is
@@ -2136,15 +1335,19 @@ static void sus_path_hooks_arm(void)
      * permission or attribute check anyway - so they were paying a per-call cost
      * for coverage that was already there.
      *
-     * no_extra is the isolation switch: no LSM, no dirent filter, no DAC. */
+     * The layers that used to be armed on top of this - the syscall-entry kprobes,
+     * the path-string probes (filename_lookup / do_filp_open / user_path_at_empty),
+     * the getname kretprobes, the DAC probes and the candidate diagnostic scan -
+     * are DELETED, not merely disabled: none of them was registered in the default
+     * configuration, and a hook that cannot fire is worse than no hook, because it
+     * reads as coverage.  See the note above sus_path_init().
+     *
+     * no_extra is the isolation switch: no LSM, no dirent filter. */
     if (!no_extra)
         sus_path_dirent_register();
     else
         pr_warn("sus_path: no_extra - dirent filter off\n");
 
-    /* Diagnostic only, and independent of any rule: it is about which path
-     * walkers this kernel actually executes. */
-    sus_path_cand_register();
     SUSFS_LOGI("sus_path: hooks armed (LSM + dirent kretprobes)\n");
     mutex_unlock(&sus_path_arm_lock);
 }
@@ -2334,17 +1537,12 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
 {
     struct sus_path_entry *e;
     int n = 0;
-    int i;
 
     n += scnprintf(buf + n, PAGE_SIZE - n,
-                   "hide_from_apps=%d  enoent: getattr=%d perm=%d nameop=%d meta=%d dac=%d gper=%d path=%d "
-                   "(kp=%d getname=%d exit=%d)\n",
+                   "hide_from_apps=%d  enoent: getattr=%d perm=%d nameop=%d meta=%d\n",
                    hide_from_apps, atomic_read(&n_enoent_getattr),
                    atomic_read(&n_enoent_perm), atomic_read(&n_enoent_nameop),
-                   atomic_read(&n_enoent_meta), atomic_read(&n_enoent_dac),
-                   atomic_read(&n_enoent_gper), atomic_read(&n_enoent_path),
-                   atomic_read(&n_hit_kp),
-                   atomic_read(&n_hit_getname), atomic_read(&n_hit_exit));
+                   atomic_read(&n_enoent_meta));
     n += scnprintf(buf + n, PAGE_SIZE - n,
                    "dirent: rewrite-fail=%d  all-hidden=%d  pending=%d  calls(l64=%d compat=%d)\n",
                    atomic_read(&n_dirent_rewrite_fail),
@@ -2356,13 +1554,6 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
         n += scnprintf(buf + n, PAGE_SIZE - n,
                        "lsm: %d secondary hook(s) FAILED (first: %s) - that operation is not covered\n",
                        n_lsm_ext_fail, first_lsm_ext_fail);
-    if (cand_probe) {
-        n += scnprintf(buf + n, PAGE_SIZE - n, "cand:");
-        for (i = 0; i < N_CAND; i++)
-            n += scnprintf(buf + n, PAGE_SIZE - n, " %s=%d",
-                           cand_syms[i], atomic_read(&cand_hits[i]));
-        n += scnprintf(buf + n, PAGE_SIZE - n, "\n");
-    }
     /* Everything the pending machinery did, so that "still pending" can be read
      * for what it is: passes/ticks == 0 means the retry never ran at all, walks
      * > 0 with pending > 0 means the walk kept failing (last-rc says how), and
@@ -2502,13 +1693,13 @@ int sus_path_init(void)
     if (!dirent_tmp)
         pr_warn("sus_path: dirent scratch buffer unavailable, listings will not be filtered\n");
 
-    /* The dirent kretprobes and the candidate diagnostic probes are armed by
-     * sus_path_hooks_arm() once a rule exists: with nothing registered there is
-     * nothing to answer, so they cost nothing until then. */
+    /* The dirent kretprobes are armed by sus_path_hooks_arm() once a rule exists:
+     * with nothing registered there is nothing to answer, so they cost nothing
+     * until then. */
     SUSFS_LOGI("sus_path: hooks deferred until the first rule\n");
 
     if (no_extra) {
-        SUSFS_LOGI("sus_path: no_extra=1 - LSM, DAC and getdents64 layers OFF; the inline hooks stay on (isolation test)\n");
+        SUSFS_LOGI("sus_path: no_extra=1 - the LSM layer and the dirent filter are OFF (isolation test)\n");
         return 0;
     }
 
@@ -2570,17 +1761,22 @@ int sus_path_init(void)
                     n_lsm_ext_fail, (int)ARRAY_SIZE(extra), first_lsm_ext_fail);
     }
 
-    /* The DAC layer is NOT registered here any more.
+    /* The DAC probes that used to be armed from sus_path_hooks_arm() are DELETED,
+     * not disabled.  They existed for one case: DAC runs before the LSM chain, so
+     * a file whose mode denies the caller gets EACCES before any LSM hook can turn
+     * it into ENOENT.  That case is handled where it starts instead - a registered
+     * rule relaxes its target's mode once (sus_path_relax_mode()), so DAC passes
+     * and the LSM layer is the only thing that can refuse.  Two brk traps on every
+     * inode_permission/generic_permission bought nothing on top of that.
      *
-     * It exists for one case: DAC runs before the LSM chain, so a file whose mode
-     * denies the caller gets EACCES before any LSM hook can turn it into ENOENT.
-     * But an entry layer that refuses before the syscall runs means DAC is never
-     * reached at all - measured: with the fp layer armed, dac stayed 0 across the
-     * whole regression, and even hide_by_dac=0 still answered ENOENT.  It was two
-     * brk exceptions on every inode_permission/generic_permission for nothing.
-     *
-     * So it is armed from sus_path_hooks_arm() only when the fp layer could not be
-     * installed - which is the configuration where it can actually fire. */
+     * Two other layers are gone the same way, and for the same reason (registered
+     * hooks that could never fire while the LSM layer answers first - they were the
+     * pre-LSM fallback): the syscall-entry kprobes (openat/openat2/statx/readlinkat/
+     * execve and their 32-bit counterparts) and the path-string probes
+     * (filename_lookup / do_filp_open / user_path_at_empty) with the getname
+     * kretprobes that fed them.  Their history is in TECHNICAL_NOTES.md, including
+     * the FPAC panic that one of them caused - kept there rather than as dead code
+     * here, because a hook that cannot fire reads as coverage. */
     return 0;
 }
 
@@ -2590,8 +1786,10 @@ void sus_path_exit(void)
     LIST_HEAD(doomed);
 
     /* Unregister the hooks FIRST: after this nothing can match, so the entries
-     * (and their inode references) can be torn down safely. */
-    sus_path_getname_unregister();
+     * (and their inode references) can be torn down safely.  The dirent kretprobes
+     * are the only hooks armed after init; everything else here is an LSM slot. */
+    sus_path_dirent_unregister();
+
     /* The retry timer must be off, and no resolution pass may be in flight while
      * the table is emptied below: a pass re-finds its entry under the lock and
      * never frees anything, but it may not run past the teardown either.  It is
@@ -2601,10 +1799,6 @@ void sus_path_exit(void)
     mutex_unlock(&sus_path_pending_lock);
     /* No walk can be in flight now, so the borrowed creds are ours to release. */
     sus_path_drop_caller_cred();
-    sus_path_cand_unregister();
-    sus_path_syscall_unregister();
-    sus_path_path_unregister();
-    sus_path_dac_unregister();
     if (sus_path_perm_hook.entry)
         ksu_unregister_lsm_hook(&sus_path_perm_hook);
     {
@@ -2626,7 +1820,6 @@ void sus_path_exit(void)
     if (sus_path_getattr_hook.entry)
         ksu_unregister_lsm_hook(&sus_path_getattr_hook);
 
-    sus_path_dirent_unregister();
     kvfree(dirent_tmp);
     dirent_tmp = NULL;
 
@@ -2673,10 +1866,10 @@ void sus_path_exit(void)
  * not exist, so a caller other than the stock tool (which realpath()s first)
  * believed a rule was installed that upstream would have rejected.
  *
- * A pending rule is not dead weight: the path-string layer matches the
- * registered string, so open/stat/exec/readlink answer ENOENT from the moment
- * the path exists.  What the pending state delays is the by-inode layers (LSM
- * hooks, DAC probes) and the getdents64 filter, which are filled in as soon as
+ * A pending rule is not dead weight: it holds its place in the table, so the path is
+ * hidden from the moment the background walk resolves its inode.  What the pending
+ * state delays is every layer - the LSM slots (by inode) and the dirent filter
+ * ((ino, name)) - because none of them can match an inode that does not exist yet. */
  * the inode resolves. */
 void sus_path_supercall(unsigned int cmd, void __user **arg)
 {
@@ -2828,10 +2021,10 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
          * inode number at all (it hides by the AS_FLAGS_SUS_PATH bit on
          * inode->i_mapping) and its dirent filter does ilookup(sb, d_ino), which
          * finds nothing for ino 0 either.  So neither implementation filters the
-         * listing here; the by-inode layers and the path-string layer still hide
-         * the path, and a name-based fallback would hide unrelated entries that
+         * listing here; the by-inode layers still hide the path, and a name-based
+         * fallback would hide unrelated entries that happen to report d_ino 0 as well. */
          * happen to report d_ino 0 as well. */
-        pr_warn("sus_path: '%s' reports ino 0 - hidden by inode and by path, but a directory listing cannot be filtered for it\n",
+        pr_warn("sus_path: '%s' reports ino 0 - hidden by inode, but a directory listing cannot be filtered for it\n",
                 info.target_pathname);
     }
 
@@ -2845,12 +2038,12 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
                     info.target_pathname);
     }
 
-    /* First rule: arm the tracepoint, the syscall probes and the getname
-     * hooks.  Idempotent, and safe to call with a rule already in the list. */
+    /* First rule: arm the dirent kretprobes.  Idempotent, and safe to call with a
+     * rule already in the list. */
     sus_path_hooks_arm();
 
     if (!inode) {
-        SUSFS_LOGI("sus_path: hide '%s' (pending: path does not exist yet - hidden by path from now on, inode resolved in the background)\n",
+        SUSFS_LOGI("sus_path: hide '%s' (pending: the path does not exist yet - it is hidden once the background walk resolves its inode)\n",
                 info.target_pathname);
         /* The walk happens later, in a worker whose own creds cannot reach a
          * path under /data (measured: -EACCES), so remember the creds of the

@@ -821,15 +821,34 @@ static void susfs_kstat_spoof_kstat(struct inode *inode, struct kstat *stat)
 		stat->ctime.tv_nsec = e->spoofed_ctime_tv_nsec;
 }
 
+/* Counters, because "registered" and "reached" are different claims everywhere in
+ * this module: the sys_exit rewrite handles newfstatat, and this fallback is what
+ * covers the paths that never go through that wrapper (fstat(2), statx(2), any
+ * caller of the exported vfs_getattr).  If these stay at 0 through a run that
+ * calls fstat/statx, the probe is dead weight and has to go - the same test the
+ * maps hook, __d_path and pin_user_pages_remote failed. */
+static atomic_t n_gattr_hits = ATOMIC_INIT(0);
+static atomic_t n_gattr_spoofs = ATOMIC_INIT(0);
+
 static int kr_vfs_getattr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct vfs_getattr_args *a = (struct vfs_getattr_args *)ri->data;
+	struct inode *inode;
+	struct sus_kstat_snapshot snap;
 
 	if (regs_return_value(regs) != 0)
 		return 0;
 	if (!a->path || !a->path->dentry || !a->stat)
 		return 0;
-	susfs_kstat_spoof_kstat(a->path->dentry->d_inode, a->stat);
+	inode = a->path->dentry->d_inode;
+
+	atomic_inc(&n_gattr_hits);
+	if (inode && susfs_kstat_gate_ok() &&
+	    susfs_kstat_lookup(inode->i_ino, new_encode_dev(inode->i_sb->s_dev),
+			       &snap))
+		atomic_inc(&n_gattr_spoofs);
+
+	susfs_kstat_spoof_kstat(inode, a->stat);
 	return 0;
 }
 
@@ -1242,6 +1261,8 @@ static int kstat_proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "maps: armed=%d hits=%d rewrites=%d\n",
 		   kstat_maps_registered, atomic_read(&n_kstat_map_hits),
 		   atomic_read(&n_kstat_map_rewrites));
+	seq_printf(m, "vfs_getattr fallback: gattr_hits=%d gattr_spoofs=%d\n",
+		   atomic_read(&n_gattr_hits), atomic_read(&n_gattr_spoofs));
 	return 0;
 }
 
