@@ -1755,10 +1755,13 @@ static void sus_path_fp_dump(void)
 
 /* Returns how many entries were replaced; 0 means the caller must fall back. */
 static int sus_path_fp_arm(void)
-{	int i, n = 0;
+{
+	int i, n = 0;
 
+	/* fp_test > 0 is the bisect knob: install only that one entry.  Otherwise all
+	 * of them - that is the default, and fp_all exists only to say it out loud. */
 	for (i = 0; i < (int)N_FP_HOOKS; i++) {
-		if (!fp_all && fp_test != i + 1)
+		if (fp_test > 0 && fp_test != i + 1)
 			continue;
 		if (!susfs_fp_install(&fp_hooks[i]))
 			n++;
