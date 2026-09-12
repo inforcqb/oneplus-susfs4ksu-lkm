@@ -60,6 +60,7 @@
 #include <linux/atomic.h>
 #include "susfs_abi.h"
 #include "susfs_log.h"
+#include "susfs_fp_hook.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact, for optional compat probes */
 #include "susfs_inline_hook.h"	/* entry patching, replaces the hot kprobes */
@@ -1596,6 +1597,22 @@ static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret);
 /* Inline hooks are defined further down; armed from sus_path_hooks_arm(). */
 static int sus_path_ih_register(void);
 static void sus_path_ih_unregister(void);
+/* fp layer (sys_call_table entries), defined with its wrapper table below.
+ *
+ * This is the replacement for the inline hooks (see susfs_fp_hook.c for why):
+ * the table entry is a data pointer, so nothing here can break the PAC/BTI
+ * pairing of the wrapper, and KernelSU - which reads the very same array when it
+ * wants the original behaviour - ends up calling through us automatically.
+ *
+ * fp_test=N installs only the n-th entry of fp_hooks[] (1-based), fp_all installs
+ * all of them.  Either one takes over from the inline hooks and from the kprobe
+ * layer, which is what makes the two comparable on the same build. */
+static int fp_test;
+module_param(fp_test, int, 0644);
+static bool fp_all;
+module_param(fp_all, bool, 0644);
+static void sus_path_fp_arm(void);
+static void sus_path_fp_disarm(void);
 
 static void sus_path_tracepoint_register(void)
 {
@@ -1625,6 +1642,17 @@ static void sus_path_hooks_arm(void)
          * faccessat2 and newfstatat have NO layer at all - they are answered by
          * sus_path_sys_exit() precisely because KernelSU owns their entries. */
         pr_warn("sus_path: no_extra - sys_exit rewrite off, faccessat/newfstatat uncovered\n");
+    }
+
+    /* fp layer: the syscall entries are replaced, so neither the entry hooks nor
+     * the syscall kprobes may be installed - a kprobe would write its BRK into
+     * the very wrapper we no longer touch, and the inline hooks would fight over
+     * the same table entries. */
+    if (fp_test > 0 || fp_all) {
+        sus_path_fp_arm();
+        pr_info("sus_path: hooks armed (fp layer, first rule registered)\n");
+        mutex_unlock(&sus_path_arm_lock);
+        return;
     }
 
     /* Entry-decision and onLeave hooks: patch the entries if we can, otherwise
@@ -1838,6 +1866,68 @@ static void ih_restore_work(struct work_struct *w);
 static DECLARE_DELAYED_WORK(ih_restore_wq, ih_restore_work);
 
 module_param(ih_enabled, int, 0644);
+
+#define SUSFS_FP_WRAPPER(w, argno)					\
+	static susfs_syscall_fn_t susfs_fp_orig_##w;			\
+	static __nocfi long susfs_fp_##w(const struct pt_regs *regs)	\
+	{								\
+		if (susfs_ih_decide((u64)(unsigned long)regs, argno))	\
+			return -ENOENT;					\
+		return READ_ONCE(susfs_fp_orig_##w)(regs);		\
+	}
+
+SUSFS_FP_WRAPPER(newfstatat, 1)
+SUSFS_FP_WRAPPER(statx, 1)
+SUSFS_FP_WRAPPER(faccessat, 1)
+SUSFS_FP_WRAPPER(faccessat2, 1)
+SUSFS_FP_WRAPPER(openat, 1)
+SUSFS_FP_WRAPPER(openat2, 1)
+SUSFS_FP_WRAPPER(readlinkat, 1)
+SUSFS_FP_WRAPPER(execve, 0)
+
+static struct susfs_fp_hook fp_hooks[] = {
+	{ __NR_newfstatat,  "susfs_fp_newfstatat",  susfs_fp_newfstatat,  &susfs_fp_orig_newfstatat,  NULL, false },
+	{ __NR_statx,       "susfs_fp_statx",       susfs_fp_statx,       &susfs_fp_orig_statx,       NULL, false },
+	{ __NR_faccessat,   "susfs_fp_faccessat",   susfs_fp_faccessat,   &susfs_fp_orig_faccessat,   NULL, false },
+#ifdef __NR_faccessat2
+	{ __NR_faccessat2,  "susfs_fp_faccessat2",  susfs_fp_faccessat2,  &susfs_fp_orig_faccessat2,  NULL, false },
+#endif
+	{ __NR_openat,      "susfs_fp_openat",      susfs_fp_openat,      &susfs_fp_orig_openat,      NULL, false },
+	{ __NR_openat2,     "susfs_fp_openat2",     susfs_fp_openat2,     &susfs_fp_orig_openat2,     NULL, false },
+	{ __NR_readlinkat,  "susfs_fp_readlinkat",  susfs_fp_readlinkat,  &susfs_fp_orig_readlinkat,  NULL, false },
+	{ __NR_execve,      "susfs_fp_execve",      susfs_fp_execve,      &susfs_fp_orig_execve,      NULL, false },
+};
+
+#define N_FP_HOOKS ARRAY_SIZE(fp_hooks)
+
+static void sus_path_fp_arm(void)
+{
+	int i, n = 0;
+
+	if (!fp_test && !fp_all)
+		return;
+
+	/* One dump before anything is replaced: it answers "is the table entry the
+	 * plain symbol or the .cfi_jt stub" for this exact kernel. */
+	susfs_fp_dump_entry(__NR_newfstatat, "__arm64_sys_newfstatat");
+
+	for (i = 0; i < (int)N_FP_HOOKS; i++) {
+		if (!fp_all && fp_test != i + 1)
+			continue;
+		if (!susfs_fp_install(&fp_hooks[i]))
+			n++;
+	}
+	pr_info("sus_path: fp layer armed (%d/%d syscall table entries replaced)\n",
+		n, (int)N_FP_HOOKS);
+}
+
+static void sus_path_fp_disarm(void)
+{
+	int i;
+
+	for (i = (int)N_FP_HOOKS - 1; i >= 0; i--)
+		susfs_fp_remove(&fp_hooks[i]);
+}
 
 static struct {
 	const char *sym;
@@ -2413,6 +2503,7 @@ void sus_path_exit(void)
     /* No walk can be in flight now, so the borrowed creds are ours to release. */
     sus_path_drop_caller_cred();
 	sus_path_ih_unregister();
+    sus_path_fp_disarm();
     sus_path_cand_unregister();
     sus_path_syscall_unregister();
     sus_path_syscall_fallback_unregister();
