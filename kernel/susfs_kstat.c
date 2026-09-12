@@ -492,11 +492,9 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
  *   __NR_fstatat64 327, __NR_fstat64 197
  *       -> struct stat64, arch/arm64/include/asm/stat.h:19-48, filled by
  *          cp_new_stat64() (fs/stat.c:486) through SYSCALL_DEFINE4(fstatat64,...)
- *          (fs/stat.c:556, enabled by __ARCH_WANT_COMPAT_STAT64).  Note that
- *          compat_u64/compat_s64 are `__attribute__((aligned(4)))` on arm64
- *          (include/linux/compat.h:37-38), so the u64 members are packed on
- *          4-byte boundaries - that is what fixes these offsets, and it is also
- *          why this struct is NOT the same as struct compat_stat.
+ *          (fs/stat.c:556, enabled by __ARCH_WANT_COMPAT_STAT64).  This struct is
+ *          NOT struct compat_stat, and it is not laid out the way the 4-byte
+ *          INT_MAX... see the alignment note below.
  *
  *   __NR_stat 106, __NR_lstat 107, __NR_fstat 108
  *       -> struct compat_stat (arch/arm64/include/asm/compat.h:38-67), filled by
@@ -508,23 +506,31 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
  *          the lookup could never match and 32-bit callers got no spoofing at
  *          all, while a match would have written into st_dev/st_rdev).
  *
- * Values verified against D:\kernel_oneplus_sm8550 (5.15.180 OnePlus SM8550):
- * arch/arm64/include/asm/stat.h, arch/arm64/include/asm/compat.h, fs/stat.c,
- * arch/arm64/include/asm/unistd32.h:407,667. */
+ * ALIGNMENT, and how these numbers were established (twice corrected):
+ *   compat_u64/compat_s64 are `__attribute__((aligned(4)))` only when
+ *   CONFIG_COMPAT_FOR_U64_ALIGNMENT is set (include/asm-generic/compat.h).  That
+ *   option is selected by the 32-bit arm architecture only, so on this arm64
+ *   kernel the plain `typedef s64 compat_s64;` applies and the u64 members keep
+ *   their natural 8-byte alignment: st_size is at +48, not +44, and st_ino at
+ *   +96, not +88.  Reading a 4-byte-aligned layout is not a silent near-miss - it
+ *   was measured on device with tools/susfs_compat_stat: a 6-byte file reported
+ *   size=25769803776 = 6 << 32, i.e. the low half of the field came from the
+ *   padding and the high half from the value.  The offsets below are the ones
+ *   that client and the kernel agree on. */
 #define STAT64_ST_DEV_OFF       0	/* compat_u64 */
-#define STAT64_ST_INO_OFF       88	/* compat_u64 (the one glibc reads) */
-#define STAT64_ST_BROKEN_INO_OFF 12	/* compat_ulong_t __st_ino */
+#define STAT64_ST_BROKEN_INO_OFF 12	/* compat_ulong_t __st_ino (what is filled) */
 #define STAT64_ST_NLINK_OFF     20	/* compat_uint_t */
-#define STAT64_ST_SIZE_OFF      44	/* compat_s64 */
-#define STAT64_ST_BLKSIZE_OFF   52	/* compat_ulong_t */
-#define STAT64_ST_BLOCKS_OFF    56	/* compat_u64 */
-#define STAT64_ST_ATIME_OFF     64
-#define STAT64_ST_ATIME_NSEC_OFF 68
-#define STAT64_ST_MTIME_OFF     72
-#define STAT64_ST_MTIME_NSEC_OFF 76
-#define STAT64_ST_CTIME_OFF     80
-#define STAT64_ST_CTIME_NSEC_OFF 84
-#define STAT64_ST_SIZE          96
+#define STAT64_ST_SIZE_OFF      48	/* compat_s64 */
+#define STAT64_ST_BLKSIZE_OFF   56	/* compat_ulong_t */
+#define STAT64_ST_BLOCKS_OFF    64	/* compat_u64 */
+#define STAT64_ST_ATIME_OFF     72
+#define STAT64_ST_ATIME_NSEC_OFF 76
+#define STAT64_ST_MTIME_OFF     80
+#define STAT64_ST_MTIME_NSEC_OFF 84
+#define STAT64_ST_CTIME_OFF     88
+#define STAT64_ST_CTIME_NSEC_OFF 92
+#define STAT64_ST_INO_OFF       96	/* compat_u64 (unfilled: STAT64_HAS_BROKEN_ST_INO) */
+#define STAT64_ST_SIZE          104
 
 /* ARM EABI syscall numbers that fill struct stat64. */
 #define COMPAT_FSTATAT64_NR	327	/* fstatat64(dfd, path, statbuf, flag) */
@@ -546,11 +552,16 @@ static void susfs_kstat_spoof_compat_statbuf(unsigned long statbuf)
 	if (!susfs_kstat_gate_ok())
 		return;
 
-	/* The table is keyed by (ino, dev) as the caller sees them in the struct
-	 * it is about to be given: st_ino (u64, +88) and st_dev (u64, +0). */
-	if (copy_from_user(&v64, (void __user *)(statbuf + STAT64_ST_INO_OFF), sizeof(v64)))
+	/* Key lookup on what the kernel ACTUALLY filled: __st_ino at +12.
+	 *
+	 * stat64 carries the STAT64_HAS_BROKEN_ST_INO marker (arch/arm64/include/asm/
+	 * stat.h), so cp_new_stat64() writes __st_ino and leaves st_ino (+96) alone -
+	 * reading the key from +96 would therefore compare against whatever the
+	 * caller's buffer happened to contain and never match.  Both fields are
+	 * written when spoofing, so a libc that synthesises st_ino from __st_ino and
+	 * one that reads st_ino directly both see the spoofed value. */
+	if (copy_from_user(&ino, (void __user *)(statbuf + STAT64_ST_BROKEN_INO_OFF), sizeof(ino)))
 		return;
-	ino = (unsigned int)v64;
 	if (copy_from_user(&dev, (void __user *)(statbuf + STAT64_ST_DEV_OFF), sizeof(dev)))
 		return;
 	if (!susfs_kstat_lookup(ino, dev, &snap))

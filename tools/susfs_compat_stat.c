@@ -13,12 +13,17 @@
  * back, so a rule's spoofed ino/dev/size/nlink can be compared against the same
  * rule observed from a 64-bit caller.
  *
- * The struct below is `packed` on purpose: the AArch32 struct stat64 uses
- * compat_u64/compat_s64, which arm64 defines as `__attribute__((aligned(4)))`
- * (include/linux/compat.h:37-38), while the compiler's default alignment for
- * unsigned long long on armv7 is 8.  Without the attribute the client's own
- * view of the struct would disagree with the kernel's and the test would be
- * measuring its own bug.
+ * The struct below must use the SAME alignment the kernel uses.  compat_u64/
+ * compat_s64 are `__attribute__((aligned(4)))` only when
+ * CONFIG_COMPAT_FOR_U64_ALIGNMENT is set (include/asm-generic/compat.h), and that
+ * option is selected by the 32-bit arm architecture only - on arm64 the plain
+ * typedefs apply, so the u64 members keep their natural 8-byte alignment and
+ * sizeof(struct stat64) is 104, with st_size at +48 and st_ino at +96.
+ *
+ * Marking this struct `packed` (the first version of this client did) silently
+ * makes the client disagree with the kernel: a 6-byte file came back as
+ * size=25769803776 = 6 << 32, because the low half of the field was read from the
+ * padding the kernel had left.  The size check printed below is what caught it.
  *
  * Build (see .github/workflows/build-ddk.yml):
  *
@@ -43,24 +48,33 @@ typedef unsigned int u32;
 struct stat64_compat {
 	u64 st_dev;			/* 0  */
 	unsigned char __pad0[4];	/* 8  */
-	u32 __st_ino;			/* 12 */
+	u32 __st_ino;			/* 12 (filled by the kernel) */
 	u32 st_mode;			/* 16 */
 	u32 st_nlink;			/* 20 */
 	u32 st_uid;			/* 24 */
 	u32 st_gid;			/* 28 */
 	u64 st_rdev;			/* 32 */
 	unsigned char __pad3[4];	/* 40 */
-	s64 st_size;			/* 44 */
-	u32 st_blksize;			/* 52 */
-	u64 st_blocks;			/* 56 */
-	u32 st_atime;			/* 64 */
-	u32 st_atime_nsec;		/* 68 */
-	u32 st_mtime;			/* 72 */
-	u32 st_mtime_nsec;		/* 76 */
-	u32 st_ctime;			/* 80 */
-	u32 st_ctime_nsec;		/* 84 */
-	u64 st_ino;			/* 88 */
-} __attribute__((packed));
+	s64 st_size;			/* 48 (8-byte aligned on arm64) */
+	u32 st_blksize;			/* 56 */
+	u64 st_blocks;			/* 64 */
+	u32 st_atime;			/* 72 */
+	u32 st_atime_nsec;		/* 76 */
+	u32 st_mtime;			/* 80 */
+	u32 st_mtime_nsec;		/* 84 */
+	u32 st_ctime;			/* 88 */
+	u32 st_ctime_nsec;		/* 92 */
+	u64 st_ino;			/* 96 (left alone: STAT64_HAS_BROKEN_ST_INO) */
+};
+
+/* The layout claim, checked at compile time: if armv7's default alignment ever
+ * differed from the arm64 kernel's view, the client would be measuring itself. */
+_Static_assert(sizeof(struct stat64_compat) == 104, "stat64 size");
+_Static_assert(__builtin_offsetof(struct stat64_compat, __st_ino) == 12, "stat64 __st_ino");
+_Static_assert(__builtin_offsetof(struct stat64_compat, st_size) == 48, "stat64 st_size");
+_Static_assert(__builtin_offsetof(struct stat64_compat, st_blocks) == 64, "stat64 st_blocks");
+_Static_assert(__builtin_offsetof(struct stat64_compat, st_ctime_nsec) == 92, "stat64 st_ctime_nsec");
+_Static_assert(__builtin_offsetof(struct stat64_compat, st_ino) == 96, "stat64 st_ino");
 
 static struct stat64_compat st;
 static char out[512];
@@ -203,7 +217,7 @@ void compat_main(long argc, char **argv)
 
 	pos = put(out, pos, "struct stat64 size=");
 	pos = putnum(out, pos, (u64)sizeof(st), 0);
-	pos = put(out, pos, " (expect 96; a mismatch means this client's layout is wrong)\n");
+	pos = put(out, pos, " (expect 104; 96 would mean a 4-byte-aligned layout)\n");
 	sys4(SYS_write, 1, (long)out, pos, 0);
 
 	rc = sys4(__NR_fstatat64, AT_FDCWD, (long)path, (long)&st, 0);
