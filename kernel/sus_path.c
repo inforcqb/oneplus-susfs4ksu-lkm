@@ -668,6 +668,7 @@ static void sus_path_pending_work(struct work_struct *w)
 
 static int sus_path_inode_getattr(const struct path *path);
 static int sus_path_inode_permission(struct inode *inode, int mask);
+static int sus_path_inode_readlink(struct dentry *dentry);
 
 /* The signatures MUST match the LSM hook types exactly, and must NOT be __nocfi:
  * this kernel uses kCFI with cross-module checks, so the call site compares type
@@ -683,10 +684,22 @@ static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_getattr),
 static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_permission),
 					   typeof(&sus_path_inode_permission)),
 	      "inode_permission hook signature mismatch");
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_readlink),
+					   typeof(&sus_path_inode_readlink)),
+	      "inode_readlink hook signature mismatch");
 
 static struct ksu_lsm_hook sus_path_getattr_hook = KSU_LSM_HOOK_INIT(
 	inode_getattr, "selinux_inode_getattr",
 	(void *)sus_path_inode_getattr, 0);
+
+/* readlinkat is the one path-metadata read that inode_permission does NOT cover:
+ * do_readlinkat() (fs/stat.c:587) calls security_inode_readlink() and then
+ * vfs_readlink(), and neither checks inode permissions - so without this slot a
+ * registered symlink hands its target straight to the caller.  Same shape as the
+ * other two slots, no new mechanism. */
+static struct ksu_lsm_hook sus_path_readlink_hook = KSU_LSM_HOOK_INIT(
+	inode_readlink, "selinux_inode_readlink",
+	(void *)sus_path_inode_readlink, 0);
 
 static struct ksu_lsm_hook sus_path_perm_hook = KSU_LSM_HOOK_INIT(
 	inode_permission, "selinux_inode_permission",
@@ -814,6 +827,24 @@ static int sus_path_inode_permission(struct inode *inode, int mask)
     if (!orig)
         return 0;
     return orig(inode, mask);
+}
+
+/* Counted apart from the getattr hits on purpose: this is the layer that answers
+ * readlink, and a counter that lumps it in with stat could not show whether the
+ * symlink gap is actually closed. */
+static atomic_t n_enoent_readlink = ATOMIC_INIT(0);
+
+static int sus_path_inode_readlink(struct dentry *dentry)
+{
+    int (*orig)(struct dentry *) = (void *)sus_path_readlink_hook.original;
+
+    if (dentry && sus_path_inode_hidden(d_inode(dentry))) {
+        atomic_inc(&n_enoent_readlink);
+        return -ENOENT;
+    }
+    if (!orig)
+        return 0;
+    return orig(dentry);
 }
 
 /* ---- DAC layer ----
@@ -2246,10 +2277,11 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
     int i;
 
     n += scnprintf(buf + n, PAGE_SIZE - n,
-                   "hide_from_apps=%d  enoent: getattr=%d perm=%d dac=%d gper=%d path=%d "
+                   "hide_from_apps=%d  enoent: getattr=%d perm=%d readlink=%d dac=%d gper=%d path=%d "
                    "(fp=%d kp=%d getname=%d exit=%d)\n",
                    hide_from_apps, atomic_read(&n_enoent_getattr),
-                   atomic_read(&n_enoent_perm), atomic_read(&n_enoent_dac),
+                   atomic_read(&n_enoent_perm), atomic_read(&n_enoent_readlink),
+                   atomic_read(&n_enoent_dac),
                    atomic_read(&n_enoent_gper), atomic_read(&n_enoent_path),
                    atomic_read(&n_hit_fp), atomic_read(&n_hit_kp),
                    atomic_read(&n_hit_getname), atomic_read(&n_hit_exit));
@@ -2430,6 +2462,13 @@ int sus_path_init(void)
         pr_info("sus_path: perm hook armed, orig=%ps\n",
                 sus_path_perm_hook.original);
 
+    rc = ksu_register_lsm_hook(&sus_path_readlink_hook);
+    if (rc)
+        pr_warn("sus_path: readlink hook failed %d\n", rc);
+    else
+        pr_info("sus_path: readlink hook armed, orig=%ps\n",
+                sus_path_readlink_hook.original);
+
     /* The DAC layer is NOT registered here any more.
      *
      * It exists for one case: DAC runs before the LSM chain, so a file whose mode
@@ -2468,6 +2507,8 @@ void sus_path_exit(void)
     sus_path_dac_unregister();
     if (sus_path_perm_hook.entry)
         ksu_unregister_lsm_hook(&sus_path_perm_hook);
+    if (sus_path_readlink_hook.entry)
+        ksu_unregister_lsm_hook(&sus_path_readlink_hook);
     if (sus_path_getattr_hook.entry)
         ksu_unregister_lsm_hook(&sus_path_getattr_hook);
 
