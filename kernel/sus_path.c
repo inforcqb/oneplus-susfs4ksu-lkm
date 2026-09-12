@@ -1577,7 +1577,7 @@ module_param(fp_all, bool, 0644);
  * This is the zero-risk first run on a new kernel (no write, no BTI/PAC bet). */
 static int fp_dump;
 module_param(fp_dump, int, 0644);
-static void sus_path_fp_arm(void);
+static int sus_path_fp_arm(void);
 static void sus_path_fp_dump(void);
 /* Non-zero while the fp layer owns the syscall entries; the sys_exit rewrite in
  * sus_path_sys_exit() is only a backstop for the entries it could not take. */
@@ -1755,8 +1755,7 @@ static void sus_path_fp_dump(void)
 
 /* Returns how many entries were replaced; 0 means the caller must fall back. */
 static int sus_path_fp_arm(void)
-{
-	int i, n = 0;
+{	int i, n = 0;
 
 	for (i = 0; i < (int)N_FP_HOOKS; i++) {
 		if (!fp_all && fp_test != i + 1)
