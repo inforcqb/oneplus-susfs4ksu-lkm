@@ -188,7 +188,7 @@ static void susfs_tw_func(struct callback_head *cb)
 		/* Unreachable: reboot_pre() only defers a command that
 		 * susfs_cmd_handled() accepted.  Kept as a net in case the two
 		 * lists ever drift apart. */
-		pr_info("susfs supercall: unsupported cmd 0x%x\n", tw->cmd);
+		SUSFS_LOGI("susfs supercall: unsupported cmd 0x%x\n", tw->cmd);
 		break;
 	}
 	kfree(tw);
@@ -268,7 +268,7 @@ static int reboot_pre(struct kprobe *kp, struct pt_regs *regs)
 	 * there (that is how the C tool detects "command not supported").  See
 	 * susfs_cmd_handled(). */
 	if (!susfs_cmd_handled(cmd)) {
-		pr_info("susfs supercall: unsupported cmd 0x%x\n", cmd);
+		SUSFS_LOGI("susfs supercall: unsupported cmd 0x%x\n", cmd);
 		return 0;
 	}
 
@@ -374,7 +374,7 @@ int susfs_supercall_init(void)
 		return rc;
 	}
 	sc_registered = true;
-	pr_info("susfs supercall: armed (reboot ABI, version " SUSFS_VERSION_STR ")\n");
+	SUSFS_LOGI("susfs supercall: armed (reboot ABI, version " SUSFS_VERSION_STR ")\n");
 	return 0;
 }
 

@@ -38,6 +38,7 @@ typedef long s64;
 #define SYS_pread64   67
 #define SYS_readlinkat 78
 #define SYS_exit      93
+#define SYS_newfstatat 79
 #define SYS_mmap      222
 
 #define AT_FDCWD   (-100)
@@ -49,7 +50,7 @@ typedef long s64;
 
 #define PAGE 4096
 
-static char out[1024];
+static char out[4096];
 static char fbuf[8192];
 
 static long sys6(long n, long a, long b, long c, long d, long e, long f)
@@ -205,6 +206,116 @@ static const char *basename_of(const char *p)
 	return b;
 }
 
+/* ---- the maps line itself, and the numbers a real file would put in it ----
+ *
+ * The columns after the permission flags are "pgoff major:minor ino".  For an
+ * open_redirect rule those last two numbers come from the file the redirection
+ * really opened, while the NAME on the same line is the target's - so printing the
+ * line verbatim is what makes the two comparable: a line whose name and numbers
+ * come from different files is a contradiction no real file can produce.
+ *
+ * stat(2) is not part of open_redirect's disguise (upstream leaves dev/ino to
+ * sus_kstat), so the target path's st_dev/st_ino are the real target values, i.e.
+ * exactly what the maps line has to agree with.  st_dev as userspace sees it is
+ * the kernel's ENCODED dev_t (cp_new_stat -> new_encode_dev), so major/minor have
+ * to be decoded from it: major = enc >> 8, minor = (enc & 0xff) | ((enc >> 20) << 8)
+ * - the same numbers the kernel prints as "%02x:%02x". */
+static u64 hexval(char c)
+{
+	if (c >= '0' && c <= '9')
+		return (u64)(c - '0');
+	if (c >= 'a' && c <= 'f')
+		return (u64)(c - 'a' + 10);
+	return (u64)(c - 'A' + 10);
+}
+
+/* lowercase hex, no prefix and no padding - the width the kernel's own %02x uses
+ * for major and minor */
+static u64 puthex2(char *dst, u64 pos, u64 v)
+{
+	static const char d[] = "0123456789abcdef";
+	char tmp[20];
+	int n = 0;
+
+	if (!v) {
+		dst[pos++] = '0';
+		return pos;
+	}
+	while (v) {
+		tmp[n++] = d[v & 0xf];
+		v >>= 4;
+	}
+	while (n)
+		dst[pos++] = tmp[--n];
+	return pos;
+}
+
+static u64 emit_maps_line(char *out, u64 pos, u64 addr)
+{
+	long n = read_file("/proc/self/maps", fbuf, sizeof(fbuf));
+	long i = 0;
+	int found = 0;
+
+	pos = put(out, pos, "maps_line=");
+	if (n > 0) {
+		while (i < n) {
+			long j = i, k;
+			u64 start = 0, end = 0;
+
+			while (j < n && fbuf[j] != '\n')
+				j++;
+			k = i;
+			while (k < j && fbuf[k] != '-')
+				start = (start << 4) | hexval(fbuf[k++]);
+			k++;
+			while (k < j && fbuf[k] != ' ')
+				end = (end << 4) | hexval(fbuf[k++]);
+			if (addr >= start && addr < end) {
+				for (k = i; k < j; k++)
+					out[pos++] = fbuf[k];
+				found = 1;
+				break;
+			}
+			i = j + 1;
+		}
+	}
+	if (!found)
+		pos = put(out, pos, "(the mapping is not listed)");
+	out[pos++] = '\n';
+	return pos;
+}
+
+static u64 emit_stat(char *out, u64 pos, const char *label, const char *path)
+{
+	unsigned char st[128];
+	long r = sys6(SYS_newfstatat, AT_FDCWD, (long)path, (long)st, 0, 0, 0);
+	u64 enc = 0, ino = 0, major, minor;
+	int i;
+
+	pos = put(out, pos, "stat_");
+	pos = put(out, pos, label);
+	pos = put(out, pos, "=");
+	if (r < 0) {
+		pos = put(out, pos, "(stat failed)");
+	} else {
+		/* st_dev at 0, st_ino at 8 - the first two fields of struct stat, which
+		 * is all this needs; byte-wise for the same reason the dirent reader is */
+		for (i = 7; i >= 0; i--)
+			enc = (enc << 8) | (u64)st[i];
+		for (i = 15; i >= 8; i--)
+			ino = (ino << 8) | (u64)st[i];
+		major = (enc >> 8) & 0xfff;
+		minor = (enc & 0xff) | (((enc >> 20) & 0xfffff) << 8);
+		pos = puthex2(out, pos, major);
+		out[pos++] = ':';
+		pos = puthex2(out, pos, minor);
+		out[pos++] = ' ';
+		pos = putnum(out, pos, ino);
+	}
+	out[pos++] = '\n';
+	return pos;
+}
+
 /* /proc/self/map_files/<start>-<end> is a symlink per mapping, and resolving it
  * names the mapped file - which is how the a4 tests located a mapping the maps
  * listing had already dropped.  Count the entries, how many of them still NAME
@@ -350,6 +461,11 @@ void mmap_main(long argc, char **argv)
 		pos = putnum(out, pos, enoent);
 		pos = put(out, pos, "\n");
 	}
+
+	pos = emit_maps_line(out, pos, (u64)map);
+	pos = emit_stat(out, pos, "mapped", path);
+	if (argc > 3)		/* argv[2] is the optional mapping size */
+		pos = emit_stat(out, pos, "argv3", argv[3]);
 
 	sys6(SYS_write, 1, (long)out, pos, 0, 0, 0);
 }

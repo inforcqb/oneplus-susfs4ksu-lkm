@@ -294,7 +294,7 @@ static void sus_map_note_ops(const void *ops)
     WRITE_ONCE(walk_seen_ops[n], ops);
     atomic_inc(&walk_seen_cnt[n]);
     smp_store_release(&walk_seen_n, n + 1);
-    pr_info("sus_map: walk ops[%d] = %pS\n", n, ops);
+    SUSFS_LOGI("sus_map: walk ops[%d] = %pS\n", n, ops);
 }
 
 static int sus_map_walk_ops_show(char *buf, const struct kernel_param *kp)
@@ -332,7 +332,7 @@ static void sus_map_resolve_walk_ops(void)
                 "smaps_rollup and pagemap stay unfiltered\n");
         return;
     }
-    pr_info("sus_map: walk ops smaps=%px smaps_shmem=%px pagemap=%px\n",
+    SUSFS_LOGI("sus_map: walk ops smaps=%px smaps_shmem=%px pagemap=%px\n",
             sus_map_ops_smaps, sus_map_ops_smaps_shmem, sus_map_ops_pagemap);
 }
 
@@ -394,7 +394,7 @@ static void sus_map_walk_dbg_log(const char *what, struct mm_struct *mm,
         return;
     if (atomic_dec_if_positive(&n_walk_dbg_left) < 0)
         return;
-    pr_info("sus_map: %s mm=%px start=%lx mmap=%px vma=%px %lx-%lx file=%px\n",
+    SUSFS_LOGI("sus_map: %s mm=%px start=%lx mmap=%px vma=%px %lx-%lx file=%px\n",
             what, mm, start, mm ? mm->mmap : NULL, vma,
             vma ? vma->vm_start : 0UL, vma ? vma->vm_end : 0UL,
             (vma && vma->vm_file) ? vma->vm_file : NULL);
@@ -627,7 +627,7 @@ static int sus_map_register_probes(void)
     }
 
     if (n)
-        pr_info("sus_map: %d/%d probes armed (%d rules)\n",
+        SUSFS_LOGI("sus_map: %d/%d probes armed (%d rules)\n",
                 n, (int)N_MAP_PROBES, nmap);
 
     /* The map_files hook is a kretprobe, so it lives outside map_probes[] (which
@@ -654,7 +654,7 @@ int susfs_sus_map_init(void)
 
     sus_map_add(param_map_ino);
     if (nmap == 0) {
-        pr_info("sus_map: no rules, hook not installed\n");
+        SUSFS_LOGI("sus_map: no rules, hook not installed\n");
         return 0;
     }
 
@@ -731,7 +731,7 @@ void susfs_sus_map_supercall(void __user **arg)
         info.err = rc;
         goto out;
     }
-    pr_info("sus_map: added %s (ino=%lu) via supercall\n",
+    SUSFS_LOGI("sus_map: added %s (ino=%lu) via supercall\n",
             info.target_pathname, inode->i_ino);
     path_put(&p);
 

@@ -12,6 +12,7 @@
 #include <linux/init.h>
 
 #include "symbol_resolver.h"
+#include "susfs_log.h"
 #include "lsm_hook.h"
 #include "susfs.h"
 
@@ -96,7 +97,7 @@ static int __init susfs_init(void)
 {
     int ret;
 
-    pr_info("susfs_guard_lkm: init v%s\n", SUSFS_LKM_VERSION);
+    SUSFS_LOGI("susfs_guard_lkm: init v%s\n", SUSFS_LKM_VERSION);
     ksu_init_symbol_resolver();
     ksu_lsm_hook_init();
 
@@ -147,7 +148,7 @@ static int __init susfs_init(void)
      * consequence is that `lsmod | grep susfs` is always empty, and a second
      * `insmod` fails with -EEXIST ("File exists"), which reads like a broken
      * module.  Say where the truth is. */
-    pr_info("susfs_guard_lkm: loaded. This module is filtered out of /proc/modules for every caller including root, so `lsmod | grep susfs` stays empty - check /sys/module/%s instead (a second insmod fails with -EEXIST while it is loaded).\n",
+    SUSFS_LOGI("susfs_guard_lkm: loaded. This module is filtered out of /proc/modules for every caller including root, so `lsmod | grep susfs` stays empty - check /sys/module/%s instead (a second insmod fails with -EEXIST while it is loaded).\n",
             SUSFS_LKM_MODULE_NAME);
 
     return 0;
@@ -167,7 +168,7 @@ static void __exit susfs_exit(void)
     susfs_kstat_exit();
     susfs_uname_exit();
     ksu_lsm_hook_exit();
-    pr_info("susfs_guard_lkm: exit\n");
+    SUSFS_LOGI("susfs_guard_lkm: exit\n");
 }
 
 module_init(susfs_init);

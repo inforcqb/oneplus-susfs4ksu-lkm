@@ -175,7 +175,7 @@ int susfs_hide_syms_init(void)
 	 * while the kprobe lands on the function itself.  The check that matters is
 	 * the one on device - /proc/kallsyms going from 257 ksu_/susfs_ matches to
 	 * none - and that is what the line is for. */
-	pr_info("susfs_hide_syms: armed at %px (kallsyms_op.show=%px%s)\n",
+	SUSFS_LOGI("susfs_hide_syms: armed at %px (kallsyms_op.show=%px%s)\n",
 		(void *)kp_s_show.addr, (void *)table_show,
 		(table_show && (unsigned long)kp_s_show.addr == table_show) ?
 		" - same address" : " - different address (expected: table holds the CFI thunk)");
@@ -207,6 +207,6 @@ void susfs_hide_syms_exit(void)
 		unregister_kprobe(&kp_s_show);
 		hide_registered = false;
 	}
-	pr_info("susfs_hide_syms: exit enter=%d hit=%d\n",
+	SUSFS_LOGI("susfs_hide_syms: exit enter=%d hit=%d\n",
 		atomic_read(&hide_enter_count), atomic_read(&hide_hit_count));
 }

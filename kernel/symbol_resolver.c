@@ -109,14 +109,14 @@ static int lookup_symbol_variant_cb(void *data, const char *name, struct module 
 #if !USE_KCFI
     if (ksu_symbol_has_suffix(name, name_len, cfi_suffix, cfi_suffix_len)) {
         ctx->match = (void *)addr;
-        pr_info("use .cfi_jt variant: %s\n", name);
+        SUSFS_LOGI("use .cfi_jt variant: %s\n", name);
         return 1;
     }
 #endif
 
     if (!ctx->match) {
         ctx->match = (void *)addr;
-        pr_info("found variant: %s\n", name);
+        SUSFS_LOGI("found variant: %s\n", name);
 #if USE_KCFI
         return 1;
 #endif

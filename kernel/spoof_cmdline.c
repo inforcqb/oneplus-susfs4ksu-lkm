@@ -88,7 +88,7 @@ int susfs_spoof_cmdline_init(void)
 	int rc;
 
 	if (!param_bootconfig[0]) {
-		pr_info("spoof_cmdline: no fake bootconfig, not armed\n");
+		SUSFS_LOGI("spoof_cmdline: no fake bootconfig, not armed\n");
 		return 0;
 	}
 	rc = spoof_set(param_bootconfig);
@@ -96,7 +96,7 @@ int susfs_spoof_cmdline_init(void)
 		pr_err("spoof_cmdline: set failed %d, not armed\n", rc);
 		return rc;
 	}
-	pr_info("spoof_cmdline armed: %s\n", param_bootconfig);
+	SUSFS_LOGI("spoof_cmdline armed: %s\n", param_bootconfig);
 	return 0;
 }
 
@@ -161,7 +161,7 @@ void susfs_spoof_cmdline_supercall(void __user **arg)
 
 	info->err = spoof_set(info->fake_cmdline_or_bootconfig);
 	if (!info->err)
-		pr_info("spoof_cmdline: set fake bootconfig (supercall)\n");
+		SUSFS_LOGI("spoof_cmdline: set fake bootconfig (supercall)\n");
 out:
 	/* upstream writes back only ->err for input-type commands */
 	if (copy_to_user(&((struct st_susfs_spoof_cmdline_or_bootconfig __user *)*arg)->err,

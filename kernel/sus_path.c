@@ -67,7 +67,7 @@
 
 #include "lsm_hook.h"
 
-/* Bounce buffer for the getdents64 rewrite.  One record at a time is moved
+/* Bounce buffer for the dirent rewrite.  One record at a time is moved
  * through it, so the size of a LISTING is not a limit - only the size of a
  * single record is.  A record that does not fit is left in place, i.e. not
  * filtered, and the rewrite stops there; that is counted and logged. */
@@ -86,9 +86,12 @@
  * target_pathname field. */
 #define SUS_PATH_LEN 256
 
-/* arm64 compat (32-bit) getdents64.  Not reachable through asm/unistd.h in this
- * build, so spelled out per arch/arm64/include/asm/unistd32.h. */
+/* arm64 compat (32-bit) syscall numbers.  Not reachable through asm/unistd.h in
+ * this build, so spelled out per arch/arm64/include/asm/unistd32.h:
+ * getdents64 (217) maps to the NATIVE sys_getdents64 there, getdents (141) is the
+ * separate compat body - which is why only the latter needed its own probe. */
 #define __NR_compat_getdents64 217
+#define __NR_compat_getdents 141
 
 struct linux_dirent64 {
     u64 d_ino;
@@ -98,14 +101,12 @@ struct linux_dirent64 {
     char d_name[];
 };
 
-#define D_NAME_OFF offsetof(struct linux_dirent64, d_name)
-#define D_RECLEN_OFF offsetof(struct linux_dirent64, d_reclen)
-
 /*
  * One registered path.
  *
  * Kept for two independent mechanisms:
- *   - the getdents64 filter hides the directory entry (by dev+ino+name);
+ *   - the dirent filter hides the directory entry (by dev+ino+name) on every
+ *     listing ABI this kernel can reach (see the probe block below);
  *   - the LSM hooks reject path-based access outright (by the ihold'ed inode
  *     pointer, which is what upstream's AS_FLAGS_SUS_PATH inode flag achieves).
  *
@@ -203,18 +204,18 @@ module_param_string(hide_name, hide_name, sizeof(hide_name), 0644);
 
 static char *dirent_tmp;
 /* Isolation test: with no_extra=1 the LSM replacement, the DAC probes and the
- * getdents64 tracepoint are not registered at all. */
+ * dirent kretprobes are not registered at all. */
 static int no_extra;
 module_param(no_extra, int, 0644);
 
 /* Guards dirent_tmp.  It is a single global scratch buffer shared by every
- * getdents64 exit, and the tracepoint can fire concurrently on several CPUs:
+ * dirent filter exit, and the probes can fire concurrently on several CPUs:
  * without this, two listings compact into the same buffer and one process can
  * get another directory's entries.  sus_path_lock cannot be reused - it is taken
  * inside the traversal by sus_path_is_hidden(). */
 static DEFINE_SPINLOCK(sus_path_buf_lock);
 
-/* getdents64 rewrites that had to stop early (a record too large for the bounce
+/* dirent rewrites that had to stop early (a record too large for the bounce
  * buffer, or a uaccess fault while rewriting).  Both used to be silent; the
  * counter and the ratelimited log are what makes "the listing did not get
  * filtered" visible instead of just producing a longer listing. */
@@ -567,7 +568,7 @@ static int sus_path_resolve_pending(void)
              * (-ENOENT, -EACCES, -ENOTDIR) says which of the two it is without
              * putting the hidden path itself into the log. */
             atomic_set(&sus_path_pend_logged_rc, rc);
-            pr_info("sus_path: pending walk rc=%d (%d pending, pass %u)\n",
+            SUSFS_LOGI("sus_path: pending walk rc=%d (%d pending, pass %u)\n",
                     rc, atomic_read(&sus_path_n_pending), gen);
         }
 
@@ -609,7 +610,7 @@ static int sus_path_resolve_pending(void)
     }
 
     if (resolved)
-        pr_info("sus_path: resolved %d pending rule(s), %d still unresolved\n",
+        SUSFS_LOGI("sus_path: resolved %d pending rule(s), %d still unresolved\n",
                 resolved, atomic_read(&sus_path_n_pending));
 
     mutex_unlock(&sus_path_pending_lock);
@@ -655,7 +656,7 @@ static void sus_path_pending_work(struct work_struct *w)
         atomic_set(&sus_path_pending_tries, 0);     /* progress: keep trying */
 
     if (atomic_inc_return(&sus_path_pending_tries) > SUS_PATH_PENDING_TRIES) {
-        pr_info("sus_path: %d rule(s) still pending after %d retries (last walk rc=%d) - retry timer stops; the path layer keeps hiding them, the next add tries again\n",
+        SUSFS_LOGI("sus_path: %d rule(s) still pending after %d retries (last walk rc=%d) - retry timer stops; the path layer keeps hiding them, the next add tries again\n",
                 atomic_read(&sus_path_n_pending), SUS_PATH_PENDING_TRIES,
                 atomic_read(&sus_path_pend_last_rc));
         return;
@@ -1128,7 +1129,7 @@ static int sus_path_path_notify(const struct path *path, u64 mask, unsigned int 
 /* ---- DAC layer ----
  *
  * Everything else in this file sits either after the DAC check (the LSM hooks)
- * or beside it (the getdents64 tracepoint).  inode_permission() is:
+ * or beside it (the dirent kretprobe, which runs after the whole listing is built).  inode_permission() is:
  *
  *     retval = sb_permission(...);
  *     retval = do_inode_permission(...);        DAC   <-- EACCES leaves HERE
@@ -1250,7 +1251,7 @@ static void sus_path_dac_register(void)
         }
         dac_registered[i] = true;
     }
-    pr_info("sus_path: DAC layer armed (inode_permission=%d generic_permission=%d)\n",
+    SUSFS_LOGI("sus_path: DAC layer armed (inode_permission=%d generic_permission=%d)\n",
             dac_registered[0], dac_registered[1]);
 }
 
@@ -1314,7 +1315,7 @@ static atomic_t n_hit_exit = ATOMIC_INIT(0);
  * One value for all of them: a path probe does not know which syscall is walking,
  * and this layer only carries calls when the fp layer is off. */
 /* Diagnostic: arm nothing but the LSM hooks (registered at init) and the
- * getdents64 tracepoint - no fp layer, no kprobes, no path probes, no getname.
+ * dirent kretprobes - no fp layer, no path probes, no getname.
  * It is how the LSM layer's own coverage gets measured instead of guessed: the
  * entry layers otherwise refuse first and hide what the LSM layer can or cannot
  * see.  Useful together with a chmod 777 on the target, which is the other half of
@@ -1428,7 +1429,7 @@ static int kp_user_path_pre(struct kprobe *kp, struct pt_regs *regs)
     if (IS_ERR_OR_NULL(uname))
         return 0;
     /* Bounded read of the caller's own path.  Fails harmlessly (-EFAULT) if the
-     * page is not there; this is the same uaccess the getdents64 tracepoint
+     * page is not there; this is the same uaccess the dirent filter
      * already does in a context that cannot sleep. */
     n = strncpy_from_user(buf, uname, sizeof(buf) - 1);
     if (n <= 0)
@@ -1599,7 +1600,7 @@ static void sus_path_compat_register(void)
         c++;
     }
 
-    pr_info("sus_path: 32-bit syscall layer armed (%d/%d compat probes)\n",
+    SUSFS_LOGI("sus_path: 32-bit syscall layer armed (%d/%d compat probes)\n",
             c, (int)N_COMPAT_PATH_PROBES);
 }
 
@@ -1619,7 +1620,7 @@ static void sus_path_syscall_register(void)
         n++;
     }
 
-    pr_info("sus_path: syscall layer armed (%d/%d native probes)\n",
+    SUSFS_LOGI("sus_path: syscall layer armed (%d/%d native probes)\n",
             n, (int)N_SYS_PATH_PROBES);
     sus_path_compat_register();
 }
@@ -1770,7 +1771,7 @@ static void sus_path_getname_register(void)
         getname_registered[i] = true;
         n++;
     }
-    pr_info("sus_path: getname layer armed (%d/%d probes)\n", n,
+    SUSFS_LOGI("sus_path: getname layer armed (%d/%d probes)\n", n,
             (int)N_GETNAME_KRPS);
 }
 
@@ -1856,7 +1857,7 @@ static int sus_path_cand_pre(struct kprobe *kp, struct pt_regs *regs)
 		if (kp->symbol_name != cand_syms[i])
 			continue;
 		if (atomic_inc_return(&cand_hits[i]) <= 3)
-			pr_info("sus_path: cand %s hit (x0=%px x1=%px)\n",
+			SUSFS_LOGI("sus_path: cand %s hit (x0=%px x1=%px)\n",
 				cand_syms[i], (void *)regs->regs[0],
 				(void *)regs->regs[1]);
 		return 0;	/* observe only - never changes behaviour */
@@ -1874,11 +1875,11 @@ static void sus_path_cand_register(void)
 		cand_kps[i].symbol_name = cand_syms[i];
 		cand_kps[i].pre_handler = sus_path_cand_pre;
 		if (register_kprobe(&cand_kps[i]))
-			pr_info("sus_path: cand %s not available\n", cand_syms[i]);
+			SUSFS_LOGI("sus_path: cand %s not available\n", cand_syms[i]);
 		else
 			cand_registered[i] = true;
 	}
-	pr_info("sus_path: candidate scan armed (cand_probe=1) - see hide_list\n");
+	SUSFS_LOGI("sus_path: candidate scan armed (cand_probe=1) - see hide_list\n");
 }
 
 static void sus_path_cand_unregister(void)
@@ -1907,7 +1908,7 @@ static void sus_path_path_register(void)
         }
         path_probes_registered[i] = true;
     }
-    pr_info("sus_path: path layer armed (filename_lookup=%d do_filp_open=%d user_path_at_empty=%d)\n",
+    SUSFS_LOGI("sus_path: path layer armed (filename_lookup=%d do_filp_open=%d user_path_at_empty=%d)\n",
             path_probes_registered[0], path_probes_registered[1],
             path_probes_registered[2]);
 }
@@ -1926,7 +1927,7 @@ static void sus_path_path_unregister(void)
 
 /* Every hook below the LSM layer is only worth its cost once something is
  * actually registered: kprobe/kretprobe entry costs a brk trap per hit, and the
- * getdents64 tracepoint sits on every syscall exit.  With no rules there is
+ * dirent kretprobe costs a trap on every listing.  With no rules there is
  * nothing to answer, so they are armed on the first rule and torn down when the
  * module goes - the same "no rules, no cost" effect as nop'ing a patched call
  * site, but through the kernel's own register/unregister paths (unregistering a
@@ -1946,85 +1947,166 @@ static const char *first_lsm_ext_fail;
  * layer on top of the first one's. */
 static DEFINE_MUTEX(sus_path_arm_lock);
 
-/* ---- the listing filter, on __do_sys_getdents64 ----
+/* ---- the listing filter ----
  *
  * The filter has to run AFTER the kernel has built the directory chain, and no LSM
  * hook can do it: the chain is built inside the filesystem, entry by entry, with no
- * per-entry callback a module can reach.  That leaves the function itself, and the
- * innermost one is the right one:
+ * per-entry callback a module can reach.  That leaves the syscall body itself.
  *
- *   __arm64_sys_getdents64 (wrapper)  -> would need a syscall-table entry
- *   __do_sys_getdents64 (the body)    -> a kretprobe, and it is the same function
- *                                        for 32-bit callers, so one probe covers
- *                                        both ABIs
+ * WHICH bodies are reachable was read off this kernel's tables rather than assumed
+ * (include/uapi/asm-generic/unistd.h, arch/arm64/include/asm/unistd32.h):
+ *
+ *   getdents64, native 61     -> __arm64_sys_getdents64   -> __do_sys_getdents64
+ *   getdents64, AArch32 217   -> the SAME native wrapper (the 32-bit table maps
+ *                                217 to sys_getdents64, not to a compat one)
+ *   getdents,   AArch32 141   -> __arm64_compat_sys_getdents -> __do_compat_sys_getdents
+ *
+ * and two more that upstream covers through its fill callbacks but which no table
+ * here can reach, so a probe on them could never fire and none is installed:
+ *
+ *   __do_sys_getdents              - the native table has no __NR_getdents
+ *   __arm64_compat_sys_old_readdir - "89 was sys_readdir"; the AArch32 table has
+ *                                    no entry for it either
+ *
+ * (That is why the missing coverage was one ABI, not four: 32-bit getdents64 shares
+ * the native body, which is what the first version of this probe already covered.)
  *
  * A global sys_exit tracepoint does the same job - that is what this used to be -
  * but it fires for EVERY syscall of every process and then compares the number,
  * which measured 28 ns on calls that have nothing to do with listings (getpid:
- * 113 -> 141 ns).  A kretprobe is paid for only by getdents64.
+ * 113 -> 141 ns).  A kretprobe is paid for only by listings.
  *
  * The entry handler stashes the caller's buffer: by the time the return handler
  * runs, the argument registers are gone.  For a 32-bit caller the register holds
- * the zero-extended user pointer, which is the address to use as is. */
+ * the zero-extended user pointer, which is the address to use as is (the wrapper
+ * de-louses it, __SC_DELOUSE in linux/syscalls.h). */
 struct sus_path_dirent_args {
     unsigned long buf;
 };
 
-static long sus_path_filter(unsigned long buf, long count);
-
-static int kr_getdents64_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-    struct sus_path_dirent_args *a = (struct sus_path_dirent_args *)ri->data;
-
-    a->buf = regs_get_kernel_argument(regs, 1);
-    return 0;
-}
-
-static int kr_getdents64_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-    const struct sus_path_dirent_args *a = (const struct sus_path_dirent_args *)ri->data;
-    long ret = regs_return_value(regs);
-
-    if (ret <= 0 || !a->buf)
-        return 0;
-    if (!READ_ONCE(sus_path_count) && !hide_name[0])
-        return 0;
-
-    regs_set_return_value(regs, sus_path_filter(a->buf, ret));
-    return 0;
-}
-
-static struct kretprobe krp_getdents64 = {
-    .kp.symbol_name = "__do_sys_getdents64",
-    .entry_handler = kr_getdents64_entry,
-    .handler = kr_getdents64_ret,
-    .data_size = sizeof(struct sus_path_dirent_args),
-    .maxactive = 64,
+/* Record layouts.  Both reachable ABIs are NUL-terminated with an explicit
+ * d_reclen, so nothing here needs the d_namlen/computed-length variant that
+ * old_readdir would have needed. */
+struct sus_dirent64_compat {
+    u32 d_ino;
+    u32 d_off;
+    unsigned short d_reclen;
+    char d_name[];
 };
 
-static bool getdents64_probe_registered;
+enum {
+    SUS_DIRENT_L64 = 0,     /* struct linux_dirent64      (native and AArch32 61/217) */
+    SUS_DIRENT_COMPAT,      /* struct compat_linux_dirent (AArch32 141)              */
+    SUS_DIRENT_N,
+};
+
+struct sus_dirent_layout {
+    unsigned char id;
+    unsigned char ino_size;     /* 8 native, 4 compat */
+    unsigned char name_off;     /* offset of d_name */
+    unsigned char reclen_off;   /* offset of d_reclen */
+};
+
+static const struct sus_dirent_layout sus_dirent_l64 = {
+    .id = SUS_DIRENT_L64,
+    .ino_size = 8,
+    .name_off = offsetof(struct linux_dirent64, d_name),
+    .reclen_off = offsetof(struct linux_dirent64, d_reclen),
+};
+
+static const struct sus_dirent_layout sus_dirent_compat = {
+    .id = SUS_DIRENT_COMPAT,
+    .ino_size = 4,
+    .name_off = offsetof(struct sus_dirent64_compat, d_name),
+    .reclen_off = offsetof(struct sus_dirent64_compat, d_reclen),
+};
+
+/* "Did this ABI reach us at all" is a different claim from "did we hide
+ * something", and only the pair can tell a dead probe from a working one: the
+ * AArch32 layout is the one that cannot be exercised by a 64-bit test tool. */
+static atomic_t n_dirent_calls[SUS_DIRENT_N];
+
+static long sus_path_filter(unsigned long buf, long count,
+                            const struct sus_dirent_layout *lay);
+
+/* One kretprobe per ABI.  The return handler has to know its layout, and
+ * struct kretprobe_instance has no back-pointer to the probe on 5.15, so the
+ * layout is baked in by the macro rather than looked up per instance. */
+#define SUS_PATH_DIRENT_PROBE(sym, layname)                                     \
+    static int kr_##layname##_entry(struct kretprobe_instance *ri,              \
+                                    struct pt_regs *regs)                       \
+    {                                                                          \
+        struct sus_path_dirent_args *a = (struct sus_path_dirent_args *)ri->data; \
+                                                                               \
+        a->buf = regs_get_kernel_argument(regs, 1);                            \
+        return 0;                                                              \
+    }                                                                          \
+                                                                               \
+    static int kr_##layname##_ret(struct kretprobe_instance *ri,               \
+                                  struct pt_regs *regs)                        \
+    {                                                                          \
+        const struct sus_path_dirent_args *a =                                 \
+            (const struct sus_path_dirent_args *)ri->data;                     \
+        long ret = regs_return_value(regs);                                    \
+                                                                               \
+        if (ret <= 0 || !a->buf)                                               \
+            return 0;                                                          \
+        atomic_inc(&n_dirent_calls[sus_dirent_##layname.id]);                  \
+        if (!READ_ONCE(sus_path_count) && !hide_name[0])                       \
+            return 0;                                                          \
+                                                                               \
+        regs_set_return_value(regs,                                            \
+                              sus_path_filter(a->buf, ret, &sus_dirent_##layname)); \
+        return 0;                                                              \
+    }                                                                          \
+                                                                               \
+    static struct kretprobe krp_##layname = {                                  \
+        .kp.symbol_name = sym,                                                 \
+        .entry_handler = kr_##layname##_entry,                                 \
+        .handler = kr_##layname##_ret,                                         \
+        .data_size = sizeof(struct sus_path_dirent_args),                      \
+        .maxactive = 64,                                                       \
+    }
+
+SUS_PATH_DIRENT_PROBE("__do_sys_getdents64", l64);
+SUS_PATH_DIRENT_PROBE("__do_compat_sys_getdents", compat);
+
+static bool dirent_probe_registered[SUS_DIRENT_N];
 
 static void sus_path_dirent_register(void)
 {
-    int rc = register_kretprobe(&krp_getdents64);
+    struct kretprobe *probes[SUS_DIRENT_N] = { &krp_l64, &krp_compat };
+    int i, c = 0;
 
-    if (rc) {
-        /* This is the one thing the LSM slots cannot do, so say so loudly: without
-         * it a hidden entry shows up in every directory listing. */
-        pr_warn("sus_path: kretprobe(__do_sys_getdents64) failed %d - listings will not be filtered\n",
-                rc);
-        return;
+    for (i = 0; i < SUS_DIRENT_N; i++) {
+        int rc = register_kretprobe(probes[i]);
+
+        if (rc) {
+            /* This is the one thing the LSM slots cannot do, so say so: without it
+             * a hidden entry shows up in every listing. */
+            pr_warn("sus_path: kretprobe(%s) failed %d - that ABI's listings are not filtered\n",
+                    probes[i]->kp.symbol_name, rc);
+            continue;
+        }
+        dirent_probe_registered[i] = true;
+        c++;
     }
-    getdents64_probe_registered = true;
-    pr_info("sus_path: listing filter armed (kretprobe __do_sys_getdents64)\n");
+    if (c)
+        SUSFS_LOGI("sus_path: listing filter armed (%d/%d ABIs: getdents64 native+AArch32, getdents AArch32)\n",
+                c, (int)SUS_DIRENT_N);
 }
 
 static void sus_path_dirent_unregister(void)
 {
-    if (!getdents64_probe_registered)
-        return;
-    unregister_kretprobe(&krp_getdents64);
-    getdents64_probe_registered = false;
+    struct kretprobe *probes[SUS_DIRENT_N] = { &krp_l64, &krp_compat };
+    int i;
+
+    for (i = 0; i < SUS_DIRENT_N; i++) {
+        if (!dirent_probe_registered[i])
+            continue;
+        unregister_kretprobe(probes[i]);
+        dirent_probe_registered[i] = false;
+    }
 }
 
 static void sus_path_hooks_arm(void)
@@ -2044,7 +2126,7 @@ static void sus_path_hooks_arm(void)
      *   by the same slots, and it cannot be dodged with a different spelling,
      *   a symlink, a hard link or a bind mount;
      *
-     *   the getdents64 exit does the listing filter, which no LSM hook can do:
+     *   the dirent kretprobes do the listing filter, which no LSM hook can do:
      *   the directory chain is built inside the filesystem and there is no
      *   per-entry callback a module can hook.
      *
@@ -2063,7 +2145,7 @@ static void sus_path_hooks_arm(void)
     /* Diagnostic only, and independent of any rule: it is about which path
      * walkers this kernel actually executes. */
     sus_path_cand_register();
-    pr_info("sus_path: hooks armed (LSM + getdents64 kretprobe)\n");
+    SUSFS_LOGI("sus_path: hooks armed (LSM + dirent kretprobes)\n");
     mutex_unlock(&sus_path_arm_lock);
 }
 
@@ -2092,10 +2174,12 @@ static void sus_path_hooks_arm(void)
  * That last distinction is the fix for the old behaviour: a failed write-back
  * returned `count` while the buffer already held a *partially* compacted chain,
  * so the caller was told to parse bytes that were no longer records. */
-static long sus_path_filter(unsigned long buf, long count)
+static long sus_path_filter(unsigned long buf, long count,
+                            const struct sus_dirent_layout *lay)
 {
     long offset = 0;        /* read position in the caller's chain */
     long written = 0;       /* bytes of the compacted chain already handed back */
+    unsigned short head_reclen = 0;     /* first record's length, for the placeholder */
     bool failed = false;
     char *tmp;
 
@@ -2114,27 +2198,46 @@ static long sus_path_filter(unsigned long buf, long count)
     }
 
     while (offset < count) {
-        struct linux_dirent64 d;
+        unsigned long long ino = 0;
         unsigned short reclen;
         char name[NAME_MAX + 1];
         long nlen;
         bool hide;
 
-        if (copy_from_user(&d, (void __user *)(buf + offset), sizeof(d))) {
+        if (copy_from_user(&reclen, (void __user *)(buf + offset + lay->reclen_off),
+                           sizeof(reclen))) {
             failed = true;
             break;
         }
-        reclen = d.d_reclen;
         /* d_reclen is filesystem-supplied: bound it before it is used as a
          * copy length, as a step, and before the bounce buffer is indexed. */
-        if (reclen < D_NAME_OFF + 1 ||
+        if (reclen < lay->name_off + 1 ||
             offset + reclen > count ||
             reclen > DIRENT_BUF_SIZE) {
             failed = true;
             break;
         }
 
-        nlen = strnlen_user((void __user *)(buf + offset + D_NAME_OFF),
+        /* The ino is the record's only fixed-width, ABI-dependent field: 8 bytes
+         * in linux_dirent64, 4 in the AArch32 compat record.  A 32-bit record
+         * exists only when the number fit (compat_filldir answers -EOVERFLOW
+         * otherwise), so the low 4 bytes are the whole value. */
+        if (lay->ino_size == 8) {
+            if (copy_from_user(&ino, (void __user *)(buf + offset), sizeof(u64))) {
+                failed = true;
+                break;
+            }
+        } else {
+            u32 ino32;
+
+            if (copy_from_user(&ino32, (void __user *)(buf + offset), sizeof(ino32))) {
+                failed = true;
+                break;
+            }
+            ino = ino32;
+        }
+
+        nlen = strnlen_user((void __user *)(buf + offset + lay->name_off),
                             sizeof(name) - 1);
         if (nlen == 0) {            /* no readable NUL in the name field */
             failed = true;
@@ -2142,17 +2245,19 @@ static long sus_path_filter(unsigned long buf, long count)
         }
         if (nlen >= sizeof(name))   /* longer than NAME_MAX: cannot match */
             nlen = sizeof(name) - 1;
-        if (nlen > reclen - D_NAME_OFF) {
+        if (nlen > reclen - lay->name_off) {
             failed = true;
             break;
         }
-        if (copy_from_user(name, (void __user *)(buf + offset + D_NAME_OFF), nlen)) {
+        if (copy_from_user(name, (void __user *)(buf + offset + lay->name_off), nlen)) {
             failed = true;
             break;
         }
         name[nlen] = 0;
+        if (!head_reclen)
+            head_reclen = reclen;
 
-        hide = sus_path_is_hidden((u64)d.d_ino, name);
+        hide = sus_path_is_hidden((u64)ino, name);
         /* No gate here any more: sus_path_is_hidden() applies the per-rule gate
          * itself (and has to, or the module's own /proc nodes would still show
          * up for uid 1000/2000). */
@@ -2185,7 +2290,7 @@ static long sus_path_filter(unsigned long buf, long count)
 
     if (failed) {
         atomic_inc(&n_dirent_rewrite_fail);
-        pr_warn_ratelimited("sus_path: getdents64 rewrite stopped at %ld/%ld bytes (returned %ld)\n",
+        pr_warn_ratelimited("sus_path: dirent rewrite stopped at %ld/%ld bytes (returned %ld)\n",
                             offset, count, written ? written : count);
         if (!written)
             return count;       /* nothing was written back: claim no filtering */
@@ -2202,17 +2307,17 @@ static long sus_path_filter(unsigned long buf, long count)
      * a directory that ends early.  The hidden name is gone from the buffer
      * either way. */
     if (!failed && count > 0 && written == 0) {
-        unsigned short reclen = 0;
-        u64 zero = 0;
+        char zero_ino[8] = {0};
         char nul = '\0';
 
-        if (!copy_from_user(&reclen, (void __user *)(buf + D_RECLEN_OFF),
-                            sizeof(reclen)) &&
-            reclen >= D_NAME_OFF + 1 && reclen <= count &&
-            !copy_to_user((void __user *)buf, &zero, sizeof(zero)) &&
-            !copy_to_user((void __user *)(buf + D_NAME_OFF), &nul, 1)) {
+        /* head_reclen is the first record's own length, read above with this
+         * ABI's layout - the buffer still holds it untouched, because written
+         * == 0 means nothing was moved. */
+        if (head_reclen >= lay->name_off + 1 && head_reclen <= count &&
+            !copy_to_user((void __user *)buf, zero_ino, lay->ino_size) &&
+            !copy_to_user((void __user *)(buf + lay->name_off), &nul, 1)) {
             atomic_inc(&n_dirent_all_hidden);
-            return reclen;
+            return head_reclen;
         }
         /* Could not build the placeholder: filtering would be worse than not
          * filtering, because the caller would lose the chunk entirely. */
@@ -2241,10 +2346,12 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
                    atomic_read(&n_hit_kp),
                    atomic_read(&n_hit_getname), atomic_read(&n_hit_exit));
     n += scnprintf(buf + n, PAGE_SIZE - n,
-                   "dirent: rewrite-fail=%d  all-hidden=%d  pending=%d\n",
+                   "dirent: rewrite-fail=%d  all-hidden=%d  pending=%d  calls(l64=%d compat=%d)\n",
                    atomic_read(&n_dirent_rewrite_fail),
                    atomic_read(&n_dirent_all_hidden),
-                   atomic_read(&sus_path_n_pending));
+                   atomic_read(&sus_path_n_pending),
+                   atomic_read(&n_dirent_calls[SUS_DIRENT_L64]),
+                   atomic_read(&n_dirent_calls[SUS_DIRENT_COMPAT]));
     if (n_lsm_ext_fail)
         n += scnprintf(buf + n, PAGE_SIZE - n,
                        "lsm: %d secondary hook(s) FAILED (first: %s) - that operation is not covered\n",
@@ -2354,7 +2461,7 @@ static int sus_path_add_hidden_ex(const char *path, bool self_protect)
 	sus_path_relax_mode(e);
 	spin_unlock(&sus_path_lock);
 
-	pr_info("sus_path: hidden (built-in) '%s'%s\n", path,
+	SUSFS_LOGI("sus_path: hidden (built-in) '%s'%s\n", path,
 		self_protect ? " (self-protected: hidden from every non-root caller)" : "");
 	sus_path_hooks_arm();
 	return 0;
@@ -2395,14 +2502,13 @@ int sus_path_init(void)
     if (!dirent_tmp)
         pr_warn("sus_path: dirent scratch buffer unavailable, listings will not be filtered\n");
 
-    /* The getdents64 tracepoint (it sits on every syscall exit), the syscall
-     * probes and the getname hooks are armed by sus_path_hooks_arm() once a
-     * rule exists: with nothing registered there is nothing to answer, so they
-     * cost nothing until then. */
-    pr_info("sus_path: hooks deferred until the first rule\n");
+    /* The dirent kretprobes and the candidate diagnostic probes are armed by
+     * sus_path_hooks_arm() once a rule exists: with nothing registered there is
+     * nothing to answer, so they cost nothing until then. */
+    SUSFS_LOGI("sus_path: hooks deferred until the first rule\n");
 
     if (no_extra) {
-        pr_info("sus_path: no_extra=1 - LSM, DAC and getdents64 layers OFF; the inline hooks stay on (isolation test)\n");
+        SUSFS_LOGI("sus_path: no_extra=1 - LSM, DAC and getdents64 layers OFF; the inline hooks stay on (isolation test)\n");
         return 0;
     }
 
@@ -2417,7 +2523,7 @@ int sus_path_init(void)
         pr_err("sus_path: getattr hook failed %d - nothing would be hidden, refusing to load\n", rc);
         return rc;
     }
-    pr_info("sus_path: getattr hook armed, orig=%ps\n", sus_path_getattr_hook.original);
+    SUSFS_LOGI("sus_path: getattr hook armed, orig=%ps\n", sus_path_getattr_hook.original);
 
     rc = ksu_register_lsm_hook(&sus_path_perm_hook);
     if (rc) {
@@ -2425,7 +2531,7 @@ int sus_path_init(void)
         ksu_unregister_lsm_hook(&sus_path_getattr_hook);
         return rc;
     }
-    pr_info("sus_path: perm hook armed, orig=%ps\n", sus_path_perm_hook.original);
+    SUSFS_LOGI("sus_path: perm hook armed, orig=%ps\n", sus_path_perm_hook.original);
 
     /* Name-based and metadata operations: without these, an app that can write the
      * parent directory can delete or rename a hidden file, and a hidden file can
@@ -2455,7 +2561,7 @@ int sus_path_init(void)
                 pr_warn("sus_path: %s hook failed %d - that operation will not be covered\n",
                         extra[i]->head_name, rc);
             } else {
-                pr_info("sus_path: %s hook armed, orig=%ps\n",
+                SUSFS_LOGI("sus_path: %s hook armed, orig=%ps\n",
                         extra[i]->head_name, extra[i]->original);
             }
         }
@@ -2620,7 +2726,7 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
      * caller that hides a path first and then tries to register something else on
      * it gets the same -ENOENT from both implementations.) */
     if (rc == -ENOENT && !pending_ok) {
-        pr_info("sus_path: '%s' does not exist and this is ADD_SUS_PATH (not _LOOP): reporting -ENOENT like upstream\n",
+        SUSFS_LOGI("sus_path: '%s' does not exist and this is ADD_SUS_PATH (not _LOOP): reporting -ENOENT like upstream\n",
                 info.target_pathname);
         info.err = -ENOENT;
         goto out;
@@ -2703,7 +2809,7 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
                 spin_unlock(&sus_path_lock);
                 kfree(e);
                 info.err = 0;
-                pr_info("sus_path: hide '%s' (pending rule completed by this add, dev=%llu ino=%llu)\n",
+                SUSFS_LOGI("sus_path: hide '%s' (pending rule completed by this add, dev=%llu ino=%llu)\n",
                         info.target_pathname, dev, ino);
                 goto out;
             }
@@ -2744,7 +2850,7 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
     sus_path_hooks_arm();
 
     if (!inode) {
-        pr_info("sus_path: hide '%s' (pending: path does not exist yet - hidden by path from now on, inode resolved in the background)\n",
+        SUSFS_LOGI("sus_path: hide '%s' (pending: path does not exist yet - hidden by path from now on, inode resolved in the background)\n",
                 info.target_pathname);
         /* The walk happens later, in a worker whose own creds cannot reach a
          * path under /data (measured: -EACCES), so remember the creds of the
@@ -2757,7 +2863,7 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
          * which is an event this kernel does not hand us. */
         sus_path_pending_arm();
     } else {
-        pr_info("sus_path: hide '%s' (dev=%llu ino=%llu)\n",
+        SUSFS_LOGI("sus_path: hide '%s' (dev=%llu ino=%llu)\n",
                 info.target_pathname, dev, ino);
     }
 

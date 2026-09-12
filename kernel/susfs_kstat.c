@@ -383,7 +383,7 @@ static void kstat_maps_arm(void)
 		pr_warn("susfs_kstat: register_kprobe(show_map_vma) failed %d\n", rc);
 	else {
 		kstat_maps_registered = true;
-		pr_info("susfs_kstat: maps hook armed (show_map_vma)\n");
+		SUSFS_LOGI("susfs_kstat: maps hook armed (show_map_vma)\n");
 	}
 }
 
@@ -1080,11 +1080,11 @@ int susfs_kstat_init(void)
 		if (!kstat_proc_entry)
 			pr_warn("proc_create(susfs_kstat) failed\n");
 	} else {
-		pr_info("susfs_kstat: /proc node not created (expose_proc=%d lsm=%d)\n",
+		SUSFS_LOGI("susfs_kstat: /proc node not created (expose_proc=%d lsm=%d)\n",
 			(int)susfs_expose_proc, (int)sus_path_lsm_active());
 	}
 
-	pr_info("kstat armed: %d rules (tp=%d krp=%d proc=%d)\n", nkstat,
+	SUSFS_LOGI("kstat armed: %d rules (tp=%d krp=%d proc=%d)\n", nkstat,
 		kstat_tp_registered, kstat_krp_registered,
 		kstat_proc_entry != NULL);
 	return 0;

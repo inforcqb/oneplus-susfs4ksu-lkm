@@ -97,7 +97,7 @@ static int uname_register(void)
     if (rc)
         return rc;
     uname_registered = true;
-    pr_info("uname spoof armed: release=%s version=%s\n",
+    SUSFS_LOGI("uname spoof armed: release=%s version=%s\n",
             fake_release, fake_version);
     return 0;
 }
@@ -119,7 +119,7 @@ int susfs_uname_init(void)
         if (rc)
             pr_warn("register_kretprobe(newuname) failed %d\n", rc);
     } else {
-        pr_info("uname spoof: disabled (enable via CMD_SUSFS_SET_UNAME)\n");
+        SUSFS_LOGI("uname spoof: disabled (enable via CMD_SUSFS_SET_UNAME)\n");
     }
     return 0;
 }
@@ -168,7 +168,7 @@ void susfs_uname_supercall(void __user **arg)
         goto out;
     }
     info.err = 0;
-    pr_info("uname spoof set: release=%s version=%s\n", fake_release, fake_version);
+    SUSFS_LOGI("uname spoof set: release=%s version=%s\n", fake_release, fake_version);
 out:
     /* upstream writes back only ->err for input-type commands */
     if (copy_to_user(&((struct st_susfs_uname __user *)*arg)->err,

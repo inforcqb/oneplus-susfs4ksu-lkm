@@ -13,6 +13,11 @@
  * back, so a rule's spoofed ino/dev/size/nlink can be compared against the same
  * rule observed from a 64-bit caller.
  *
+ * It also walks one directory through BOTH of the listing interfaces an AArch32
+ * caller has - getdents64 (217, mapped to the native sys_getdents64) and getdents
+ * (141, whose own compat body has a different record layout) - because only a
+ * 32-bit caller can reach the second one at all.
+ *
  * The struct below must use the SAME alignment the kernel uses.  compat_u64/
  * compat_s64 are `__attribute__((aligned(4)))` only when
  * CONFIG_COMPAT_FOR_U64_ALIGNMENT is set (include/asm-generic/compat.h), and that
@@ -31,7 +36,7 @@
  *           -static-pie -fno-stack-protector -fno-builtin -fuse-ld=lld \
  *           -Wl,-e,_start -o susfs_compat_stat tools/susfs_compat_stat.c
  *
- * Usage: susfs_compat_stat <path>
+ * Usage: susfs_compat_stat <path> [dir] [needle]
  */
 
 typedef unsigned long long u64;
@@ -41,6 +46,7 @@ typedef unsigned int u32;
 #define SYS_exit 1
 #define SYS_write 4
 #define SYS_open 5
+#define SYS_lseek 19
 #define __NR_fstatat64 327
 #define __NR_fstat64 197
 #define AT_FDCWD (-100)
@@ -191,6 +197,84 @@ static void show(const char *what, long rc)
 	sys4(SYS_write, 1, (long)out, pos, 0);
 }
 
+/* ---- the two listing ABIs an AArch32 caller can use ----
+ *
+ * This is why a 32-bit client is needed for more than stat: the AArch32 table has
+ * getdents64 (217) pointing at the NATIVE sys_getdents64 - so the 64-bit probe
+ * already covers it - and a SEPARATE getdents (141) whose body is
+ * __do_compat_sys_getdents with its own record layout:
+ *
+ *   getdents64: struct linux_dirent64      { u64 ino; s64 off; u16 reclen; u8 type; char name[]; }
+ *               -> reclen at +16, name at +19
+ *   getdents:   struct compat_linux_dirent { u32 ino; u32 off; u16 reclen; char name[]; }
+ *               -> reclen at +8,  name at +10
+ *
+ * A hidden entry must be gone from both.  Fields are read byte-wise: the buffer is
+ * a char array, and unaligned 64-bit loads are not worth relying on here. */
+#define __NR_getdents 141
+#define __NR_getdents64 217
+#define DIRBUF 4096
+
+static char dirbuf[DIRBUF];
+
+static int name_is(const char *p, const char *needle)
+{
+	if (!needle || !needle[0])
+		return 0;
+	while (*needle) {
+		if (*p++ != *needle++)
+			return 0;
+	}
+	return *p == 0;
+}
+
+static u32 scan_dir(long fd, int compat, const char *needle, u32 *entries)
+{
+	u32 matches = 0;
+	long n;
+
+	*entries = 0;
+	while ((n = sys4(compat ? __NR_getdents : __NR_getdents64,
+			 fd, (long)dirbuf, DIRBUF, 0)) > 0) {
+		long off = 0;
+
+		while (off < n) {
+			u32 reclen, nameoff;
+
+			if (compat) {
+				reclen = (unsigned char)dirbuf[off + 8] |
+					 ((u32)(unsigned char)dirbuf[off + 9] << 8);
+				nameoff = 10;
+			} else {
+				reclen = (unsigned char)dirbuf[off + 16] |
+					 ((u32)(unsigned char)dirbuf[off + 17] << 8);
+				nameoff = 19;
+			}
+			if (reclen < nameoff + 1 || off + (long)reclen > n)
+				break;
+			(*entries)++;
+			if (name_is(dirbuf + off + nameoff, needle))
+				matches++;
+			off += reclen;
+		}
+	}
+	return matches;
+}
+
+static void show_dirents(long dirfd, int compat, const char *needle)
+{
+	u32 pos = 0, entries = 0;
+	u32 matches = scan_dir(dirfd, compat, needle, &entries);
+
+	pos = put(out, pos, compat ? "getdents(141)  " : "getdents64(217)");
+	pos = put(out, pos, " entries=");
+	pos = putnum(out, pos, entries, 0);
+	pos = put(out, pos, " needle_hits=");
+	pos = putnum(out, pos, matches, 0);
+	pos = put(out, pos, "\n");
+	sys4(SYS_write, 1, (long)out, pos, 0);
+}
+
 __asm__(
 ".text\n"
 ".global _start\n"
@@ -205,15 +289,20 @@ __asm__(
 );
 
 void compat_main(long argc, char **argv);
-
 void compat_main(long argc, char **argv)
 {
 	const char *path = "/data/local/tmp/dac_probe/visible";
+	const char *dir = "/data/local/tmp/dac_probe";
+	const char *needle = "open600";
 	long fd, rc;
 	u32 pos = 0;
 
 	if (argc > 1)
 		path = argv[1];
+	if (argc > 2)
+		dir = argv[2];
+	if (argc > 3)
+		needle = argv[3];
 
 	pos = put(out, pos, "struct stat64 size=");
 	pos = putnum(out, pos, (u64)sizeof(st), 0);
@@ -228,4 +317,24 @@ void compat_main(long argc, char **argv)
 		rc = sys4(__NR_fstat64, fd, (long)&st, 0, 0);
 		show("fstat64  ", rc);
 	}
+
+	/* Both listing interfaces, on the directory that holds the hidden entry:
+	 * the needle must be missing from BOTH. */
+	fd = sys4(SYS_open, (long)dir, 0, 0, 0);
+	if (fd < 0) {
+		pos = 0;
+		pos = put(out, pos, "open(dir) failed\n");
+		sys4(SYS_write, 1, (long)out, pos, 0);
+		return;
+	}
+	pos = 0;
+	pos = put(out, pos, "dir=");
+	pos = put(out, pos, dir);
+	pos = put(out, pos, " needle=");
+	pos = put(out, pos, needle);
+	pos = put(out, pos, "\n");
+	sys4(SYS_write, 1, (long)out, pos, 0);
+	show_dirents(fd, 0, needle);	/* getdents64 (217) -> native body         */
+	sys4(SYS_lseek, fd, 0, 0, 0);	/* rewind between the two interfaces       */
+	show_dirents(fd, 1, needle);	/* getdents   (141) -> compat body         */
 }

@@ -86,7 +86,7 @@ static int avc_register(void)
 	if (rc)
 		return rc;
 	avc_registered = true;
-	pr_info("susfs_avc_spoof: hook installed (slow_avc_audit)\n");
+	SUSFS_LOGI("susfs_avc_spoof: hook installed (slow_avc_audit)\n");
 	return 0;
 }
 
@@ -96,7 +96,7 @@ static void avc_unregister(void)
 		return;
 	unregister_kprobe(&kp_avc);
 	avc_registered = false;
-	pr_info("susfs_avc_spoof: hook removed\n");
+	SUSFS_LOGI("susfs_avc_spoof: hook removed\n");
 }
 
 /* ---- /proc/susfs_avc_spoof ---- */
@@ -175,7 +175,7 @@ int susfs_avc_spoof_init(void)
 			avc_priv_app_ctx, err);
 		avc_priv_app_sid = 0;
 	}
-	pr_info("avc_spoof: su_sid=%u (%s), priv_app_sid=%u (%s)\n",
+	SUSFS_LOGI("avc_spoof: su_sid=%u (%s), priv_app_sid=%u (%s)\n",
 		avc_su_sid, avc_su_ctx, avc_priv_app_sid, avc_priv_app_ctx);
 
 	/* Only the /proc node is optional: the avc hook is installed by
@@ -188,9 +188,9 @@ int susfs_avc_spoof_init(void)
 		if (!avc_proc_entry)
 			pr_warn("proc_create(susfs_avc_spoof) failed\n");
 		else
-			pr_info("susfs_avc_spoof: proc ready (/proc/susfs_avc_spoof)\n");
+			SUSFS_LOGI("susfs_avc_spoof: proc ready (/proc/susfs_avc_spoof)\n");
 	} else {
-		pr_info("susfs_avc_spoof: /proc node not created (expose_proc=%d lsm=%d)\n",
+		SUSFS_LOGI("susfs_avc_spoof: /proc node not created (expose_proc=%d lsm=%d)\n",
 			(int)susfs_expose_proc, (int)sus_path_lsm_active());
 	}
 	return 0;
@@ -231,7 +231,7 @@ void susfs_avc_spoof_supercall(void __user **arg)
 		avc_spoof_enabled = false;
 	}
 	info.err = 0;
-	pr_info("avc_spoof: %s (supercall)\n", info.enabled ? "enabled" : "disabled");
+	SUSFS_LOGI("avc_spoof: %s (supercall)\n", info.enabled ? "enabled" : "disabled");
 out:
 	/* upstream writes back only ->err for input-type commands */
 	if (copy_to_user(&((struct st_susfs_avc_log_spoofing __user *)*arg)->err,

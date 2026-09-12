@@ -759,7 +759,7 @@ static int sus_mount_mark_ksu_mounts(void)
              * few mounts show what d_path() actually renders for them. */
             if (scan_logged < 400) {
                 scan_logged++;
-                pr_info("sus_mount: scan %s -> %s\n", r->mnt_devname,
+                SUSFS_LOGI("sus_mount: scan %s -> %s\n", r->mnt_devname,
                         IS_ERR_OR_NULL(dp) ? "(d_path failed)" : dp);
             }
             if (IS_ERR_OR_NULL(dp)) {
@@ -791,7 +791,7 @@ static int sus_mount_mark_ksu_mounts(void)
             failed = true;
             break;
         }
-        pr_info("sus_mount: marked mnt_id %d -> %d (%s, devname %s)\n",
+        SUSFS_LOGI("sus_mount: marked mnt_id %d -> %d (%s, devname %s)\n",
                 r->mnt_id, new_id, shown,
                 r->mnt_devname ? r->mnt_devname : "none");
         r->mnt_id = new_id;
@@ -813,12 +813,12 @@ static int sus_mount_mark_ksu_mounts(void)
         pr_warn("sus_mount: marking stopped early (see the warning above), %d mount(s) marked\n",
                 marked);
     if (marked)
-        pr_info("sus_mount: %d KSU mount(s) marked with real mnt_id_ida ids (>= %llu)\n",
+        SUSFS_LOGI("sus_mount: %d KSU mount(s) marked with real mnt_id_ida ids (>= %llu)\n",
                 marked, DEFAULT_KSU_MNT_ID);
     else
-        pr_info("sus_mount: 0 KSU mounts marked (nothing under /data/adb matched in this mnt ns, hide threshold %lu)\n",
+        SUSFS_LOGI("sus_mount: 0 KSU mounts marked (nothing under /data/adb matched in this mnt ns, hide threshold %lu)\n",
                 min);
-    pr_info("sus_mount: scan stats: seen=%u devname_hits=%u dpath_ok=%u dpath_err=%u skipped(other ns/cursor)=%u skipped(already marked)=%u marked=%d\n",
+    SUSFS_LOGI("sus_mount: scan stats: seen=%u devname_hits=%u dpath_ok=%u dpath_err=%u skipped(other ns/cursor)=%u skipped(already marked)=%u marked=%d\n",
             seen, n_devname, n_dpath_ok, n_dpath_err, n_skipped_ns,
             n_skipped_marked, marked);
     return marked;
@@ -847,7 +847,7 @@ int susfs_sus_mount_init(void)
         param_min_mnt_id = DEFAULT_KSU_MNT_ID;
     }
 
-    pr_info("sus_mount: su ctx \"%s\" -> sid %u (stock KernelSU uses \"u:r:su:s0\", override with susfs_guard_lkm.su_ctx)\n",
+    SUSFS_LOGI("sus_mount: su ctx \"%s\" -> sid %u (stock KernelSU uses \"u:r:su:s0\", override with susfs_guard_lkm.su_ctx)\n",
             param_su_ctx, su_sid);
     if (!pfn_security_cred_getsecid)
         pr_warn("sus_mount: security_cred_getsecid not found - no su-domain gating, KSU mounts will be hidden from EVERY process including su\n");
@@ -868,7 +868,7 @@ int susfs_sus_mount_init(void)
      * itself is not gated on that flag - the hook compares ids, so the mounts
      * have to carry KSU ids before it is switched on (and the next enable
      * rescans anyway, which picks up mounts created since load). */
-    pr_info("sus_mount: disabled by default (enable via CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS)\n");
+    SUSFS_LOGI("sus_mount: disabled by default (enable via CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS)\n");
     (void)sus_mount_mark_ksu_mounts();
     return 0;
 }
@@ -998,7 +998,7 @@ void susfs_sus_mount_supercall(void __user **arg)
         mount_registered = false;
     }
     info.err = 0;
-    pr_info("sus_mount: %s (supercall)\n", info.enabled ? "hide" : "unhide");
+    SUSFS_LOGI("sus_mount: %s (supercall)\n", info.enabled ? "hide" : "unhide");
 out:
     /* upstream writes back only ->err for input-type commands */
     if (copy_to_user(&((struct st_susfs_hide_sus_mnts_for_non_su_procs __user *)*arg)->err,

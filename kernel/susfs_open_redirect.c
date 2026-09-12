@@ -48,19 +48,20 @@
  * first two and seq_show() are static and the maps/fdinfo numbers are printed
  * from locals a kprobe cannot see.  What IS reachable are helpers they share,
  * and there the substitute is the same one the forward direction already uses -
- * point the caller at the *target's* path:
+ * point the caller at the *target's* path - plus, where no shared helper exists,
+ * rewriting the line the function has already formatted, from a kretprobe on
+ * that function's return:
  *
  *   d_path()                 <- do_proc_readlink() and seq_path() (the maps
  *                               name column) both d_path() the file's f_path
- *   show_vma_header_prefix() <- args 6/7 are exactly the maps dev:ino columns
+ *   show_map_vma() (return)  <- its line carries "maj:min ino" from the
+ *                               redirected inode; rewritten to the target's
  *   vfs_statfs()             <- fstatfs()/statfs()
  *
  * All three are best effort, and never silent: registration outcome and hit
  * counts are logged and shown by /proc/susfs_open_redirect, because registering
- * successfully only proves the symbol exists - the probes the audit found
- * "registered, zero hits" were LTO-inlined call sites.
- * /proc/<pid>/fdinfo/N (mnt_id/ino) stays uncovered, and why is noted at
- * or_proc_show().
+ * successfully only proves the symbol exists - the maps dev:ino hook was first
+ * put on show_vma_header_prefix(), registered cleanly, and never fired (LTO).
  *
  * Interface mirrors upstream: /proc/susfs_open_redirect
  *   add_open_redirect <target> <redirected> <uid_scheme>
@@ -78,6 +79,9 @@
 #include <linux/uaccess.h>
 #include "mount.h"		/* fs/mount.h: real_mount() -> mnt_id */
 #include <linux/atomic.h>	/* reverse-disguise hit counters */
+#include <linux/mm.h>		/* struct vm_area_struct (the maps reverse face) */
+#include <linux/kdev_t.h>	/* MAJOR/MINOR, to render dev:ino the way proc does */
+#include <linux/kernel.h>	/* scnprintf, for the same rendering */
 #include <linux/security.h>	/* security_secctx_to_secid */
 #include "susfs_abi.h"
 #include "susfs_log.h"
@@ -162,7 +166,6 @@ static DEFINE_MUTEX(or_lock);
  * live call sites (AUDIT_FINDINGS.md: five probes registered, zero hits). */
 static atomic_t or_rev_dpath_hits = ATOMIC_INIT(0);
 static atomic_t or_rev_statfs_hits = ATOMIC_INIT(0);
-static atomic_t or_rev_vma_hits = ATOMIC_INIT(0);
 
 /* Cached paths are per-entry and released once, at unload.
  *
@@ -193,7 +196,7 @@ static void or_resolve_su_sid(void)
 		or_su_sid = 0;
 		return;
 	}
-	pr_info("open_redirect: su ctx \"%s\" -> sid %u (stock KernelSU uses \"u:r:su:s0\", override with susfs_guard_lkm.or_su_ctx)\n",
+	SUSFS_LOGI("open_redirect: su ctx \"%s\" -> sid %u (stock KernelSU uses \"u:r:su:s0\", override with susfs_guard_lkm.or_su_ctx)\n",
 		or_su_ctx, or_su_sid);
 }
 
@@ -453,40 +456,6 @@ static int or_vfs_statfs_pre(struct kprobe *kp, struct pt_regs *regs)
 	return 0;
 }
 
-/* ---- reverse: show_vma_header_prefix(m, start, end, flags, pgoff, dev, ino) ----
- * args 7 and 8 of that call are the "dev:ino" columns of /proc/<pid>/maps
- * (fs/proc/task_mmu.c:252-255, called from show_map_vma() at :293).  Upstream
- * rewrites the two locals that feed them (patch:1270-1288) to the *target's*
- * ino/dev; those locals are out of reach for a kprobe, but the values arrive in
- * x5/x6 (AAPCS64 argument order), which a pre_handler can rewrite - the same
- * technique sus_map's show_map_vma probe and the other register-level probes in
- * this LKM use.
- *
- * The lookup key is what the line is about to print: the redirected file's
- * (dev, ino).  A vma that has neither (the smaps_rollup trailer prints 0:0,
- * task_mmu.c:1096-1097) is skipped so no rule can ever match it. */
-static int or_vma_hdr_pre(struct kprobe *kp, struct pt_regs *regs)
-{
-	struct sus_or_entry *e;
-
-	if (!READ_ONCE(nor))
-		return 0;
-	if (!regs->regs[5] && !regs->regs[6])
-		return 0;
-	if (!or_reverse_visible())
-		return 0;
-
-	e = or_find_by_redirected_inode((unsigned long)regs->regs[6],
-					(dev_t)regs->regs[5]);
-	if (!e)
-		return 0;
-
-	atomic_inc(&or_rev_vma_hits);
-	regs->regs[5] = (unsigned long)e->target_dev;
-	regs->regs[6] = (unsigned long)e->target_ino;
-	return 0;
-}
-
 static struct kprobe kp_or = {
 	.symbol_name = "vfs_open",
 	.pre_handler = or_vfs_open_pre,
@@ -502,10 +471,120 @@ static struct kprobe kp_or_vfs_statfs = {
 	.pre_handler = or_vfs_statfs_pre,
 };
 
-static struct kprobe kp_or_vma_hdr = {
-	.symbol_name = "show_vma_header_prefix",
-	.pre_handler = or_vma_hdr_pre,
+/* ---- reverse face 3: the dev:ino columns of /proc/<pid>/maps (and smaps) ----
+ *
+ * The first attempt put this on show_vma_header_prefix() - args 6 and 7 of that
+ * call ARE the two columns - and it registered fine and never fired once: with
+ * clang's full LTO it has no out-of-line copy in this kernel, so there is no call
+ * site for a probe to land on (measured: the vma_hdr hit counter stayed 0 over
+ * every run).
+ *
+ * So the already-formatted line is rewritten instead, at the exit of the function
+ * that prints it: show_map_vma() writes
+ *
+ *     "<start>-<end> <rwxp> <pgoff> <maj>:<min> <ino> <name>"
+ *
+ * one line per buffer, and the two numbers come from vma->vm_file - i.e. from the
+ * REDIRECTED inode.  Replacing the "<maj>:<min> <ino>" run with the target's makes
+ * the line consistent with the name that face 1 (d_path) already disguises:
+ * without it a detector reads the target's name next to the redirected file's
+ * device, which no file on this system can produce.
+ *
+ * The run is rendered exactly the way fs/proc/task_mmu.c renders it (seq_put_hex_ll
+ * for major/minor: lowercase, minimum width 2; seq_put_decimal_ull for the ino), and
+ * both surrounding spaces are part of the match so neither the pgoff nor the name
+ * can be caught by it. */
+static atomic_t or_rev_maps_hits = ATOMIC_INIT(0);
+static atomic_t or_rev_maps_rewrites = ATOMIC_INIT(0);
+
+struct or_maps_args {
+	struct seq_file *m;
+	struct vm_area_struct *vma;
 };
+
+static int or_maps_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct or_maps_args *a = (struct or_maps_args *)ri->data;
+
+	a->m = (struct seq_file *)regs->regs[0];
+	a->vma = (struct vm_area_struct *)regs->regs[1];
+	return 0;
+}
+
+/* Replace the first occurrence of old[0..old_len) in the seq_file buffer with
+ * new[0..new_len).  Growing is allowed as long as the buffer has room; without room
+ * the line is left alone rather than truncated. */
+static bool or_buf_replace(struct seq_file *m, const char *old, size_t old_len,
+			   const char *new, size_t new_len)
+{
+	char *buf = m->buf;
+	size_t count = m->count, i, pos = 0;
+
+	if (!old_len || !new_len || old_len > count)
+		return false;
+	for (i = 0; i + old_len <= count; i++) {
+		if (!memcmp(buf + i, old, old_len)) {
+			pos = i;
+			break;
+		}
+	}
+	if (i + old_len > count)
+		return false;
+	if (new_len > old_len && count + (new_len - old_len) >= m->size)
+		return false;
+	if (new_len != old_len)
+		memmove(buf + pos + new_len, buf + pos + old_len, count - (pos + old_len));
+	memcpy(buf + pos, new, new_len);
+	m->count = count - old_len + new_len;
+	return true;
+}
+
+static int or_maps_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	const struct or_maps_args *a = (const struct or_maps_args *)ri->data;
+	struct seq_file *m = a->m;
+	struct vm_area_struct *vma = a->vma;
+	struct inode *inode;
+	struct sus_or_entry *e;
+	char old[48], new[48];
+	int old_len, new_len;
+
+	if (!m || !m->buf || !m->count || !vma || !vma->vm_file)
+		return 0;
+	if (!or_reverse_visible())
+		return 0;
+	inode = file_inode(vma->vm_file);
+	if (!inode)
+		return 0;
+
+	e = or_find_by_redirected_inode(inode->i_ino, inode->i_sb->s_dev);
+	if (!e)
+		return 0;
+
+	atomic_inc(&or_rev_maps_hits);
+
+	old_len = scnprintf(old, sizeof(old), "%02x:%02x %lu",
+			    (unsigned int)MAJOR(inode->i_sb->s_dev),
+			    (unsigned int)MINOR(inode->i_sb->s_dev),
+			    (unsigned long)inode->i_ino);
+	new_len = scnprintf(new, sizeof(new), "%02x:%02x %lu",
+			    (unsigned int)MAJOR(e->target_dev),
+			    (unsigned int)MINOR(e->target_dev),
+			    (unsigned long)e->target_ino);
+	if (old_len > 0 && new_len > 0 &&
+	    or_buf_replace(m, old, (size_t)old_len, new, (size_t)new_len))
+		atomic_inc(&or_rev_maps_rewrites);
+	return 0;
+}
+
+static struct kretprobe kr_or_maps = {
+	.kp.symbol_name = "show_map_vma",	/* fs/proc/task_mmu.c */
+	.entry_handler = or_maps_entry,
+	.handler = or_maps_ret,
+	.data_size = sizeof(struct or_maps_args),
+	.maxactive = 16,
+};
+static bool or_maps_registered;
 
 /* ---- reverse face 4: /proc/<pid>/fdinfo/N ----
  *
@@ -651,7 +730,6 @@ static bool or_fdinfo_registered;
 static bool or_registered;
 static bool or_dpath_registered;
 static bool or_statfs_registered;
-static bool or_vma_hdr_registered;
 
 /* The forward hook is the feature: a rule that cannot fire is worse than no
  * rule, so its registration failure is reported to the caller. */
@@ -665,7 +743,7 @@ static int or_register(void)
 	if (rc)
 		return rc;
 	or_registered = true;
-	pr_info("susfs_open_redirect: hook installed (vfs_open)\n");
+	SUSFS_LOGI("susfs_open_redirect: hook installed (vfs_open)\n");
 	return 0;
 }
 
@@ -687,7 +765,7 @@ static void or_register_reverse(void)
 				rc);
 		else {
 			or_dpath_registered = true;
-			pr_info("susfs_open_redirect: reverse hook installed (d_path)\n");
+			SUSFS_LOGI("susfs_open_redirect: reverse hook installed (d_path)\n");
 		}
 	}
 	if (!or_statfs_registered) {
@@ -697,17 +775,17 @@ static void or_register_reverse(void)
 				rc);
 		else {
 			or_statfs_registered = true;
-			pr_info("susfs_open_redirect: reverse hook installed (vfs_statfs)\n");
+			SUSFS_LOGI("susfs_open_redirect: reverse hook installed (vfs_statfs)\n");
 		}
 	}
-	if (!or_vma_hdr_registered) {
-		rc = register_kprobe(&kp_or_vma_hdr);
+	if (!or_maps_registered) {
+		rc = register_kretprobe(&kr_or_maps);
 		if (rc)
-			pr_warn("open_redirect: register_kprobe(show_vma_header_prefix) failed %d - maps dev:ino not disguised (or already inlined)\n",
+			pr_warn("open_redirect: register_kretprobe(show_map_vma) failed %d - the maps dev:ino stays the redirected file's\n",
 				rc);
 		else {
-			or_vma_hdr_registered = true;
-			pr_info("susfs_open_redirect: reverse hook installed (show_vma_header_prefix)\n");
+			or_maps_registered = true;
+			SUSFS_LOGI("susfs_open_redirect: reverse hook installed (show_map_vma)\n");
 		}
 	}
 	if (!or_fdinfo_registered) {
@@ -717,7 +795,7 @@ static void or_register_reverse(void)
 				rc);
 		else {
 			or_fdinfo_registered = true;
-			pr_info("susfs_open_redirect: reverse hook installed (seq_show/fdinfo)\n");
+			SUSFS_LOGI("susfs_open_redirect: reverse hook installed (seq_show/fdinfo)\n");
 		}
 	}
 }
@@ -728,9 +806,9 @@ static void or_unregister(void)
 		unregister_kretprobe(&kr_or_fdinfo);
 		or_fdinfo_registered = false;
 	}
-	if (or_vma_hdr_registered) {
-		unregister_kprobe(&kp_or_vma_hdr);
-		or_vma_hdr_registered = false;
+	if (or_maps_registered) {
+		unregister_kretprobe(&kr_or_maps);
+		or_maps_registered = false;
 	}
 	if (or_statfs_registered) {
 		unregister_kprobe(&kp_or_vfs_statfs);
@@ -744,7 +822,7 @@ static void or_unregister(void)
 		return;
 	unregister_kprobe(&kp_or);
 	or_registered = false;
-	pr_info("susfs_open_redirect: hook removed\n");
+	SUSFS_LOGI("susfs_open_redirect: hook removed\n");
 }
 
 /* ---- /proc/susfs_open_redirect ---- */
@@ -783,11 +861,11 @@ int susfs_open_redirect_init(void)
 		if (!or_proc_entry)
 			pr_warn("proc_create(susfs_open_redirect) failed\n");
 	} else {
-		pr_info("susfs_open_redirect: /proc node not created (expose_proc=%d lsm=%d)\n",
+		SUSFS_LOGI("susfs_open_redirect: /proc node not created (expose_proc=%d lsm=%d)\n",
 			(int)susfs_expose_proc, (int)sus_path_lsm_active());
 	}
 
-	pr_info("susfs_open_redirect: %d rules (hook %s, proc %d)\n", nor,
+	SUSFS_LOGI("susfs_open_redirect: %d rules (hook %s, proc %d)\n", nor,
 		or_registered ? "armed" : "lazy", or_proc_entry != NULL);
 	return 0;
 }
@@ -851,12 +929,13 @@ static int or_proc_show(struct seq_file *m, void *v)
 	 * matter twice over: fdinfo=<registered> and the fdinfo hit/rewrite pair.
 	 * mnt_id is NOT rewritten here: that id belongs to sus_mount's table, and the
 	 * fdinfo line for a mount is only ever wrong when that feature is hidden. */
-	seq_printf(m, "hooks: open=%d dpath=%d statfs=%d vma_hdr=%d fdinfo=%d | rev hits: dpath=%d statfs=%d vma_hdr=%d fdinfo=%d/%d | su_sid=%u\n",
+	seq_printf(m, "hooks: open=%d dpath=%d statfs=%d maps=%d fdinfo=%d | rev hits: dpath=%d statfs=%d maps=%d/%d fdinfo=%d/%d | su_sid=%u\n",
 		   or_registered, or_dpath_registered, or_statfs_registered,
-		   or_vma_hdr_registered, or_fdinfo_registered,
+		   or_maps_registered, or_fdinfo_registered,
 		   atomic_read(&or_rev_dpath_hits),
 		   atomic_read(&or_rev_statfs_hits),
-		   atomic_read(&or_rev_vma_hits),
+		   atomic_read(&or_rev_maps_hits),
+		   atomic_read(&or_rev_maps_rewrites),
 		   atomic_read(&or_rev_fdinfo_hits),
 		   atomic_read(&or_rev_fdinfo_rewrites),
 		   or_su_sid);

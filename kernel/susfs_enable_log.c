@@ -6,8 +6,11 @@
  * (susfs_is_log_enabled), toggled by CMD_SUSFS_ENABLE_LOG.  An LKM has no
  * static branch, so we expose the same semantics through a global flag and a
  * /proc/susfs_enable_log interface: write "1"/"0" to enable/disable, read to
- * query.  Feature hit-path logs should check susfs_log_enabled() to stay
- * silent by default.
+ * query.  The flag is ON at load, exactly like upstream's
+ * DEFINE_STATIC_KEY_TRUE(susfs_is_log_enabled), and every informational line in
+ * this module goes through SUSFS_LOGI() (susfs_log.h), so switching it off
+ * really does silence the module - measured before the fix: the flag had no
+ * readers at all, and "susfs_guard_lkm: ..." kept appearing after enable_log 0.
  */
 #include <linux/module.h>
 #include <linux/proc_fs.h>
@@ -18,7 +21,7 @@
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc */
 
-static bool log_enabled;
+static bool log_enabled = true;
 
 bool susfs_log_enabled(void)
 {
@@ -68,12 +71,16 @@ static ssize_t log_proc_write(struct file *file, const char __user *buf,
 	if (c != '0' && c != '1')
 		return -EINVAL;
 
-	if (c == '1')
+	if (c == '1') {
 		WRITE_ONCE(log_enabled, true);
-	else
+		SUSFS_LOGI("susfs: enable logging to kernel\n");
+	} else {
 		WRITE_ONCE(log_enabled, false);
-
-	pr_info("susfs: %s logging to kernel\n", log_enabled ? "enable" : "disable");
+		/* Unconditional on purpose (upstream uses its unconditional
+		 * SUSFS_LOGE here): the confirmation that silence is now in effect
+		 * must not itself be silenced. */
+		pr_info("susfs: disable logging to kernel\n");
+	}
 	return len;
 }
 
@@ -99,9 +106,9 @@ int susfs_enable_log_init(void)
 		if (!log_proc_entry)
 			pr_warn("proc_create(susfs_enable_log) failed\n");
 		else
-			pr_info("susfs_enable_log: armed (proc: /proc/susfs_enable_log)\n");
+			SUSFS_LOGI("susfs_enable_log: armed (proc: /proc/susfs_enable_log)\n");
 	} else {
-		pr_info("susfs_enable_log: /proc node not created (expose_proc=%d lsm=%d)\n",
+		SUSFS_LOGI("susfs_enable_log: /proc node not created (expose_proc=%d lsm=%d)\n",
 			(int)susfs_expose_proc, (int)sus_path_lsm_active());
 	}
 	return 0;
@@ -113,7 +120,7 @@ void susfs_enable_log_exit(void)
 		proc_remove(log_proc_entry);
 		log_proc_entry = NULL;
 	}
-	log_enabled = false;
+	log_enabled = true;	/* back to the load-time default */
 }
 
 /* supercall: CMD_SUSFS_ENABLE_LOG */
@@ -125,10 +132,14 @@ void susfs_enable_log_supercall(void __user **arg)
         info.err = -EFAULT;
         goto out;
     }
-    WRITE_ONCE(log_enabled, info.enabled);
+    if (info.enabled) {
+        WRITE_ONCE(log_enabled, true);
+        SUSFS_LOGI("susfs: enable logging to kernel (supercall)\n");
+    } else {
+        WRITE_ONCE(log_enabled, false);
+        pr_info("susfs: disable logging to kernel (supercall)\n");
+    }
     info.err = 0;
-    pr_info("susfs: %s logging to kernel (supercall)\n",
-            log_enabled ? "enable" : "disable");
 out:
     /* upstream writes back only ->err for input-type commands */
     if (copy_to_user(&((struct st_susfs_log __user *)*arg)->err,
