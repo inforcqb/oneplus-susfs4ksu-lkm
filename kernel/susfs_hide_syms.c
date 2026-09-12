@@ -116,6 +116,33 @@ static struct kprobe kp_s_show = {
 	.pre_handler = hide_syms_s_show_pre,
 };
 
+/* /proc/modules is 0444 - any app can read it - and nothing in a built-in SUSFS
+ * is listed there.  Our own line is printed by m_show(m, p), where p is
+ * &module->list; answering success without emitting anything leaves the listing
+ * exactly as it would be without the module.  struct module's layout is what this
+ * module was built against (RANDSTRUCT is off on this kernel), so recovering the
+ * module from the iterator is safe. */
+static int hide_syms_m_show_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	void *p = (void *)regs_get_kernel_argument(regs, 1);
+
+	if (!p)
+		return 0;
+	if ((struct module *)((char *)p - offsetof(struct module, list)) != THIS_MODULE)
+		return 0;
+
+	regs_set_return_value(regs, 0);		/* no output for this entry */
+	regs->pc = regs->regs[30];
+	return 1;
+}
+
+static struct kprobe kp_m_show = {
+	.symbol_name = "m_show",
+	.pre_handler = hide_syms_m_show_pre,
+};
+
+static bool m_show_registered;
+
 /* Read-only comparison target: the function kallsyms itself calls. */
 static unsigned long hide_syms_table_show(void)
 {
@@ -152,6 +179,16 @@ int susfs_hide_syms_init(void)
 		(void *)kp_s_show.addr, (void *)table_show,
 		(table_show && (unsigned long)kp_s_show.addr == table_show) ?
 		" - same address" : " - different address (expected: table holds the CFI thunk)");
+
+	/* Separate probe, separate failure: hiding the symbol names and hiding the
+	 * module entry are independent, and neither should stop the other. */
+	rc = register_kprobe(&kp_m_show);
+	if (rc)
+		pr_warn("susfs_hide_syms: register_kprobe(m_show) failed %d - /proc/modules still lists the module\n",
+			rc);
+	else
+		m_show_registered = true;
+
 	return 0;
 }
 
@@ -162,6 +199,10 @@ bool susfs_hide_syms_active(void)
 
 void susfs_hide_syms_exit(void)
 {
+	if (m_show_registered) {
+		unregister_kprobe(&kp_m_show);
+		m_show_registered = false;
+	}
 	if (hide_registered) {
 		unregister_kprobe(&kp_s_show);
 		hide_registered = false;

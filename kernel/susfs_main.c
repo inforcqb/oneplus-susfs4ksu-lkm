@@ -16,6 +16,10 @@
 #include "susfs.h"
 
 #define SUSFS_LKM_VERSION "2.3.0-gki"
+/* The directory name the module gets under /sys/module: it has to match what the
+ * kernel derives from the module name, because susfs_self_hide_nodes() registers it
+ * as a hidden path. */
+#define SUSFS_LKM_MODULE_NAME "susfs_guard_lkm"
 
 /* The /proc/susfs_* control nodes are OFF by default.
  *
@@ -51,6 +55,16 @@ static const char *const susfs_self_hide_paths[] = {
     "/proc/susfs_open_redirect",
     "/proc/susfs_enable_log",
     "/proc/susfs_avc_spoof",
+    /* And the module's own sysfs directory.
+     *
+     * A built-in SUSFS has no module entry to hide; a loadable module is listed in
+     * /proc/modules and under /sys/module, and BOTH ARE WORLD-READABLE - one
+     * `lsmod`, or one readdir of /sys/module, is enough to see that the hiding
+     * machinery is loaded, name and all.  Registering the directory makes the
+     * listing filter drop it and a direct access answer ENOENT, exactly like any
+     * other hidden path; /proc/modules is handled separately (see
+     * susfs_hide_syms.c, which already hooks the seq_file show that prints it). */
+    "/sys/module/" SUSFS_LKM_MODULE_NAME,
 };
 
 /* Register our control nodes in sus_path's hidden set.
