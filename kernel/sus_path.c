@@ -938,7 +938,26 @@ static void sus_path_dac_unregister(void)
  *                       into it - takes a __user pointer, read with
  *                       strncpy_from_user
  */
-static atomic_t n_enoent_path = ATOMIC_INIT(0);
+/* Counters for the path-string layer, one per hook, because they answer different
+ * questions: which layer refused, and - when the fp layer is off - how many layers
+ * saw the same call.  In the default configuration only one of them can fire for
+ * a given call (the fp wrapper refuses before the real syscall runs, so nothing
+ * downstream is reached), but with fp_enabled=0 the syscall kprobe, the path
+ * probes and the getname kretprobe can all match the same string, and a single
+ * aggregate number would hide that. */
+static atomic_t n_enoent_path = ATOMIC_INIT(0);		/* all of them */
+static atomic_t n_hit_fp = ATOMIC_INIT(0);
+static atomic_t n_hit_kp = ATOMIC_INIT(0);
+static atomic_t n_hit_getname = ATOMIC_INIT(0);
+static atomic_t n_hit_exit = ATOMIC_INIT(0);
+
+/* Defined with the fp layer further down, but the path probes need it too: they
+ * refuse by rewriting the return value at the ENTRY of their target, which is the
+ * same shortcut shape the fp wrapper takes, so they need the same timing cover.
+ * One value for all of them: a path probe does not know which syscall is walking,
+ * and this layer only carries calls when the fp layer is off. */
+#define SUS_PATH_KP_COVER_NS 1500
+static void sus_path_fp_cover_gap(unsigned int base_ns);
 
 static bool sus_path_match_path(const char *path)
 {
@@ -985,8 +1004,14 @@ static int kp_path_answer(struct pt_regs *regs, const char *name, bool errptr)
         return 0;
 
     atomic_inc(&n_enoent_path);
+    atomic_inc(&n_hit_kp);
     pr_info_ratelimited("sus_path: path hit '%s' (uid=%u)\n",
                         name, current_uid().val);
+    /* Refusing here is the same shortcut the fp wrapper takes - return, without
+     * running the lookup - so it needs the same timing cover, or the paths this
+     * layer catches (the fp layer is off, or the caller came in through a kernel
+     * internal path) would answer measurably faster than a real failure. */
+    sus_path_fp_cover_gap(SUS_PATH_KP_COVER_NS);
     if (errptr)
         regs_set_return_value(regs, (unsigned long)ERR_PTR(-ENOENT));
     else
@@ -1343,6 +1368,7 @@ static int kr_getname_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
         return 0;
 
     atomic_inc(&n_enoent_path);
+    atomic_inc(&n_hit_getname);
     pr_info_ratelimited("sus_path: getname hit '%s' (uid=%u)\n",
                         f->name, current_uid().val);
     sus_path_spoof_name(f);
@@ -1714,6 +1740,7 @@ __attribute__((visibility("hidden"))) int sus_path_fp_decide(u64 uregs_arg, int 
 	/* Same accounting as the kprobe path, so the counters and the log stay
 	 * usable no matter which layer answered. */
 	atomic_inc(&n_enoent_path);
+	atomic_inc(&n_hit_fp);
 	if (fp_log_hits)
 		pr_info_ratelimited("sus_path: path hit '%s' (uid=%u) [fp]\n",
 				    buf, current_uid().val);
@@ -2070,6 +2097,7 @@ static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret)
 
         if (sus_path_match_path(name)) {
             atomic_inc(&n_enoent_path);
+            atomic_inc(&n_hit_exit);
             pr_info_ratelimited("sus_path: path hit (sys_exit rewrite) '%s' (uid=%u)\n",
                                 name, current_uid().val);
             regs->regs[0] = (unsigned long)-ENOENT;   /* was ret, success or EACCES */
@@ -2121,10 +2149,13 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
     int i;
 
     n += scnprintf(buf + n, PAGE_SIZE - n,
-                   "hide_from_apps=%d  enoent: getattr=%d perm=%d dac=%d gper=%d path=%d\n",
+                   "hide_from_apps=%d  enoent: getattr=%d perm=%d dac=%d gper=%d path=%d "
+                   "(fp=%d kp=%d getname=%d exit=%d)\n",
                    hide_from_apps, atomic_read(&n_enoent_getattr),
                    atomic_read(&n_enoent_perm), atomic_read(&n_enoent_dac),
-                   atomic_read(&n_enoent_gper), atomic_read(&n_enoent_path));
+                   atomic_read(&n_enoent_gper), atomic_read(&n_enoent_path),
+                   atomic_read(&n_hit_fp), atomic_read(&n_hit_kp),
+                   atomic_read(&n_hit_getname), atomic_read(&n_hit_exit));
     n += scnprintf(buf + n, PAGE_SIZE - n,
                    "dirent: rewrite-fail=%d  all-hidden=%d  pending=%d\n",
                    atomic_read(&n_dirent_rewrite_fail),
