@@ -408,6 +408,10 @@ static bool kr_fdinfo_ok;
  * rewrite is idempotent (the second one finds a rewritten id that is not in the
  * table), so arming both is safe - which of them fires is reported separately. */
 static DEFINE_PER_CPU(unsigned long, sus_mount_statx_user);
+/* Which landing point this call is at: 's' = __arm64_sys_statx, 'd' = do_statx.
+ * struct kretprobe_instance has no back pointer to its kretprobe in 5.15, so the
+ * two entry handlers write their own letter instead. */
+static DEFINE_PER_CPU(char, sus_mount_statx_where);
 
 static atomic_t n_statx_entry = ATOMIC_INIT(0);
 static atomic_t n_statx_ret = ATOMIC_INIT(0);
@@ -416,9 +420,18 @@ static atomic_t n_statx_err = ATOMIC_INIT(0);
 static atomic_t n_statx_copyfail = ATOMIC_INIT(0);
 static atomic_t n_statx_nomap = ATOMIC_INIT(0);
 
-static int sus_mount_statx_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+static int sus_mount_statx_entry_sys(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     atomic_inc(&n_statx_entry);
+    this_cpu_write(sus_mount_statx_where, 's');
+    this_cpu_write(sus_mount_statx_user, regs->regs[4]);
+    return 0;
+}
+
+static int sus_mount_statx_entry_do(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    atomic_inc(&n_statx_entry);
+    this_cpu_write(sus_mount_statx_where, 'd');
     this_cpu_write(sus_mount_statx_user, regs->regs[4]);
     return 0;
 }
@@ -439,8 +452,8 @@ static int sus_mount_statx_ret(struct kretprobe_instance *ri, struct pt_regs *re
         /* Which of the two landing points has no user pointer in argument 5 is
          * worth knowing: the other one is the one doing the work. */
         atomic_inc(&n_statx_nobuf);
-        pr_info_ratelimited("sus_mount: statx at %s has no buffer in x4\n",
-                            ri->rp->kp.symbol_name);
+        pr_info_ratelimited("sus_mount: statx at %c has no buffer in x4\n",
+                            this_cpu_read(sus_mount_statx_where));
         return 0;
     }
     if (sus_mount_is_su_domain())
@@ -469,7 +482,7 @@ static int sus_mount_statx_ret(struct kretprobe_instance *ri, struct pt_regs *re
 
 static struct kretprobe kr_statx = {
     .kp.symbol_name = "__arm64_sys_statx",
-    .entry_handler = sus_mount_statx_entry,
+    .entry_handler = sus_mount_statx_entry_sys,
     .handler = sus_mount_statx_ret,
     .maxactive = 16,
 };
@@ -477,7 +490,7 @@ static bool kr_statx_ok;
 
 static struct kretprobe kr_statx_do = {
     .kp.symbol_name = "do_statx",
-    .entry_handler = sus_mount_statx_entry,
+    .entry_handler = sus_mount_statx_entry_do,
     .handler = sus_mount_statx_ret,
     .maxactive = 16,
 };
