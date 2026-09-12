@@ -737,6 +737,77 @@ static struct ksu_lsm_hook sus_path_rename_hook = KSU_LSM_HOOK_INIT(
 static struct ksu_lsm_hook sus_path_link_hook = KSU_LSM_HOOK_INIT(
 	inode_link, "selinux_inode_link", (void *)sus_path_inode_link, 0);
 
+/* ---- metadata and attribute operations ----
+ *
+ * These syscalls reach the kernel through namei and then stop before any check we
+ * otherwise hook, so a hidden file could still be probed - and in the setattr case
+ * even modified - while answering "permission denied" rather than "no such file".
+ * Each of them has an LSM hook that carries the dentry (or the path), so the same
+ * inode match answers all of them; no entry-layer work needed.
+ *
+ *   statfs/fstatfs        -> security_sb_statfs(dentry)
+ *   chmod/chown/truncate/utimes -> security_inode_setattr(dentry, iattr)
+ *   getxattr/listxattr    -> security_inode_getxattr / _listxattr(dentry, ...)
+ *   setxattr/removexattr  -> security_inode_setxattr / _removexattr(...)
+ *   inotify_add_watch, fanotify_mark -> security_path_notify(path, ...)
+ *
+ * inode_setattr is the one that also closes the error-code leak: without it an app
+ * got EPERM or EACCES from the owner check, which says the file exists. */
+static int sus_path_sb_statfs(struct dentry *dentry);
+static int sus_path_inode_setattr(struct dentry *dentry, struct iattr *attr);
+static int sus_path_inode_getxattr(struct dentry *dentry, const char *name);
+static int sus_path_inode_listxattr(struct dentry *dentry);
+static int sus_path_inode_setxattr(struct user_namespace *mnt_userns,
+				   struct dentry *dentry, const char *name,
+				   const void *value, size_t size, int flags);
+static int sus_path_inode_removexattr(struct user_namespace *mnt_userns,
+				      struct dentry *dentry, const char *name);
+static int sus_path_path_notify(const struct path *path, u64 mask,
+				unsigned int obj_type);
+
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(sb_statfs),
+					   typeof(&sus_path_sb_statfs)),
+	      "sb_statfs hook signature mismatch");
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_setattr),
+					   typeof(&sus_path_inode_setattr)),
+	      "inode_setattr hook signature mismatch");
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_getxattr),
+					   typeof(&sus_path_inode_getxattr)),
+	      "inode_getxattr hook signature mismatch");
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_listxattr),
+					   typeof(&sus_path_inode_listxattr)),
+	      "inode_listxattr hook signature mismatch");
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_setxattr),
+					   typeof(&sus_path_inode_setxattr)),
+	      "inode_setxattr hook signature mismatch");
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_removexattr),
+					   typeof(&sus_path_inode_removexattr)),
+	      "inode_removexattr hook signature mismatch");
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(path_notify),
+					   typeof(&sus_path_path_notify)),
+	      "path_notify hook signature mismatch");
+
+static struct ksu_lsm_hook sus_path_statfs_hook = KSU_LSM_HOOK_INIT(
+	sb_statfs, "selinux_sb_statfs", (void *)sus_path_sb_statfs, 0);
+
+static struct ksu_lsm_hook sus_path_setattr_hook = KSU_LSM_HOOK_INIT(
+	inode_setattr, "selinux_inode_setattr", (void *)sus_path_inode_setattr, 0);
+
+static struct ksu_lsm_hook sus_path_getxattr_hook = KSU_LSM_HOOK_INIT(
+	inode_getxattr, "selinux_inode_getxattr", (void *)sus_path_inode_getxattr, 0);
+
+static struct ksu_lsm_hook sus_path_listxattr_hook = KSU_LSM_HOOK_INIT(
+	inode_listxattr, "selinux_inode_listxattr", (void *)sus_path_inode_listxattr, 0);
+
+static struct ksu_lsm_hook sus_path_setxattr_hook = KSU_LSM_HOOK_INIT(
+	inode_setxattr, "selinux_inode_setxattr", (void *)sus_path_inode_setxattr, 0);
+
+static struct ksu_lsm_hook sus_path_removexattr_hook = KSU_LSM_HOOK_INIT(
+	inode_removexattr, "selinux_inode_removexattr", (void *)sus_path_inode_removexattr, 0);
+
+static struct ksu_lsm_hook sus_path_notify_hook = KSU_LSM_HOOK_INIT(
+	path_notify, "selinux_path_notify", (void *)sus_path_path_notify, 0);
+
 static struct ksu_lsm_hook sus_path_getattr_hook = KSU_LSM_HOOK_INIT(
 	inode_getattr, "selinux_inode_getattr",
 	(void *)sus_path_inode_getattr, 0);
@@ -940,6 +1011,102 @@ static int sus_path_inode_link(struct dentry *old_dentry, struct inode *dir,
     if (!orig)
         return 0;
     return orig(old_dentry, dir, new_dentry);
+}
+
+/* Metadata/attribute hits are counted apart from the name operations: the first
+ * says "the name is not usable", the second "the object cannot be probed or
+ * changed", and they fail for different reasons (see the block above). */
+static atomic_t n_enoent_meta = ATOMIC_INIT(0);
+
+static int sus_path_meta_hit(void)
+{
+    atomic_inc(&n_enoent_meta);
+    return -ENOENT;
+}
+
+static int sus_path_sb_statfs(struct dentry *dentry)
+{
+    int (*orig)(struct dentry *) = (void *)sus_path_statfs_hook.original;
+
+    if (sus_path_dentry_hidden(dentry))
+        return sus_path_meta_hit();
+    if (!orig)
+        return 0;
+    return orig(dentry);
+}
+
+static int sus_path_inode_setattr(struct dentry *dentry, struct iattr *attr)
+{
+    int (*orig)(struct dentry *, struct iattr *) = (void *)sus_path_setattr_hook.original;
+
+    if (sus_path_dentry_hidden(dentry))
+        return sus_path_meta_hit();
+    if (!orig)
+        return 0;
+    return orig(dentry, attr);
+}
+
+static int sus_path_inode_getxattr(struct dentry *dentry, const char *name)
+{
+    int (*orig)(struct dentry *, const char *) = (void *)sus_path_getxattr_hook.original;
+
+    if (sus_path_dentry_hidden(dentry))
+        return sus_path_meta_hit();
+    if (!orig)
+        return 0;
+    return orig(dentry, name);
+}
+
+static int sus_path_inode_listxattr(struct dentry *dentry)
+{
+    int (*orig)(struct dentry *) = (void *)sus_path_listxattr_hook.original;
+
+    if (sus_path_dentry_hidden(dentry))
+        return sus_path_meta_hit();
+    if (!orig)
+        return 0;
+    return orig(dentry);
+}
+
+static int sus_path_inode_setxattr(struct user_namespace *mnt_userns,
+				   struct dentry *dentry, const char *name,
+				   const void *value, size_t size, int flags)
+{
+    int (*orig)(struct user_namespace *, struct dentry *, const char *,
+                const void *, size_t, int) = (void *)sus_path_setxattr_hook.original;
+
+    if (sus_path_dentry_hidden(dentry))
+        return sus_path_meta_hit();
+    if (!orig)
+        return 0;
+    return orig(mnt_userns, dentry, name, value, size, flags);
+}
+
+static int sus_path_inode_removexattr(struct user_namespace *mnt_userns,
+				      struct dentry *dentry, const char *name)
+{
+    int (*orig)(struct user_namespace *, struct dentry *, const char *) =
+        (void *)sus_path_removexattr_hook.original;
+
+    if (sus_path_dentry_hidden(dentry))
+        return sus_path_meta_hit();
+    if (!orig)
+        return 0;
+    return orig(mnt_userns, dentry, name);
+}
+
+static int sus_path_path_notify(const struct path *path, u64 mask, unsigned int obj_type)
+{
+    int (*orig)(const struct path *, u64, unsigned int) =
+        (void *)sus_path_notify_hook.original;
+
+    /* inotify_add_watch and fanotify_mark arrive here; the callers do not run an
+     * inode permission check on the target itself. */
+    if (path && sus_path_dentry_hidden(path->dentry))
+        return sus_path_meta_hit();
+    if (!orig)
+        return 0;
+    return orig(path, mask, obj_type);
 }
 
 /* ---- DAC layer ----
@@ -2419,11 +2586,11 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
     int i;
 
     n += scnprintf(buf + n, PAGE_SIZE - n,
-                   "hide_from_apps=%d  enoent: getattr=%d perm=%d nameop=%d dac=%d gper=%d path=%d "
+                   "hide_from_apps=%d  enoent: getattr=%d perm=%d nameop=%d meta=%d dac=%d gper=%d path=%d "
                    "(fp=%d kp=%d getname=%d exit=%d)\n",
                    hide_from_apps, atomic_read(&n_enoent_getattr),
                    atomic_read(&n_enoent_perm), atomic_read(&n_enoent_nameop),
-                   atomic_read(&n_enoent_dac),
+                   atomic_read(&n_enoent_meta), atomic_read(&n_enoent_dac),
                    atomic_read(&n_enoent_gper), atomic_read(&n_enoent_path),
                    atomic_read(&n_hit_fp), atomic_read(&n_hit_kp),
                    atomic_read(&n_hit_getname), atomic_read(&n_hit_exit));
@@ -2604,22 +2771,28 @@ int sus_path_init(void)
         pr_info("sus_path: perm hook armed, orig=%ps\n",
                 sus_path_perm_hook.original);
 
-    /* Name-based operations: without these, an app that can write the parent
-     * directory can delete or rename a hidden file. */
+    /* Name-based and metadata operations: without these, an app that can write the
+     * parent directory can delete or rename a hidden file, and a hidden file can
+     * still be probed or modified through statfs/xattr/inotify - or answered with
+     * EPERM/EACCES, which says it exists. */
     {
-        struct ksu_lsm_hook *nameops[] = {
+        struct ksu_lsm_hook *extra[] = {
             &sus_path_unlink_hook, &sus_path_rmdir_hook,
             &sus_path_rename_hook, &sus_path_link_hook,
+            &sus_path_statfs_hook, &sus_path_setattr_hook,
+            &sus_path_getxattr_hook, &sus_path_listxattr_hook,
+            &sus_path_setxattr_hook, &sus_path_removexattr_hook,
+            &sus_path_notify_hook,
         };
         int i;
 
-        for (i = 0; i < (int)ARRAY_SIZE(nameops); i++) {
-            rc = ksu_register_lsm_hook(nameops[i]);
+        for (i = 0; i < (int)ARRAY_SIZE(extra); i++) {
+            rc = ksu_register_lsm_hook(extra[i]);
             if (rc)
-                pr_warn("sus_path: %s hook failed %d\n", nameops[i]->head_name, rc);
+                pr_warn("sus_path: %s hook failed %d\n", extra[i]->head_name, rc);
             else
                 pr_info("sus_path: %s hook armed, orig=%ps\n",
-                        nameops[i]->head_name, nameops[i]->original);
+                        extra[i]->head_name, extra[i]->original);
         }
     }
 
@@ -2662,15 +2835,19 @@ void sus_path_exit(void)
     if (sus_path_perm_hook.entry)
         ksu_unregister_lsm_hook(&sus_path_perm_hook);
     {
-        struct ksu_lsm_hook *nameops[] = {
+        struct ksu_lsm_hook *extra[] = {
             &sus_path_unlink_hook, &sus_path_rmdir_hook,
             &sus_path_rename_hook, &sus_path_link_hook,
+            &sus_path_statfs_hook, &sus_path_setattr_hook,
+            &sus_path_getxattr_hook, &sus_path_listxattr_hook,
+            &sus_path_setxattr_hook, &sus_path_removexattr_hook,
+            &sus_path_notify_hook,
         };
         int i;
 
-        for (i = 0; i < (int)ARRAY_SIZE(nameops); i++) {
-            if (nameops[i]->entry)
-                ksu_unregister_lsm_hook(nameops[i]);
+        for (i = 0; i < (int)ARRAY_SIZE(extra); i++) {
+            if (extra[i]->entry)
+                ksu_unregister_lsm_hook(extra[i]);
         }
     }
     if (sus_path_getattr_hook.entry)
