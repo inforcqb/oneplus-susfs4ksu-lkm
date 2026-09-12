@@ -102,4 +102,11 @@ static inline bool susfs_control_node_allowed(void)
 	return susfs_expose_proc && sus_path_lsm_active();
 }
 
+/* open_redirect, reverse direction, for callers that only have an inode NUMBER:
+ * fdinfo prints "ino:\t<i>" with no device, so this is a lookup by ino alone and
+ * returns false when the number is ambiguous (two rules, same redirected ino) or
+ * when the caller is not one the reverse disguise applies to.  On success
+ * *out_ino is the target inode the caller should be shown. */
+bool susfs_open_redirect_spoof_ino(unsigned long ino, unsigned long *out_ino);
+
 #endif

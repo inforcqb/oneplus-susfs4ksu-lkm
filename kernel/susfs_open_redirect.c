@@ -292,6 +292,34 @@ static struct sus_or_entry *or_find_by_redirected_inode(unsigned long ino, dev_t
 	return NULL;
 }
 
+/* Reverse direction for the one caller that only has a number:
+ * /proc/<pid>/fdinfo/N prints "ino:\t<i>" for the file an fd points at and no
+ * device, so this lookup is by ino alone.  When two rules share that ino the call
+ * refuses to answer - a missed disguise is better than disguising an unrelated
+ * file (the same trade-off the dirent filter documents, made explicit here). */
+bool susfs_open_redirect_spoof_ino(unsigned long ino, unsigned long *out_ino)
+{
+	struct sus_or_entry *e = NULL;
+	int i, hits = 0;
+
+	if (!ino || !out_ino || !or_reverse_visible())
+		return false;
+	for (i = 0; i < nor; i++) {
+		if (READ_ONCE(or_entries[i].dead))
+			continue;
+		smp_rmb();
+		if (or_entries[i].redirected_ino != ino)
+			continue;
+		e = &or_entries[i];
+		if (++hits > 1)
+			return false;
+	}
+	if (hits != 1)
+		return false;
+	*out_ino = e->target_ino;
+	return true;
+}
+
 /* Is `target` another rule's redirected path?  Upstream refuses to touch such a
  * name: "duplicated '%s' cannot be removed/added because it is used for reversed
  * lookup only" (susfs.c:867-881) - that name belongs to the reverse entry of an

@@ -94,6 +94,7 @@
 #include "symbol_resolver.h"
 #include "susfs_abi.h"
 #include "susfs_log.h"
+#include "susfs.h"	/* sus_path_lsm_active, susfs_open_redirect_spoof_ino */
 
 #define DEFAULT_KSU_MNT_ID 2000000000ULL
 
@@ -329,6 +330,7 @@ struct sus_mount_kretprobe_state {
 
 static atomic_t n_fdinfo_entry = ATOMIC_INIT(0);
 static atomic_t n_fdinfo_nolabel = ATOMIC_INIT(0);
+static atomic_t n_fdinfo_ino_rewrites = ATOMIC_INIT(0);
 
 static int sus_mount_fdinfo_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
@@ -339,58 +341,56 @@ static int sus_mount_fdinfo_entry(struct kretprobe_instance *ri, struct pt_regs 
     return 0;
 }
 
-static int sus_mount_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+/* Replaces the decimal that follows `label` in the seq_file's already formatted
+ * buffer, when `mode` says the old number has a disguise:
+ *   mode 0 - mnt_id: sus_mount's own id table (KSU-range id -> host id)
+ *   mode 1 - ino: open_redirect's reverse direction (redirected ino -> target ino)
+ * Returns true when the buffer was rewritten.  The replacement never grows, so
+ * the buffer is only ever shortened and m->count stays consistent. */
+static bool sus_mount_fdinfo_replace(struct seq_file *m, const char *label,
+                                     size_t label_len, int mode)
 {
-    struct sus_mount_kretprobe_state *st = (struct sus_mount_kretprobe_state *)ri->data;
-    struct seq_file *m = st->m;
-    char *buf, digits[12];
-    size_t count, i, pos = 0, len = 0, n = 0;
-    long old_id = 0;
+    char *buf = m->buf, digits[12];
+    size_t count = m->count, i, pos = 0, len = 0, n = 0;
+    unsigned long old = 0, new_val = 0;
+    bool known;
     unsigned int v;
-    int shown;
 
-    if (!m || (long)regs_return_value(regs) != 0)
-        return 0;
-    if (!m->buf || !m->count)
-        return 0;
-    /* The su/ksu domain keeps seeing its own mounts' real ids, exactly like the
-     * mount-line skip above. */
-    if (sus_mount_is_su_domain())
-        return 0;
-
-    buf = m->buf;
-    count = m->count;
-    atomic_inc(&n_fdinfo_hits);
-
-    for (i = 0; i + SUS_MOUNT_MNTID_LABEL_LEN < count; i++) {
-        if (!memcmp(buf + i, SUS_MOUNT_MNTID_LABEL, SUS_MOUNT_MNTID_LABEL_LEN)) {
-            pos = i + SUS_MOUNT_MNTID_LABEL_LEN;
+    for (i = 0; i + label_len < count; i++) {
+        if (!memcmp(buf + i, label, label_len)) {
+            pos = i + label_len;
             break;
         }
     }
-    if (!pos) {
-        atomic_inc(&n_fdinfo_nolabel);
-        return 0;
-    }
+    if (!pos)
+        return false;
 
     while (pos + len < count && len < 10 &&
            buf[pos + len] >= '0' && buf[pos + len] <= '9') {
-        old_id = old_id * 10 + (buf[pos + len] - '0');
+        old = old * 10 + (unsigned long)(buf[pos + len] - '0');
         len++;
     }
     if (!len)
-        return 0;
-    shown = sus_mount_shown_for((int)old_id);
-    if (shown <= 0)
-        return 0;
+        return false;
 
-    v = (unsigned int)shown;
+    if (mode == 0) {
+        int shown = sus_mount_shown_for((int)old);
+
+        known = (shown > 0);
+        new_val = (unsigned long)shown;
+    } else {
+        known = susfs_open_redirect_spoof_ino(old, &new_val);
+    }
+    if (!known)
+        return false;
+
+    v = (unsigned int)new_val;
     while (v) {
         digits[n++] = (char)('0' + v % 10);
         v /= 10;
     }
     if (!n || n > len)			/* never grow the buffer */
-        return 0;
+        return false;
     for (i = 0; i < n / 2; i++) {
         char t = digits[i];
 
@@ -401,7 +401,38 @@ static int sus_mount_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *r
         memmove(buf + pos + n, buf + pos + len, count - (pos + len));
     memcpy(buf + pos, digits, n);
     m->count = count - len + n;
-    atomic_inc(&n_fdinfo_rewrites);
+    return true;
+}
+
+static int sus_mount_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct sus_mount_kretprobe_state *st = (struct sus_mount_kretprobe_state *)ri->data;
+    struct seq_file *m = st->m;
+
+    if (!m || (long)regs_return_value(regs) != 0)
+        return 0;
+    if (!m->buf || !m->count)
+        return 0;
+    /* The su/ksu domain keeps seeing its own mounts' real ids, exactly like the
+     * mount-line skip above. */
+    if (sus_mount_is_su_domain())
+        return 0;
+
+    atomic_inc(&n_fdinfo_hits);
+
+    /* mnt_id first: it appears before ino, and replace() rescans the buffer, so
+     * shortening the first one cannot make the second lookup miss. */
+    if (sus_mount_fdinfo_replace(m, SUS_MOUNT_MNTID_LABEL, SUS_MOUNT_MNTID_LABEL_LEN, 0))
+        atomic_inc(&n_fdinfo_rewrites);
+    else
+        atomic_inc(&n_fdinfo_nolabel);
+
+    /* The other half of the same disguise: fdinfo names the inode the fd points
+     * at, and for an open_redirect rule that is the redirected file - naming it
+     * would hand a detector the file the redirection really opened.  Upstream
+     * covers this in the same function (susfs_open_redirect_spoof_seq_show). */
+    if (sus_mount_fdinfo_replace(m, "ino:\t", 5, 1))
+        atomic_inc(&n_fdinfo_ino_rewrites);
     return 0;
 }
 
@@ -534,12 +565,13 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
 {
     return scnprintf(buf, PAGE_SIZE,
                      "idmap=%d  hide=%d su_domain=%d\n"
-                     "fdinfo: entry=%d hits=%d rewrites=%d nolabel=%d\n"
+                     "fdinfo: entry=%d hits=%d mntid_rewrites=%d ino_rewrites=%d nolabel=%d\n"
                      "statx: entry=%d ret=%d hits=%d rewrites=%d nobuf=%d err=%d copyfail=%d nomap=%d "
                      "(sys=%d do=%d)\n",
                      n_idmap, mount_registered, (int)sus_mount_is_su_domain(),
                      atomic_read(&n_fdinfo_entry), atomic_read(&n_fdinfo_hits),
-                     atomic_read(&n_fdinfo_rewrites), atomic_read(&n_fdinfo_nolabel),
+                     atomic_read(&n_fdinfo_rewrites), atomic_read(&n_fdinfo_ino_rewrites),
+                     atomic_read(&n_fdinfo_nolabel),
                      atomic_read(&n_statx_entry), atomic_read(&n_statx_ret),
                      atomic_read(&n_statx_hits), atomic_read(&n_statx_rewrites),
                      atomic_read(&n_statx_nobuf), atomic_read(&n_statx_err),
