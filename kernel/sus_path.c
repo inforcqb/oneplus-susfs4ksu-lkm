@@ -1580,8 +1580,10 @@ module_param(fp_all, bool, 0644);
 static int fp_dump;
 module_param(fp_dump, int, 0644);
 /* Timing cover for a refused path, in nanoseconds, plus its jitter - see
- * sus_path_fp_cover_gap().  fp_delay_ns=0 turns it off. */
-static int fp_delay_ns = 1000;
+ * sus_path_fp_cover_gap().  fp_delay_ns is -1 for the per-syscall defaults
+ * measured below, >= 0 to override all of them with one value, and 0 to switch
+ * the cover off entirely. */
+static int fp_delay_ns = -1;
 module_param(fp_delay_ns, int, 0644);
 static int fp_delay_jitter_ns = 300;
 module_param(fp_delay_jitter_ns, int, 0644);
@@ -1590,7 +1592,7 @@ module_param(fp_delay_jitter_ns, int, 0644);
  * root-level observer can read it back.  The counter in hide_list is enough. */
 static int fp_log_hits;
 module_param(fp_log_hits, int, 0644);
-static void sus_path_fp_cover_gap(void);
+static void sus_path_fp_cover_gap(unsigned int base_ns);
 static int sus_path_fp_arm(void);
 static void sus_path_fp_dump(void);
 /* Non-zero while the fp layer owns the syscall entries; the sys_exit rewrite in
@@ -1715,32 +1717,34 @@ __attribute__((visibility("hidden"))) int sus_path_fp_decide(u64 uregs_arg, int 
 	if (fp_log_hits)
 		pr_info_ratelimited("sus_path: path hit '%s' (uid=%u) [fp]\n",
 				    buf, current_uid().val);
-	sus_path_fp_cover_gap();
 	return 1;
 }
 
 /* Timing cover.
  *
  * Refusing at the syscall entry is measurably faster than letting the real path
- * lookup fail: measured on this device, a hidden path answers in ~390 ns while a
- * genuinely absent path in the same directory costs 1070 ns (newfstatat) to
- * 2570 ns (openat).  An app can compare the two and learn that a path exists but
- * is hidden - which is the whole thing this module exists to prevent.  Upstream
- * SUSFS does not have the gap because it refuses inside walk_component, so the
- * lookup runs and fails the normal way.
+ * lookup fail: measured on this device with a warm negative dentry in the same
+ * directory, a hidden path answers in 269-276 ns while the absent path costs
+ * 1680 ns (newfstatat), 1956 ns (statx), 2331 ns (faccessat) or 2415 ns
+ * (openat).  That gap is a side channel - sample both a few hundred times and you
+ * know the path exists but is hidden, which is the one thing this module exists to
+ * prevent.  Upstream SUSFS has no such gap because it refuses inside
+ * walk_component: the lookup runs and fails the normal way.
  *
- * So spend the difference here.  A busy wait (ndelay), not a sleep: msleep() and
- * usleep_range() hand the CPU to the scheduler and the gap that opens is tens of
- * microseconds and wildly variable - far bigger than the difference being hidden,
- * and a signature of its own.  The jitter keeps "always exactly one microsecond"
- * from becoming the next fingerprint.
+ * So spend the difference where the refusal happens.  A busy wait (ndelay), not a
+ * sleep, and that is deliberate: msleep() and usleep_range() hand the CPU to the
+ * scheduler and the gap that opens is tens of microseconds and wildly variable -
+ * far larger than what is being hidden, and a signature of its own.  Measured:
+ * covering 3000 ns instead of 1000 makes the hidden path *slower* than the absent
+ * one, so over-correction is its own tell.
  *
- * The value is a starting point measured for a shallow, cached path; deeper
- * directories cost more to fail, so it is a knob, not a constant. */
-static void sus_path_fp_cover_gap(void)
+ * base_ns is per syscall because the four targets do not fail equally fast (the
+ * numbers above); the jitter keeps "always exactly N" from becoming the next
+ * fingerprint. */
+static void sus_path_fp_cover_gap(unsigned int base_ns)
 {
-	unsigned int ns = (unsigned int)fp_delay_ns;
-	unsigned int jitter = (unsigned int)fp_delay_jitter_ns;
+	unsigned int ns = fp_delay_ns >= 0 ? (unsigned int)fp_delay_ns : base_ns;
+	unsigned int jitter = (unsigned int)(fp_delay_jitter_ns > 0 ? fp_delay_jitter_ns : 0);
 
 	if (!ns)
 		return;
@@ -1755,23 +1759,29 @@ static void sus_path_fp_cover_gap(void)
 	ndelay(ns);
 }
 
-#define SUSFS_FP_WRAPPER(w, argno)					\
+/* The base values are measured, not guessed: each is what the corresponding
+ * syscall costs when it fails the real way on this device, minus the ~270 ns the
+ * refusal already spends.  readlinkat and execve are estimates of the same shape
+ * (a failed execve does more work than a failed stat). */
+#define SUSFS_FP_WRAPPER(w, argno, cover_ns)				\
 	static susfs_syscall_fn_t susfs_fp_orig_##w;			\
 	static __nocfi long susfs_fp_##w(const struct pt_regs *regs)	\
 	{								\
-		if (sus_path_fp_decide((u64)(unsigned long)regs, argno))	\
+		if (sus_path_fp_decide((u64)(unsigned long)regs, argno)) {	\
+			sus_path_fp_cover_gap(cover_ns);		\
 			return -ENOENT;					\
+		}							\
 		return READ_ONCE(susfs_fp_orig_##w)(regs);		\
 	}
 
-SUSFS_FP_WRAPPER(newfstatat, 1)
-SUSFS_FP_WRAPPER(statx, 1)
-SUSFS_FP_WRAPPER(faccessat, 1)
-SUSFS_FP_WRAPPER(faccessat2, 1)
-SUSFS_FP_WRAPPER(openat, 1)
-SUSFS_FP_WRAPPER(openat2, 1)
-SUSFS_FP_WRAPPER(readlinkat, 1)
-SUSFS_FP_WRAPPER(execve, 0)
+SUSFS_FP_WRAPPER(newfstatat, 1, 1300)
+SUSFS_FP_WRAPPER(statx, 1, 1150)
+SUSFS_FP_WRAPPER(faccessat, 1, 1700)
+SUSFS_FP_WRAPPER(faccessat2, 1, 1700)
+SUSFS_FP_WRAPPER(openat, 1, 1900)
+SUSFS_FP_WRAPPER(openat2, 1, 1900)
+SUSFS_FP_WRAPPER(readlinkat, 1, 1700)
+SUSFS_FP_WRAPPER(execve, 0, 2200)
 
 static struct susfs_fp_hook fp_hooks[] = {
 	{ __NR_newfstatat,  "susfs_fp_newfstatat",  "__arm64_sys_newfstatat",  susfs_fp_newfstatat,  &susfs_fp_orig_newfstatat,  NULL, false },
