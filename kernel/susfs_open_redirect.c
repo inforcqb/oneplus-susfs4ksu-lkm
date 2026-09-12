@@ -585,6 +585,11 @@ static int or_maps_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 			    (unsigned int)MAJOR(e->target_dev),
 			    (unsigned int)MINOR(e->target_dev),
 			    (unsigned long)e->target_ino);
+	/* Keep the column width: the kernel padded the name out to a fixed column,
+	 * so a shorter run would pull the name left and a line that does not line up
+	 * with its neighbours is visible on its own. */
+	while (new_len < old_len && new_len < (int)sizeof(new) - 1)
+		new[new_len++] = ' ';
 	if (old_len > 0 && new_len > 0 &&
 	    or_buf_replace(m, old, (size_t)old_len, new, (size_t)new_len))
 		atomic_inc(&or_rev_maps_rewrites);

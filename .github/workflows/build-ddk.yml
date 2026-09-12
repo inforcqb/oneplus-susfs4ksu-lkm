@@ -181,6 +181,25 @@ jobs:
           path: /tmp/susfs_mmap
           if-no-files-found: warn
 
+      # The second door to a hidden mapping's content: /proc/self/mem and
+      # process_vm_readv(2), both read by the process that owns the mapping - the
+      # only way to tell whether a remote-memory hook actually refuses.
+      - name: Build remote-memory probe
+        run: |
+          clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
+                -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
+                -o /tmp/susfs_memrd tools/susfs_memrd.c
+          file /tmp/susfs_memrd
+          ls -la /tmp/susfs_memrd
+
+      - name: Upload remote-memory probe
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs_memrd
+          path: /tmp/susfs_memrd
+          if-no-files-found: warn
+
       # The detector's view of a hidden mount: the mnt_id that /proc/self/fdinfo/N
       # prints and statx(2) returns, checked against the ids mountinfo lists.
       - name: Build mnt_id cross-check

@@ -470,6 +470,88 @@ static struct kprobe kp_map_walk_vma = {
     .pre_handler = sus_map_skip_walk_vma_pre,
 };
 
+/* ---- /proc/<pid>/mem (and ptrace): the page-fetch primitive ----
+ *
+ * Upstream's fifth SUS_MAP site is __access_remote_vm() (mm/memory.c, patch:
+ * 5667-5687): after taking mmap_read_lock it resolves vma = vma_lookup(mm, addr)
+ * ONCE and, inside the transfer loop, breaks out when that vma's file is
+ * registered - so a read (or write) that starts inside a hidden mapping
+ * transfers nothing at all.
+ *
+ * The function cannot be hooked usefully at its entry: the lock is taken INSIDE
+ * it (mmap_read_lock_killable), and resolving a vma without that lock is a
+ * use-after-free waiting for the target process to munmap.  What can be hooked is
+ * the primitive the loop calls with the lock already held:
+ *
+ *   __access_remote_vm()          -> get_user_pages_remote(mm, addr, 1, ...)
+ *   process_vm_rw_single_vec()    -> pin_user_pages_remote(mm, pa, ...)   (both
+ *                                    *_remote variants require mmap_read_lock)
+ *
+ * Short-circuiting that call (pre_handler returns 1 after x0 = 0 and pc = lr)
+ * makes the caller see "no page transferred": __access_remote_vm breaks out of
+ * its loop and returns the bytes it had already moved - 0 when the read starts
+ * inside the mapping, which is upstream's result - and process_vm_readv's
+ * process_vm_rw_single_vec takes its `pinned_pages <= 0` error path.  Nothing is
+ * pinned on the way, because the call never runs.
+ *
+ * The second primitive is NOT needed for upstream parity: upstream patches
+ * __access_remote_vm only, and process_vm_readv does not go through it (measured
+ * from this kernel's mm/process_vm_access.c: process_vm_rw_single_vec calls
+ * pin_user_pages_remote directly).  It is hooked here because the same short
+ * circuit closes it for one more probe, and because "the API that reads another
+ * process' memory" is the loudest cross-check there is.
+ *
+ * Cost control: the handler runs on every *_remote page fetch in the kernel while
+ * a rule exists, so the two cheapest tests come first (no rules -> one load;
+ * uid < 10000 -> the gate), and find_vma() only runs for callers the gate lets
+ * through. */
+static atomic_t n_gup_calls = ATOMIC_INIT(0);
+static atomic_t n_pin_gup_calls = ATOMIC_INIT(0);
+static atomic_t n_vm_hides = ATOMIC_INIT(0);
+
+static int sus_map_vm_access_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+    struct mm_struct *mm = (struct mm_struct *)regs->regs[0];
+    unsigned long addr = regs->regs[1];
+    struct vm_area_struct *vma;
+    struct inode *inode;
+
+    if (!smp_load_acquire(&nmap))
+        return 0;
+    if (!sus_map_gate_ok())
+        return 0;
+    if (!mm || !addr)
+        return 0;
+
+    atomic_inc(kp == &kp_pin_gup ? &n_pin_gup_calls : &n_gup_calls);
+
+    /* Safe without re-taking anything: both callers hold mmap_read_lock, which is
+     * what the `*_remote` contract of this primitive means. */
+    vma = find_vma(mm, addr);
+    if (!vma || !vma->vm_file)
+        return 0;
+    inode = file_inode(vma->vm_file);
+    if (!inode)
+        return 0;
+    if (!sus_map_lookup(inode->i_ino, inode->i_sb->s_dev))
+        return 0;
+
+    atomic_inc(&n_vm_hides);
+    regs_set_return_value(regs, 0);     /* "nothing transferred" */
+    regs->pc = regs->regs[30];          /* skip the call: nothing is pinned */
+    return 1;
+}
+
+static struct kprobe kp_gup_remote = {
+    .symbol_name = "get_user_pages_remote",
+    .pre_handler = sus_map_vm_access_pre,
+};
+
+static struct kprobe kp_pin_gup = {
+    .symbol_name = "pin_user_pages_remote",
+    .pre_handler = sus_map_vm_access_pre,
+};
+
 /* ---- /proc/<pid>/map_files/<start>-<end> ----
  *
  * Each of those entries is a symlink to the file mapped at that range, so `ls -l`
@@ -558,6 +640,7 @@ static bool kr_map_files_ok;
 /* Kept in one table so init and exit cannot drift apart. */
 static struct kprobe *const map_probes[] = {
     &kp_map, &kp_map_smap, &kp_map_walk, &kp_map_walk_vma,
+    &kp_gup_remote, &kp_pin_gup,
 };
 #define N_MAP_PROBES ARRAY_SIZE(map_probes)
 static bool map_registered;
@@ -580,6 +663,7 @@ static int sus_map_stat_show(char *buf, const struct kernel_param *kp)
     return scnprintf(buf, PAGE_SIZE,
                      "rules=%d armed=%d/%d walk_seen=%d walk_vma=%d walk_skipped=%d "
                      "ops_hit=%d scan_fail=%d nofile=%d nomatch=%d getlink: calls=%d skip=%d nomatch=%d hides=%d\n"
+                     "vm: gup_calls=%d pin_calls=%d hides=%d\n"
                      "ops: smaps=%px smaps_shmem=%px pagemap=%px\n",
                      nmap, armed, (int)N_MAP_PROBES,
                      atomic_read(&n_walk_seen), atomic_read(&n_walk_seen_vma),
@@ -588,6 +672,8 @@ static int sus_map_stat_show(char *buf, const struct kernel_param *kp)
                      atomic_read(&n_walk_nofile), atomic_read(&n_walk_nomatch),
                      atomic_read(&n_getlink_calls), atomic_read(&n_getlink_skip),
                      atomic_read(&n_getlink_nomatch), atomic_read(&n_map_files_hides),
+                     atomic_read(&n_gup_calls), atomic_read(&n_pin_gup_calls),
+                     atomic_read(&n_vm_hides),
                      sus_map_ops_smaps, sus_map_ops_smaps_shmem,
                      sus_map_ops_pagemap);
 }

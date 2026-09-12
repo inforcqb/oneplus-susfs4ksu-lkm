@@ -324,27 +324,90 @@ static void kstat_table_clear(void)
  *
  * Upstream's susfs_sus_kstat_spoof_show_map_vma() rewrites the dev/ino on the
  * line from inside show_map_vma(), where dev and ino are still local variables.
- * An LKM cannot reach those locals.  Re-printing the line ourselves would mean
- * reproducing the kernel's column padding exactly (show_vma_header_prefix uses
- * seq_setwidth()/seq_pad(), neither exported, and m->pad_until is private
- * state); a line that is padded differently from its neighbours is itself a
- * tell.  So the line is dropped instead.
+ * An LKM cannot reach those locals, and re-printing the line would mean
+ * reproducing the kernel's column padding (seq_setwidth()/seq_pad() are not
+ * exported, m->pad_until is private state) - a line padded differently from its
+ * neighbours is itself a tell.
  *
- * That still closes the detection this exists for: a stat() that reports one
- * ino while /proc/<pid>/maps reports the real one is a direct contradiction,
- * and it is the cheapest cross-check there is.  A mapped file that must stay
- * listed is what sus_map is for.
+ * So the already-formatted line is edited instead, at the return of the function
+ * that printed it: the "maj:min ino" run is located by rendering the REAL values
+ * exactly the way fs/proc/task_mmu.c renders them (seq_put_hex_ll for major/minor,
+ * lowercase, minimum width 2; seq_put_decimal_ull for the ino) and is replaced by
+ * the spoofed ones.
+ *
+ * This replaces an earlier version that DROPPED the whole line.  Dropping closed
+ * the stat-vs-maps contradiction, but it changed the line count - a mapping that
+ * is listed for every process on the device except this one is its own signal,
+ * and the file's own /proc/<pid>/smaps stayed unfiltered anyway because the
+ * smaps header comes from a different call site.  Rewriting has neither problem.
+ *
+ * The spoofed dev is stored the way userspace sees st_dev (new_encode_dev), so it
+ * has to be decoded back to major/minor - new_decode_dev, i.e. the kernel's own
+ * inverse - before it can be printed in the maj:min column.  Upstream substitutes
+ * its target_dev into the RAW dev local instead, which prints "0:fe4b" for a file
+ * whose stat() says 254:75; this decodes, so the two agree.
  *
  * Armed on the first rule that spoofs ino or dev, not before. */
-static int kstat_show_map_vma_pre(struct kprobe *kp, struct pt_regs *regs)
+
+/* Same buffer edit as the maps name/numbers rewrite in susfs_open_redirect.c:
+ * replace the first occurrence of old[] with new[], growing only when the buffer
+ * has room (no room -> leave the line alone rather than truncate it). */
+static bool kstat_buf_replace(struct seq_file *m, const char *old, size_t old_len,
+			      const char *new, size_t new_len)
 {
-	struct vm_area_struct *vma = (struct vm_area_struct *)regs->regs[1];
+	char *buf = m->buf;
+	size_t count = m->count, i, pos = 0;
+
+	if (!old_len || !new_len || old_len > count)
+		return false;
+	for (i = 0; i + old_len <= count; i++) {
+		if (!memcmp(buf + i, old, old_len)) {
+			pos = i;
+			break;
+		}
+	}
+	if (i + old_len > count)
+		return false;
+	if (new_len > old_len && count + (new_len - old_len) >= m->size)
+		return false;
+	if (new_len != old_len)
+		memmove(buf + pos + new_len, buf + pos + old_len, count - (pos + old_len));
+	memcpy(buf + pos, new, new_len);
+	m->count = count - old_len + new_len;
+	return true;
+}
+
+struct kstat_map_args {
+	struct seq_file *m;
+	struct vm_area_struct *vma;
+};
+
+static atomic_t n_kstat_map_hits = ATOMIC_INIT(0);
+static atomic_t n_kstat_map_rewrites = ATOMIC_INIT(0);
+
+static int kstat_map_vma_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct kstat_map_args *a = (struct kstat_map_args *)ri->data;
+
+	a->m = (struct seq_file *)regs->regs[0];
+	a->vma = (struct vm_area_struct *)regs->regs[1];
+	return 0;
+}
+
+static int kstat_map_vma_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	const struct kstat_map_args *a = (const struct kstat_map_args *)ri->data;
+	struct seq_file *m = a->m;
+	struct vm_area_struct *vma = a->vma;
 	struct sus_kstat_snapshot snap;
 	struct inode *inode;
+	char old[48], new[48];
+	unsigned int major, minor;
+	int old_len, new_len;
 
 	if (susfs_kstat_table_empty())
 		return 0;
-	if (!vma || !vma->vm_file)
+	if (!m || !m->buf || !m->count || !vma || !vma->vm_file)
 		return 0;
 	inode = file_inode(vma->vm_file);
 	if (!inode)
@@ -357,15 +420,51 @@ static int kstat_show_map_vma_pre(struct kprobe *kp, struct pt_regs *regs)
 	if (!(snap.flags & (KSTAT_SPOOF_INO | KSTAT_SPOOF_DEV)))
 		return 0;
 
-	/* Skip the line by returning straight to the caller (x0 is irrelevant:
-	 * show_map_vma returns void). */
-	regs->pc = regs->regs[30];
-	return 1;
+	atomic_inc(&n_kstat_map_hits);
+
+	/* What the kernel just printed is MAJOR()/MINOR() of the RAW s_dev. */
+	old_len = scnprintf(old, sizeof(old), "%02x:%02x %lu",
+			    (unsigned int)MAJOR(inode->i_sb->s_dev),
+			    (unsigned int)MINOR(inode->i_sb->s_dev),
+			    (unsigned long)inode->i_ino);
+
+	if (snap.flags & KSTAT_SPOOF_DEV) {
+		unsigned int enc = (unsigned int)snap.spoofed_dev;
+
+		/* new_decode_dev(): the inverse of what cp_new_stat() encoded, so a
+		 * file whose stat() says 254:75 prints "fe:4b" here as well. */
+		major = (enc & 0xfff00u) >> 8;
+		minor = (enc & 0xffu) | ((enc >> 12) & 0xfff00u);
+	} else {
+		major = (unsigned int)MAJOR(inode->i_sb->s_dev);
+		minor = (unsigned int)MINOR(inode->i_sb->s_dev);
+	}
+	new_len = scnprintf(new, sizeof(new), "%02x:%02x %lu", major, minor,
+			    (snap.flags & KSTAT_SPOOF_INO)
+				    ? snap.spoofed_ino
+				    : (unsigned long)inode->i_ino);
+
+	/* Keep the column width.  The kernel padded the name out to a fixed column,
+	 * so a SHORTER run would pull the name left by the difference - and a line
+	 * whose name does not line up with its neighbours is visible on its own.
+	 * Space-padding the run keeps the name exactly where the kernel put it; a
+	 * LONGER run does shift it, which is the rare case (a spoofed ino with more
+	 * digits than the real one) and still leaves the line self-consistent. */
+	while (new_len < old_len && new_len < (int)sizeof(new) - 1)
+		new[new_len++] = ' ';
+
+	if (old_len > 0 && new_len > 0 &&
+	    kstat_buf_replace(m, old, (size_t)old_len, new, (size_t)new_len))
+		atomic_inc(&n_kstat_map_rewrites);
+	return 0;
 }
 
-static struct kprobe kp_kstat_map_vma = {
-	.symbol_name = "show_map_vma",
-	.pre_handler = kstat_show_map_vma_pre,
+static struct kretprobe krp_kstat_map_vma = {
+	.kp.symbol_name = "show_map_vma",
+	.entry_handler = kstat_map_vma_entry,
+	.handler = kstat_map_vma_ret,
+	.data_size = sizeof(struct kstat_map_args),
+	.maxactive = 16,
 };
 
 static bool kstat_maps_registered;
@@ -378,12 +477,13 @@ static void kstat_maps_arm(void)
 
 	if (kstat_maps_registered)
 		return;
-	rc = register_kprobe(&kp_kstat_map_vma);
+	rc = register_kretprobe(&krp_kstat_map_vma);
 	if (rc)
-		pr_warn("susfs_kstat: register_kprobe(show_map_vma) failed %d\n", rc);
+		pr_warn("susfs_kstat: register_kretprobe(show_map_vma) failed %d - maps keeps printing the real dev:ino\n",
+			rc);
 	else {
 		kstat_maps_registered = true;
-		SUSFS_LOGI("susfs_kstat: maps hook armed (show_map_vma)\n");
+		SUSFS_LOGI("susfs_kstat: maps hook armed (kretprobe show_map_vma)\n");
 	}
 }
 
@@ -391,7 +491,7 @@ static void kstat_maps_disarm(void)
 {
 	if (!kstat_maps_registered)
 		return;
-	unregister_kprobe(&kp_kstat_map_vma);
+	unregister_kretprobe(&krp_kstat_map_vma);
 	kstat_maps_registered = false;
 }
 
@@ -1136,6 +1236,12 @@ static int kstat_proc_show(struct seq_file *m, void *v)
 		}
 	}
 	mutex_unlock(&kstat_lock);
+	/* "armed" is not "fired": the maps hook has to be readable the same way the
+	 * other feature hooks are, or a rewrite that never happens looks identical to
+	 * one that works. */
+	seq_printf(m, "maps: armed=%d hits=%d rewrites=%d\n",
+		   kstat_maps_registered, atomic_read(&n_kstat_map_hits),
+		   atomic_read(&n_kstat_map_rewrites));
 	return 0;
 }
 
