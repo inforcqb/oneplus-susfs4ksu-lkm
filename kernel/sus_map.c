@@ -299,6 +299,11 @@ static atomic_t n_walk_nomatch = ATOMIC_INIT(0);	/* inode is not a rule */
 static atomic_t n_walk_dbg_left = ATOMIC_INIT(4);
 /* map_files symlink resolutions that were turned into ENOENT. */
 static atomic_t n_map_files_hides = ATOMIC_INIT(0);
+/* Reachability of that hook, split the way the walk probe had to be: "the probe
+ * ran" and "the probe matched" are different claims. */
+static atomic_t n_getlink_calls = ATOMIC_INIT(0);
+static atomic_t n_getlink_skip = ATOMIC_INIT(0);
+static atomic_t n_getlink_nomatch = ATOMIC_INIT(0);
 
 /* walk_dbg: name every ops pointer that reaches the two primitives, once per
  * distinct value.  Off by default - it costs a linear scan per call. */
@@ -522,12 +527,23 @@ static int sus_map_getlink_ret(struct kretprobe_instance *ri, struct pt_regs *re
 {
     const char *target = (const char *)regs_return_value(regs);
 
-    if (!target || IS_ERR(target))
+    atomic_inc(&n_getlink_calls);
+    if (!target || IS_ERR(target)) {
+        atomic_inc(&n_getlink_skip);
         return 0;
-    if (!sus_map_gate_ok())
+    }
+    if (!sus_map_gate_ok()) {
+        atomic_inc(&n_getlink_skip);
         return 0;
-    if (!sus_map_path_lookup(target))
+    }
+    if (!sus_map_path_lookup(target)) {
+        /* Printed (a couple of times, then ratelimited) because a miss here is
+         * indistinguishable from "the hook never ran": the path d_path renders may
+         * not be byte-identical to the path the rule was registered with. */
+        atomic_inc(&n_getlink_nomatch);
+        pr_info_ratelimited("sus_map: map_files target not matched: '%s'\n", target);
         return 0;
+    }
 
     atomic_inc(&n_map_files_hides);
     pr_info_ratelimited("sus_map: hid map_files symlink to '%s' (uid=%u)\n",
@@ -567,14 +583,15 @@ static int sus_map_stat_show(char *buf, const struct kernel_param *kp)
 
     return scnprintf(buf, PAGE_SIZE,
                      "rules=%d armed=%d/%d walk_seen=%d walk_vma=%d walk_skipped=%d "
-                     "ops_hit=%d scan_fail=%d nofile=%d nomatch=%d map_files_hides=%d\n"
+                     "ops_hit=%d scan_fail=%d nofile=%d nomatch=%d getlink: calls=%d skip=%d nomatch=%d hides=%d\n"
                      "ops: smaps=%px smaps_shmem=%px pagemap=%px\n",
                      nmap, armed, (int)N_MAP_PROBES,
                      atomic_read(&n_walk_seen), atomic_read(&n_walk_seen_vma),
                      atomic_read(&n_walk_skip),
                      atomic_read(&n_walk_ops_hit), atomic_read(&n_walk_scan_fail),
                      atomic_read(&n_walk_nofile), atomic_read(&n_walk_nomatch),
-                     atomic_read(&n_map_files_hides),
+                     atomic_read(&n_getlink_calls), atomic_read(&n_getlink_skip),
+                     atomic_read(&n_getlink_nomatch), atomic_read(&n_map_files_hides),
                      sus_map_ops_smaps, sus_map_ops_smaps_shmem,
                      sus_map_ops_pagemap);
 }
