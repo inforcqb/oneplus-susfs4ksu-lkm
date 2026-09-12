@@ -2022,7 +2022,6 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
          * finds nothing for ino 0 either.  So neither implementation filters the
          * listing here; the by-inode layers still hide the path, and a name-based
          * fallback would hide unrelated entries that happen to report d_ino 0 as well. */
-         * happen to report d_ino 0 as well. */
         pr_warn("sus_path: '%s' reports ino 0 - hidden by inode, but a directory listing cannot be filtered for it\n",
                 info.target_pathname);
     }
