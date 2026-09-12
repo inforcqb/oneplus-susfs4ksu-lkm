@@ -39,6 +39,8 @@
  * equivalent here on purpose - see the note above sus_path_inode_hidden().
  */
 #include <linux/module.h>
+#include <linux/delay.h>	/* ndelay, for the timing cover */
+#include <linux/random.h>	/* prandom_u32_max, for its jitter */
 #include <linux/tracepoint.h>
 #include <trace/events/syscalls.h>
 #include <asm/syscall.h>
@@ -1577,6 +1579,18 @@ module_param(fp_all, bool, 0644);
  * This is the zero-risk first run on a new kernel (no write, no BTI/PAC bet). */
 static int fp_dump;
 module_param(fp_dump, int, 0644);
+/* Timing cover for a refused path, in nanoseconds, plus its jitter - see
+ * sus_path_fp_cover_gap().  fp_delay_ns=0 turns it off. */
+static int fp_delay_ns = 1000;
+module_param(fp_delay_ns, int, 0644);
+static int fp_delay_jitter_ns = 300;
+module_param(fp_delay_jitter_ns, int, 0644);
+/* Off by default: the log line is not free, and writing it on every hit both
+ * skews the timing this delay is trying to match and records the access where a
+ * root-level observer can read it back.  The counter in hide_list is enough. */
+static int fp_log_hits;
+module_param(fp_log_hits, int, 0644);
+static void sus_path_fp_cover_gap(void);
 static int sus_path_fp_arm(void);
 static void sus_path_fp_dump(void);
 /* Non-zero while the fp layer owns the syscall entries; the sys_exit rewrite in
@@ -1698,9 +1712,47 @@ __attribute__((visibility("hidden"))) int sus_path_fp_decide(u64 uregs_arg, int 
 	/* Same accounting as the kprobe path, so the counters and the log stay
 	 * usable no matter which layer answered. */
 	atomic_inc(&n_enoent_path);
-	pr_info_ratelimited("sus_path: path hit '%s' (uid=%u) [fp]\n",
-			    buf, current_uid().val);
+	if (fp_log_hits)
+		pr_info_ratelimited("sus_path: path hit '%s' (uid=%u) [fp]\n",
+				    buf, current_uid().val);
+	sus_path_fp_cover_gap();
 	return 1;
+}
+
+/* Timing cover.
+ *
+ * Refusing at the syscall entry is measurably faster than letting the real path
+ * lookup fail: measured on this device, a hidden path answers in ~390 ns while a
+ * genuinely absent path in the same directory costs 1070 ns (newfstatat) to
+ * 2570 ns (openat).  An app can compare the two and learn that a path exists but
+ * is hidden - which is the whole thing this module exists to prevent.  Upstream
+ * SUSFS does not have the gap because it refuses inside walk_component, so the
+ * lookup runs and fails the normal way.
+ *
+ * So spend the difference here.  A busy wait (ndelay), not a sleep: msleep() and
+ * usleep_range() hand the CPU to the scheduler and the gap that opens is tens of
+ * microseconds and wildly variable - far bigger than the difference being hidden,
+ * and a signature of its own.  The jitter keeps "always exactly one microsecond"
+ * from becoming the next fingerprint.
+ *
+ * The value is a starting point measured for a shallow, cached path; deeper
+ * directories cost more to fail, so it is a knob, not a constant. */
+static void sus_path_fp_cover_gap(void)
+{
+	unsigned int ns = (unsigned int)fp_delay_ns;
+	unsigned int jitter = (unsigned int)fp_delay_jitter_ns;
+
+	if (!ns)
+		return;
+	if (jitter) {
+		int delta = (int)prandom_u32_max(jitter * 2 + 1) - (int)jitter;
+
+		if (delta > 0)
+			ns += (unsigned int)delta;
+		else if ((unsigned int)(-delta) < ns)
+			ns -= (unsigned int)(-delta);
+	}
+	ndelay(ns);
 }
 
 #define SUSFS_FP_WRAPPER(w, argno)					\
