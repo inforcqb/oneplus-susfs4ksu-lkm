@@ -49,6 +49,23 @@ ls /sys/module/susfs_guard_lkm/parameters/   # 参数节点在，也说明已加
 
 重复 `insmod` 会因为模块已在内存里而失败（`init_module failed: File exists (os error 17)`，即 `-EEXIST`）；想重载就先 `rmmod susfs_guard_lkm`。
 
+**模块没加载时，`ksu_susfs add_*` 会报"不支持"而不是"没加载"**：
+
+```
+[-] CMD: '0x555c0', SUSFS operation not supported, please enable it in kernel
+```
+
+原因：内核若没有接管 reboot supercall，`reboot(2)` 直接返回 `-EINVAL`，而工具只看 `payload.err` ——
+它自己预置的 `126`（`ERR_CMD_NOT_SUPPORTED`）原封不动，于是"没人应答"被显示成"内核不支持"。
+判断办法同上（先确认 `/sys/module/susfs_guard_lkm`），必要时看 dmesg 里有没有
+`susfs_guard_lkm: loaded.` 这一行。
+
+`add_open_redirect` 需要**三个**参数（工具自己的 usage 少印了第三个）：
+
+```sh
+ksu_susfs add_open_redirect <target> <redirected> <uid_scheme>   # uid_scheme: 0..4
+```
+
 ## 移植参考
 
 - [susfs4ksu](https://gitlab.com/simonpunk/susfs4ksu) — SUSFS 功能逻辑与 hook 点（GPL-3.0）
