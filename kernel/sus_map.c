@@ -507,10 +507,19 @@ static struct kprobe kp_map_walk_vma = {
  * through. */
 static atomic_t n_gup_calls = ATOMIC_INIT(0);
 static atomic_t n_pin_gup_calls = ATOMIC_INIT(0);
+static atomic_t n_gup_inner_calls = ATOMIC_INIT(0);
 static atomic_t n_vm_hides = ATOMIC_INIT(0);
 
 static int sus_map_vm_access_pre(struct kprobe *kp, struct pt_regs *regs);
 
+/* All three are thin layers of the same code, and which one a given call site
+ * reaches is decided by LTO - measured: the __access_remote_vm path calls
+ * get_user_pages_remote out of line (its probe fired), while
+ * process_vm_readv's call to pin_user_pages_remote was inlined away (its probe
+ * stayed at 0 for every run).  The innermost symbol, __get_user_pages_remote, is
+ * what both wrappers end in and takes the same (mm, start) as its first two
+ * arguments, so it is armed as well; a short circuit at an outer layer stops the
+ * inner one from ever being reached, so no call is filtered twice. */
 static struct kprobe kp_gup_remote = {
     .symbol_name = "get_user_pages_remote",
     .pre_handler = sus_map_vm_access_pre,
@@ -518,6 +527,11 @@ static struct kprobe kp_gup_remote = {
 
 static struct kprobe kp_pin_gup = {
     .symbol_name = "pin_user_pages_remote",
+    .pre_handler = sus_map_vm_access_pre,
+};
+
+static struct kprobe kp_gup_remote_inner = {
+    .symbol_name = "__get_user_pages_remote",
     .pre_handler = sus_map_vm_access_pre,
 };
 
@@ -535,7 +549,8 @@ static int sus_map_vm_access_pre(struct kprobe *kp, struct pt_regs *regs)
     if (!mm || !addr)
         return 0;
 
-    atomic_inc(kp == &kp_pin_gup ? &n_pin_gup_calls : &n_gup_calls);
+    atomic_inc(kp == &kp_pin_gup ? &n_pin_gup_calls
+               : (kp == &kp_gup_remote_inner ? &n_gup_inner_calls : &n_gup_calls));
 
     /* Safe without re-taking anything: both callers hold mmap_read_lock, which is
      * what the `*_remote` contract of this primitive means. */
@@ -642,7 +657,7 @@ static bool kr_map_files_ok;
 /* Kept in one table so init and exit cannot drift apart. */
 static struct kprobe *const map_probes[] = {
     &kp_map, &kp_map_smap, &kp_map_walk, &kp_map_walk_vma,
-    &kp_gup_remote, &kp_pin_gup,
+    &kp_gup_remote, &kp_pin_gup, &kp_gup_remote_inner,
 };
 #define N_MAP_PROBES ARRAY_SIZE(map_probes)
 static bool map_registered;
@@ -665,7 +680,7 @@ static int sus_map_stat_show(char *buf, const struct kernel_param *kp)
     return scnprintf(buf, PAGE_SIZE,
                      "rules=%d armed=%d/%d walk_seen=%d walk_vma=%d walk_skipped=%d "
                      "ops_hit=%d scan_fail=%d nofile=%d nomatch=%d getlink: calls=%d skip=%d nomatch=%d hides=%d\n"
-                     "vm: gup_calls=%d pin_calls=%d hides=%d\n"
+                     "vm: gup_calls=%d pin_calls=%d inner_calls=%d hides=%d\n"
                      "ops: smaps=%px smaps_shmem=%px pagemap=%px\n",
                      nmap, armed, (int)N_MAP_PROBES,
                      atomic_read(&n_walk_seen), atomic_read(&n_walk_seen_vma),
@@ -675,7 +690,7 @@ static int sus_map_stat_show(char *buf, const struct kernel_param *kp)
                      atomic_read(&n_getlink_calls), atomic_read(&n_getlink_skip),
                      atomic_read(&n_getlink_nomatch), atomic_read(&n_map_files_hides),
                      atomic_read(&n_gup_calls), atomic_read(&n_pin_gup_calls),
-                     atomic_read(&n_vm_hides),
+                     atomic_read(&n_gup_inner_calls), atomic_read(&n_vm_hides),
                      sus_map_ops_smaps, sus_map_ops_smaps_shmem,
                      sus_map_ops_pagemap);
 }
