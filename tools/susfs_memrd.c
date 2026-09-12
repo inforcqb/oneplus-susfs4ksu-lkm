@@ -43,6 +43,7 @@ typedef unsigned int u32;
 #define SYS_lseek     62
 #define SYS_mmap      222
 #define SYS_process_vm_readv 270
+#define SYS_getpid    172
 
 #define AT_FDCWD (-100)
 #define O_RDONLY 0
@@ -142,7 +143,7 @@ void memrd_main(long argc, char **argv)
 	const char *path = "/data/local/tmp/dac_probe/mapped";
 	u64 len = 16, pos = 0, i, sum = 0, msum = 0;
 	char *map;
-	long fd, memfd, n;
+	long fd, memfd, n, pid;
 
 	if (argc > 1)
 		path = argv[1];
@@ -192,12 +193,18 @@ void memrd_main(long argc, char **argv)
 		pos = put(out, pos, "\n");
 	}
 
-	/* Door 2: process_vm_readv on ourselves - the same address, another reader. */
+	/* Door 2: process_vm_readv on ourselves - the same address, another reader.
+	 *
+	 * The pid must be real: this kernel's process_vm_rw_core() calls
+	 * find_get_task_by_vpid(pid) unconditionally (no "pid 0 means current"
+	 * shortcut), so 0 answers -ESRCH - which is exactly what the first version of
+	 * this tool measured in every state, rule or no rule. */
 	liov.iov_base = rd;
 	liov.iov_len = len;
 	riov.iov_base = map;
 	riov.iov_len = len;
-	n = sys6(SYS_process_vm_readv, 0 /* self */, (long)&liov, 1, (long)&riov, 1, 0);
+	pid = sys6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+	n = sys6(SYS_process_vm_readv, pid, (long)&liov, 1, (long)&riov, 1, 0);
 	pvm_rc = n;
 
 	pos = put(out, pos, "path=");
@@ -223,6 +230,8 @@ void memrd_main(long argc, char **argv)
 		pos = puthex2(out, pos, (unsigned)(unsigned char)direct[i]);
 	pos = put(out, pos, "\ndirect_sum=");
 	pos = putnum(out, pos, sum);
+	pos = put(out, pos, "\npid=");
+	pos = putnum(out, pos, (u64)pid);
 	pos = put(out, pos, "\npvm_readv=");
 	if (n < 0) {
 		pos = put(out, pos, "errno=");
