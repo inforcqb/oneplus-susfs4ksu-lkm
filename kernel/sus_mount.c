@@ -73,10 +73,12 @@
 #include <linux/kprobes.h>
 #include <linux/fs.h>
 #include <linux/seq_file.h>
+#include <linux/stat.h>     /* struct statx (stx_mnt_id) */
 #include <linux/uaccess.h>
 #include <linux/sched.h>
 #include <linux/cred.h>
 #include <linux/nsproxy.h>
+#include <linux/percpu.h>
 #include <linux/rcupdate.h>
 #include <linux/spinlock.h>
 #include <linux/slab.h>
@@ -199,6 +201,247 @@ static unsigned long sus_mount_min_mnt_id(void)
     return param_min_mnt_id;
 }
 
+/* Declared up here because the new hooks' stat node reports it (it is otherwise
+ * set by sus_mount_register() further down). */
+static bool mount_registered;
+
+/* ---- the same id in the two other places upstream rewrites ----
+ *
+ * Skipping the mount line is not enough on its own: /proc/<pid>/fdinfo/N prints
+ * "mnt_id:\t<i>" and statx(2) returns stx_mnt_id, both taken straight from the
+ * mount the file lives on.  An app can therefore walk the fds it holds, collect
+ * their mnt_ids and look for ones /proc/self/mountinfo never mentions - a
+ * positive indicator that something is hidden, and one that needs no root.
+ *
+ * Upstream rewrites both to the id of the first mount up the chain that is not a
+ * KSU mount (susfs_get_non_sus_mnt_id_from_mnt(), patch:849-858), so the number
+ * the app sees is one that mountinfo does print for a line it keeps.  That value
+ * is computed here once per marked mount - at marking time, when the mount
+ * pointer is still in hand - and kept in a small id table, because at rewrite
+ * time all we have is the id (kprobe context, no sleeping, no lookups). */
+#define SUS_MOUNT_IDMAP_MAX 64
+
+struct sus_mount_idmap_entry {
+    int sus_id;
+    int shown_id;
+};
+
+static struct sus_mount_idmap_entry mount_idmap[SUS_MOUNT_IDMAP_MAX];
+static int n_idmap;
+static DEFINE_SPINLOCK(idmap_lock);
+
+static atomic_t n_fdinfo_hits = ATOMIC_INIT(0);
+static atomic_t n_fdinfo_rewrites = ATOMIC_INIT(0);
+static atomic_t n_statx_hits = ATOMIC_INIT(0);
+static atomic_t n_statx_rewrites = ATOMIC_INIT(0);
+
+static void sus_mount_idmap_add(int sus_id, int shown_id)
+{
+    unsigned long flags;
+
+    spin_lock_irqsave(&idmap_lock, flags);
+    if (n_idmap < SUS_MOUNT_IDMAP_MAX) {
+        mount_idmap[n_idmap].sus_id = sus_id;
+        mount_idmap[n_idmap].shown_id = shown_id;
+        n_idmap++;
+    }
+    spin_unlock_irqrestore(&idmap_lock, flags);
+}
+
+/* 0 means "not one of ours" - mnt_id 0 is never handed out. */
+static int sus_mount_shown_for(int sus_id)
+{
+    unsigned long flags;
+    int i, shown = 0;
+
+    if (sus_id <= 0)
+        return 0;
+    spin_lock_irqsave(&idmap_lock, flags);
+    for (i = 0; i < n_idmap; i++) {
+        if (mount_idmap[i].sus_id == sus_id) {
+            shown = mount_idmap[i].shown_id;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&idmap_lock, flags);
+    return shown;
+}
+
+/* Upstream's susfs_get_non_sus_mnt_id_from_mnt(): climb past every marked mount
+ * and report the id of the first one that is not ours.  Must be called AFTER
+ * r->mnt_id has been replaced - upstream relies on the same thing, i.e. on the
+ * starting mount already carrying a KSU-range id, or the loop would stop at the
+ * mount itself and report its own (hidden) number. */
+static int sus_mount_shown_id(struct mount *mnt)
+{
+    while (mnt && mnt->mnt_parent && mnt != mnt->mnt_parent &&
+           (unsigned int)mnt->mnt_id >= SUS_MOUNT_KSU_ID_MIN)
+        mnt = mnt->mnt_parent;
+    return mnt ? mnt->mnt_id : 0;
+}
+
+/* ---- /proc/<pid>/fdinfo/N ----
+ *
+ * fs/proc/fd.c:seq_show() formats pos/flags/mnt_id/ino into the seq_file buffer
+ * and returns; the buffer is handed to userspace right after.  A kprobe cannot
+ * see the mnt_id as a value (it is a local of that function), but it can read the
+ * text that is already in m->buf at return time, which is the same information:
+ * find the label, parse the decimal that follows it, replace it with the id the
+ * app is supposed to see.  The replacement is never longer than the original
+ * (a shown id is a normal, small one), so the buffer is only ever shortened.
+ *
+ * Works whether the kernel formats that line with one seq_printf (as AOSP 5.15
+ * does) or with seq_put_decimal_ull() - both leave "mnt_id:\t<digits>" in the
+ * buffer by the time the function returns. */
+#define SUS_MOUNT_MNTID_LABEL		"mnt_id:\t"
+#define SUS_MOUNT_MNTID_LABEL_LEN	8
+
+static DEFINE_PER_CPU(struct seq_file *, sus_mount_fdinfo_seq);
+
+static int sus_mount_fdinfo_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    this_cpu_write(sus_mount_fdinfo_seq, (struct seq_file *)regs->regs[0]);
+    return 0;
+}
+
+static int sus_mount_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct seq_file *m = this_cpu_read(sus_mount_fdinfo_seq);
+    char *buf, digits[12];
+    size_t count, i, pos = 0, len = 0, n = 0;
+    long old_id = 0;
+    unsigned int v;
+    int shown;
+
+    this_cpu_write(sus_mount_fdinfo_seq, NULL);
+    if (!m || (long)regs_return_value(regs) != 0)
+        return 0;
+    if (!m->buf || !m->count)
+        return 0;
+    /* The su/ksu domain keeps seeing its own mounts' real ids, exactly like the
+     * mount-line skip above. */
+    if (sus_mount_is_su_domain())
+        return 0;
+
+    buf = m->buf;
+    count = m->count;
+    atomic_inc(&n_fdinfo_hits);
+
+    for (i = 0; i + SUS_MOUNT_MNTID_LABEL_LEN < count; i++) {
+        if (!memcmp(buf + i, SUS_MOUNT_MNTID_LABEL, SUS_MOUNT_MNTID_LABEL_LEN)) {
+            pos = i + SUS_MOUNT_MNTID_LABEL_LEN;
+            break;
+        }
+    }
+    if (!pos)
+        return 0;
+
+    while (pos + len < count && len < 10 &&
+           buf[pos + len] >= '0' && buf[pos + len] <= '9') {
+        old_id = old_id * 10 + (buf[pos + len] - '0');
+        len++;
+    }
+    if (!len)
+        return 0;
+    shown = sus_mount_shown_for((int)old_id);
+    if (shown <= 0)
+        return 0;
+
+    v = (unsigned int)shown;
+    while (v) {
+        digits[n++] = (char)('0' + v % 10);
+        v /= 10;
+    }
+    if (!n || n > len)			/* never grow the buffer */
+        return 0;
+    for (i = 0; i < n / 2; i++) {
+        char t = digits[i];
+
+        digits[i] = digits[n - 1 - i];
+        digits[n - 1 - i] = t;
+    }
+    if (n != len)
+        memmove(buf + pos + n, buf + pos + len, count - (pos + len));
+    memcpy(buf + pos, digits, n);
+    m->count = count - len + n;
+    atomic_inc(&n_fdinfo_rewrites);
+    return 0;
+}
+
+static struct kretprobe kr_fdinfo = {
+    .kp.symbol_name = "seq_show",		/* fs/proc/fd.c, unique in kallsyms */
+    .entry_handler = sus_mount_fdinfo_entry,
+    .handler = sus_mount_fdinfo_ret,
+    .maxactive = 16,
+};
+static bool kr_fdinfo_ok;
+
+/* ---- statx(2): stx_mnt_id ----
+ *
+ * vfs_statx() fills stat->mnt_id from the path's mount right after the getattr
+ * callback, so the only place a kprobe can change it is the uapi struct the
+ * syscall is about to copy out - hence entry (take the user pointer, argument 5)
+ * plus return (rewrite the field if the call succeeded). */
+static DEFINE_PER_CPU(unsigned long, sus_mount_statx_user);
+
+static int sus_mount_statx_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    this_cpu_write(sus_mount_statx_user, regs->regs[4]);
+    return 0;
+}
+
+static int sus_mount_statx_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    unsigned long ubuf = this_cpu_read(sus_mount_statx_user);
+    u64 id = 0, shown;
+    int new_id;
+
+    this_cpu_write(sus_mount_statx_user, 0);
+    if (!ubuf || (long)regs_return_value(regs) != 0)
+        return 0;
+    if (sus_mount_is_su_domain())
+        return 0;
+
+    atomic_inc(&n_statx_hits);
+    if (copy_from_user(&id, (void __user *)(ubuf + offsetof(struct statx, stx_mnt_id)),
+                       sizeof(id)))
+        return 0;
+    new_id = sus_mount_shown_for((int)id);
+    if (new_id <= 0)
+        return 0;
+    shown = (u64)new_id;
+    if (copy_to_user((void __user *)(ubuf + offsetof(struct statx, stx_mnt_id)),
+                     &shown, sizeof(shown)))
+        return 0;
+    atomic_inc(&n_statx_rewrites);
+    return 0;
+}
+
+static struct kretprobe kr_statx = {
+    .kp.symbol_name = "__arm64_sys_statx",
+    .entry_handler = sus_mount_statx_entry,
+    .handler = sus_mount_statx_ret,
+    .maxactive = 16,
+};
+static bool kr_statx_ok;
+
+/* Reachability/effect counters, one line per hook: "installed" says nothing about
+ * whether the rewrite ever happened. */
+static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
+{
+    return scnprintf(buf, PAGE_SIZE,
+                     "idmap=%d  fdinfo: hits=%d rewrites=%d  statx: hits=%d rewrites=%d  "
+                     "hide=%d su_domain=%d\n",
+                     n_idmap,
+                     atomic_read(&n_fdinfo_hits), atomic_read(&n_fdinfo_rewrites),
+                     atomic_read(&n_statx_hits), atomic_read(&n_statx_rewrites),
+                     mount_registered, (int)sus_mount_is_su_domain());
+}
+static const struct kernel_param_ops sus_mount_stat_ops = {
+    .get = sus_mount_stat_show,
+};
+module_param_cb(mount_stat, &sus_mount_stat_ops, NULL, 0400);
+
 static int sus_mount_show_pre(struct kprobe *kp, struct pt_regs *regs)
 {
     struct vfsmount *mnt = (struct vfsmount *)regs->regs[1];
@@ -243,8 +486,6 @@ static struct kprobe kp_vfsmnt = {
     .symbol_name = "show_vfsmnt",
     .pre_handler = sus_mount_show_pre,
 };
-
-static bool mount_registered;
 
 static bool sus_mount_is_adb_devname(const char *devname)
 {
@@ -419,6 +660,10 @@ static int sus_mount_mark_ksu_mounts(void)
                 r->mnt_id, new_id, shown,
                 r->mnt_devname ? r->mnt_devname : "none");
         r->mnt_id = new_id;
+        /* After the id is replaced, exactly like upstream: the climb starts at a
+         * mount that now carries a KSU-range id and stops at the first ancestor
+         * that does not - i.e. the id mountinfo still prints for the host. */
+        sus_mount_idmap_add(new_id, sus_mount_shown_id(r));
         marked++;
     }
     spin_unlock(&ns->ns_lock);
@@ -499,6 +744,14 @@ void susfs_sus_mount_exit(void)
         unregister_kprobe(&kp_mountinfo);
         unregister_kprobe(&kp_vfsstat);
         unregister_kprobe(&kp_vfsmnt);
+        if (kr_fdinfo_ok) {
+            unregister_kretprobe(&kr_fdinfo);
+            kr_fdinfo_ok = false;
+        }
+        if (kr_statx_ok) {
+            unregister_kretprobe(&kr_statx);
+            kr_statx_ok = false;
+        }
         mount_registered = false;
     }
     /* Marked mnt_ids are deliberately NOT restored: upstream assigns an id once
@@ -528,6 +781,20 @@ static int sus_mount_register(void)
         unregister_kprobe(&kp_vfsstat);
         return rc;
     }
+    /* The two id rewrites are optional on their own: without them the mount
+     * lines are still hidden, so a missing symbol must not take the rest down -
+     * but each failure is named, because it leaves the ids visible in exactly
+     * the place upstream rewrites them. */
+    rc = register_kretprobe(&kr_fdinfo);
+    if (rc)
+        pr_warn("sus_mount: register_kretprobe(seq_show) failed %d - fdinfo keeps printing the real mnt_id\n", rc);
+    else
+        kr_fdinfo_ok = true;
+    rc = register_kretprobe(&kr_statx);
+    if (rc)
+        pr_warn("sus_mount: register_kretprobe(__arm64_sys_statx) failed %d - statx keeps returning the real stx_mnt_id\n", rc);
+    else
+        kr_statx_ok = true;
     mount_registered = true;
     return 0;
 }
@@ -561,6 +828,14 @@ void susfs_sus_mount_supercall(void __user **arg)
         unregister_kprobe(&kp_mountinfo);
         unregister_kprobe(&kp_vfsstat);
         unregister_kprobe(&kp_vfsmnt);
+        if (kr_fdinfo_ok) {
+            unregister_kretprobe(&kr_fdinfo);
+            kr_fdinfo_ok = false;
+        }
+        if (kr_statx_ok) {
+            unregister_kretprobe(&kr_statx);
+            kr_statx_ok = false;
+        }
         mount_registered = false;
     }
     info.err = 0;

@@ -123,3 +123,22 @@ jobs:
           name: susfs_mmap
           path: /tmp/susfs_mmap
           if-no-files-found: warn
+
+      # The detector's view of a hidden mount: the mnt_id that /proc/self/fdinfo/N
+      # prints and statx(2) returns, checked against the ids mountinfo lists.
+      - name: Build mnt_id cross-check
+        continue-on-error: true
+        run: |
+          clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
+                -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
+                -o /tmp/susfs_mntid tools/susfs_mntid.c
+          file /tmp/susfs_mntid
+          ls -la /tmp/susfs_mntid
+
+      - name: Upload mnt_id cross-check
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs_mntid
+          path: /tmp/susfs_mntid
+          if-no-files-found: warn
