@@ -236,13 +236,70 @@ static struct kprobe kp_map_smap = {
  *
  * Cost: the probe sits on a primitive the whole kernel shares, so it must bail
  * out on everything else in one load and three compares - the ops test is first,
- * before the gate or any structure is touched. */
+ * before the gate or any structure is touched.
+ *
+ * Which primitive the two callers actually use is not something this file gets
+ * to assume: walk_page_vma() exists as a separate symbol, and with
+ * CONFIG_LTO_CLANG_FULL either call site may have been inlined into its caller
+ * (in which case no probe can see it - the same wall smap_gather_stats() hit).
+ * So both symbols are probed, and walk_dbg=1 records every distinct ops pointer
+ * that reaches them together with its call count (walk_ops), which is how the
+ * real caller is identified instead of guessed. */
 static const void *sus_map_ops_smaps;
 static const void *sus_map_ops_smaps_shmem;
 static const void *sus_map_ops_pagemap;
 static bool sus_map_walk_ops_done;
 static atomic_t n_walk_skip = ATOMIC_INIT(0);
-static atomic_t n_walk_seen = ATOMIC_INIT(0);	/* walk_page_range calls, all ops */
+static atomic_t n_walk_seen = ATOMIC_INIT(0);		/* walk_page_range calls */
+static atomic_t n_walk_seen_vma = ATOMIC_INIT(0);	/* walk_page_vma calls  */
+
+/* walk_dbg: name every ops pointer that reaches the two primitives, once per
+ * distinct value.  Off by default - it costs a linear scan per call. */
+static int walk_dbg;
+module_param_named(walk_dbg, walk_dbg, int, 0644);
+
+#define WALK_OPS_MAX 8
+static const void *walk_seen_ops[WALK_OPS_MAX];
+static atomic_t walk_seen_cnt[WALK_OPS_MAX];
+static int walk_seen_n;
+
+static void sus_map_note_ops(const void *ops)
+{
+    int i, n = READ_ONCE(walk_seen_n);
+
+    for (i = 0; i < n; i++) {
+        if (READ_ONCE(walk_seen_ops[i]) == ops) {
+            atomic_inc(&walk_seen_cnt[i]);
+            return;
+        }
+    }
+    if (n >= WALK_OPS_MAX)
+        return;
+    WRITE_ONCE(walk_seen_ops[n], ops);
+    atomic_inc(&walk_seen_cnt[n]);
+    smp_store_release(&walk_seen_n, n + 1);
+    pr_info("sus_map: walk ops[%d] = %pS\n", n, ops);
+}
+
+static int sus_map_walk_ops_show(char *buf, const struct kernel_param *kp)
+{
+    int i, n = 0, cnt = READ_ONCE(walk_seen_n);
+
+    for (i = 0; i < cnt; i++)
+        n += scnprintf(buf + n, PAGE_SIZE - n, "%2d %pS\n", i, walk_seen_ops[i]);
+    n += scnprintf(buf + n, PAGE_SIZE - n,
+                   "counts: page_range=%d page_vma=%d skipped=%d\n",
+                   atomic_read(&n_walk_seen), atomic_read(&n_walk_seen_vma),
+                   atomic_read(&n_walk_skip));
+    for (i = 0; i < cnt; i++)
+        n += scnprintf(buf + n, PAGE_SIZE - n, "  [%d] n=%d\n", i,
+                       atomic_read(&walk_seen_cnt[i]));
+    return n;
+}
+static const struct kernel_param_ops sus_map_walk_ops_ops = {
+    .get = sus_map_walk_ops_show,
+};
+module_param_cb(walk_ops, &sus_map_walk_ops_ops, NULL, 0400);
 
 static void sus_map_resolve_walk_ops(void)
 {
@@ -268,21 +325,58 @@ static bool sus_map_walk_ops_any(void)
     return sus_map_ops_smaps || sus_map_ops_smaps_shmem || sus_map_ops_pagemap;
 }
 
+static bool sus_map_walk_ops_ours(const void *ops)
+{
+    return ops && (ops == sus_map_ops_smaps || ops == sus_map_ops_smaps_shmem ||
+                   ops == sus_map_ops_pagemap);
+}
+
+/* Shared tail: `vma` is the one the skipped walk would have covered.  Returns
+ * true when the call was skipped. */
+static bool sus_map_walk_answer(struct kprobe *kp, struct pt_regs *regs,
+                                struct vm_area_struct *vma)
+{
+    struct inode *inode;
+
+    /* Defence in depth, like the vma handler: a real vma is never below a page. */
+    if ((unsigned long)vma < PAGE_SIZE)
+        return false;
+    if (!vma->vm_file)
+        return false;
+    inode = file_inode(vma->vm_file);
+    if (!inode)
+        return false;
+    if (!sus_map_lookup(inode->i_ino, inode->i_sb->s_dev))
+        return false;
+
+    atomic_inc(&n_walk_skip);
+    pr_info_ratelimited("sus_map: skipped %s walk for ino=%lu dev=%lu uid=%u\n",
+                        kp->symbol_name, inode->i_ino,
+                        (unsigned long)inode->i_sb->s_dev, current_uid().val);
+    /* Both primitives return int 0 for "walked, nothing wrong", and both callers
+     * expect that from a skipped walk (upstream's own skip leaves the same value
+     * behind).  Leaving x0 = mm would turn pagemap_read()'s `ret` into a kernel
+     * pointer and hand it back to read(2). */
+    regs_set_return_value(regs, 0);
+    regs->pc = regs->regs[30];
+    return true;
+}
+
+/* walk_page_range(mm, start, end, ops, private): the vma has to be resolved from
+ * (mm, start), which is what the walk itself would have done - mmap_lock is held
+ * for read by every caller of these three ops, so the list this walks cannot be
+ * changed underneath it. */
 static int sus_map_skip_walk_pre(struct kprobe *kp, struct pt_regs *regs)
 {
     const void *ops = (const void *)regs->regs[3];
     struct mm_struct *mm;
     struct vm_area_struct *vma;
-    struct inode *inode;
     unsigned long start;
 
     atomic_inc(&n_walk_seen);
-
-    /* Identity first: one load and three compares on a path the whole kernel
-     * uses.  Note that every resolved op is non-NULL, so a NULL `ops` can never
-     * match an unresolved one. */
-    if (ops != sus_map_ops_smaps && ops != sus_map_ops_smaps_shmem &&
-        ops != sus_map_ops_pagemap)
+    if (walk_dbg)
+        sus_map_note_ops(ops);
+    if (!sus_map_walk_ops_ours(ops))
         return 0;
 
     if (!sus_map_gate_ok())
@@ -290,38 +384,35 @@ static int sus_map_skip_walk_pre(struct kprobe *kp, struct pt_regs *regs)
 
     mm = (struct mm_struct *)regs->regs[0];
     start = (unsigned long)regs->regs[1];
-    /* Defence in depth, like the vma handler: a real mm is never below a page. */
     if ((unsigned long)mm < PAGE_SIZE)
         return 0;
 
-    /* mmap_lock is held for read by every caller of these three ops, so this is
-     * the very list walk the skipped walk would have done - and the reason the
-     * vma it returns cannot be freed underneath us. */
     for (vma = mm->mmap; vma; vma = vma->vm_next) {
         if (start < vma->vm_end)
             break;
     }
     if (!vma || start < vma->vm_start)
         return 0;			/* start is in a gap: nothing to hide */
-    if (!vma->vm_file)
-        return 0;
-    inode = file_inode(vma->vm_file);
-    if (!inode)
-        return 0;
-    if (!sus_map_lookup(inode->i_ino, inode->i_sb->s_dev))
+
+    return sus_map_walk_answer(kp, regs, vma) ? 1 : 0;
+}
+
+/* walk_page_vma(vma, ops, private): same walk, vma handed over directly. */
+static int sus_map_skip_walk_vma_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+    const void *ops = (const void *)regs->regs[1];
+
+    atomic_inc(&n_walk_seen_vma);
+    if (walk_dbg)
+        sus_map_note_ops(ops);
+    if (!sus_map_walk_ops_ours(ops))
         return 0;
 
-    atomic_inc(&n_walk_skip);
-    pr_info_ratelimited("sus_map: skipped %s walk for ino=%lu dev=%lu uid=%u\n",
-                        kp->symbol_name, inode->i_ino,
-                        (unsigned long)inode->i_sb->s_dev, current_uid().val);
-    /* walk_page_range() returns int 0 for "walked, nothing wrong", and both
-     * callers expect that from a skipped walk (upstream's own skip leaves the
-     * same value behind).  Leaving x0 = mm would turn pagemap_read()'s `ret`
-     * into a kernel pointer and hand it back to read(2). */
-    regs_set_return_value(regs, 0);
-    regs->pc = regs->regs[30];
-    return 1;
+    if (!sus_map_gate_ok())
+        return 0;
+
+    return sus_map_walk_answer(kp, regs,
+                               (struct vm_area_struct *)regs->regs[0]) ? 1 : 0;
 }
 
 static struct kprobe kp_map_walk = {
@@ -329,9 +420,14 @@ static struct kprobe kp_map_walk = {
     .pre_handler = sus_map_skip_walk_pre,
 };
 
+static struct kprobe kp_map_walk_vma = {
+    .symbol_name = "walk_page_vma",
+    .pre_handler = sus_map_skip_walk_vma_pre,
+};
+
 /* Kept in one table so init and exit cannot drift apart. */
 static struct kprobe *const map_probes[] = {
-    &kp_map, &kp_map_smap, &kp_map_walk,
+    &kp_map, &kp_map_smap, &kp_map_walk, &kp_map_walk_vma,
 };
 #define N_MAP_PROBES ARRAY_SIZE(map_probes)
 static bool map_registered;
@@ -352,10 +448,11 @@ static int sus_map_stat_show(char *buf, const struct kernel_param *kp)
         armed += map_probe_armed[i] ? 1 : 0;
 
     return scnprintf(buf, PAGE_SIZE,
-                     "rules=%d armed=%d/%d walk_seen=%d walk_skipped=%d "
+                     "rules=%d armed=%d/%d walk_seen=%d walk_vma=%d walk_skipped=%d "
                      "ops: smaps=%px smaps_shmem=%px pagemap=%px\n",
                      nmap, armed, (int)N_MAP_PROBES,
-                     atomic_read(&n_walk_seen), atomic_read(&n_walk_skip),
+                     atomic_read(&n_walk_seen), atomic_read(&n_walk_seen_vma),
+                     atomic_read(&n_walk_skip),
                      sus_map_ops_smaps, sus_map_ops_smaps_shmem,
                      sus_map_ops_pagemap);
 }
@@ -379,7 +476,8 @@ static int sus_map_register_probes(void)
 
         if (map_probe_armed[i])
             continue;
-        if (map_probes[i] == &kp_map_walk && !sus_map_walk_ops_any())
+        if ((map_probes[i] == &kp_map_walk || map_probes[i] == &kp_map_walk_vma) &&
+            !sus_map_walk_ops_any())
             continue;
         rc = register_kprobe(map_probes[i]);
         if (rc) {
