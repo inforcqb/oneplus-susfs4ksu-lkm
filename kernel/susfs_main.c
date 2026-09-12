@@ -141,6 +141,15 @@ static int __init susfs_init(void)
 
     susfs_self_hide_nodes();
 
+    /* Operator note, because the module hides its own traces from EVERY caller -
+     * root included (a built-in SUSFS has no module entry at all, so hiding it
+     * only from non-root would leave a trace upstream does not have).  The
+     * consequence is that `lsmod | grep susfs` is always empty, and a second
+     * `insmod` fails with -EEXIST ("File exists"), which reads like a broken
+     * module.  Say where the truth is. */
+    pr_info("susfs_guard_lkm: loaded. This module is filtered out of /proc/modules for every caller including root, so `lsmod | grep susfs` stays empty - check /sys/module/%s instead (a second insmod fails with -EEXIST while it is loaded).\n",
+            SUSFS_LKM_MODULE_NAME);
+
     return 0;
 }
 

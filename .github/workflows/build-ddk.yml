@@ -48,10 +48,21 @@ jobs:
           fi
           echo "=== kernel tree: $H ==="
           n=0
-          for pat in 'inode_permission)' 'inode_getattr)' 'inode_unlink)' 'sb_statfs)' 'path_notify)'; do
-            out=$(grep -n -B2 -A2 "$pat" "$H/include/linux/lsm_hooks.h" || true)
+          # 5.15 declares the hooks in include/linux/lsm_hook_defs.h with the macro
+          # form "LSM_HOOK(int, 0, inode_permission, struct inode *inode, int mask)",
+          # so the pattern has to match that as well - otherwise this step fails on
+          # a perfectly good tree (which is what it did on the first run, proving
+          # the point that it had never actually checked anything before).
+          for pat in 'inode_permission,' 'inode_getattr,' 'inode_unlink,' 'sb_statfs,' 'path_notify,'; do
+            out=""
+            if [ -f "$H/include/linux/lsm_hook_defs.h" ]; then
+              out=$(grep -n -B1 -A1 -- "$pat" "$H/include/linux/lsm_hook_defs.h" || true)
+            fi
+            if [ -z "$out" ] && [ -f "$H/include/linux/lsm_hooks.h" ]; then
+              out=$(grep -n -B2 -A2 -- "$pat" "$H/include/linux/lsm_hooks.h" || true)
+            fi
             if [ -z "$out" ]; then
-              echo "::error::pattern '$pat' not found in $H/include/linux/lsm_hooks.h"
+              echo "::error::pattern '$pat' not found in $H/include/linux/lsm_hook_defs.h or lsm_hooks.h"
               exit 1
             fi
             echo "--- $pat ---"; echo "$out"; n=$((n+1))

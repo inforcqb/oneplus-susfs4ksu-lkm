@@ -37,6 +37,18 @@ ksud insmod /data/local/tmp/susfs_guard_lkm.ko
 rmmod susfs_guard_lkm
 ```
 
+### 怎么判断它是否已经加载（**不要用 `lsmod`**）
+
+模块会把自己的那一行从 `/proc/modules` 里去掉，而且**对所有调用者都一样，root 也不例外**——上游 builtin 内根本没有"模块条目"这回事，只对非 root 隐藏的话，root 的 `lsmod` 仍会留下 builtin 不存在的痕迹。因此：
+
+```sh
+lsmod | grep susfs            # 永远是 0 行，不代表没加载
+ls -d /sys/module/susfs_guard_lkm   # ← 这个才代表已加载（root 可见）
+ls /sys/module/susfs_guard_lkm/parameters/   # 参数节点在，也说明已加载
+```
+
+重复 `insmod` 会因为模块已在内存里而失败（`init_module failed: File exists (os error 17)`，即 `-EEXIST`）；想重载就先 `rmmod susfs_guard_lkm`。
+
 ## 移植参考
 
 - [susfs4ksu](https://gitlab.com/simonpunk/susfs4ksu) — SUSFS 功能逻辑与 hook 点（GPL-3.0）

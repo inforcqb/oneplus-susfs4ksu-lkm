@@ -161,24 +161,19 @@ static void kstat_snapshot(const struct sus_kstat_entry *e,
 #define ST_CTIME_OFF        104
 #define ST_CTIME_NSEC_OFF   112
 
-/* arm64 compat (AArch32) struct compat_stat offsets (verified on device).
- * st_mode is compat_mode_t (u16) here, hence the tight packing. */
-#define COMPAT_ST_DEV_OFF      0
-#define COMPAT_ST_INO_OFF      4
-#define COMPAT_ST_NLINK_OFF    10
-#define COMPAT_ST_SIZE_OFF     20
-#define COMPAT_ST_BLKSIZE_OFF  24
-#define COMPAT_ST_BLOCKS_OFF   28
-#define COMPAT_ST_ATIME_OFF    32
-#define COMPAT_ST_ATIME_NSEC_OFF 36
-#define COMPAT_ST_MTIME_OFF    40
-#define COMPAT_ST_MTIME_NSEC_OFF 44
-#define COMPAT_ST_CTIME_OFF    48
-#define COMPAT_ST_CTIME_NSEC_OFF 52
-
-/* ARM EABI syscall number for fstatat64, which compat newfstatat maps to.
- * Source: arch/arm64/include/asm/unistd32.h line 667: __NR_fstatat64 327 */
-#define COMPAT_FSTATAT64_NR 327
+/* The numbers above are a uapi contract, so they can be checked at build time
+ * instead of trusted: arm64 uses the generic layout (__ARCH_WANT_NEW_STAT), and
+ * a DDK header change that moved a member would otherwise corrupt the caller's
+ * stat buffer instead of failing this build. */
+static_assert(offsetof(struct stat, st_dev) == ST_DEV_OFF, "stat.st_dev");
+static_assert(offsetof(struct stat, st_ino) == ST_INO_OFF, "stat.st_ino");
+static_assert(offsetof(struct stat, st_nlink) == ST_NLINK_OFF, "stat.st_nlink");
+static_assert(offsetof(struct stat, st_size) == ST_SIZE_OFF, "stat.st_size");
+static_assert(offsetof(struct stat, st_blksize) == ST_BLKSIZE_OFF, "stat.st_blksize");
+static_assert(offsetof(struct stat, st_blocks) == ST_BLOCKS_OFF, "stat.st_blocks");
+static_assert(offsetof(struct stat, st_atime) == ST_ATIME_OFF, "stat.st_atime");
+static_assert(offsetof(struct stat, st_mtime) == ST_MTIME_OFF, "stat.st_mtime");
+static_assert(offsetof(struct stat, st_ctime) == ST_CTIME_OFF, "stat.st_ctime");
 
 /* ---- the read gate ----
  *
@@ -489,14 +484,61 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
 	}
 }
 
-/* compat (32-bit) statbuf: struct compat_stat, st_ino is u32 at offset 4 */
+/* AArch32 (compat) statbuf layouts.
+ *
+ * There are TWO of them, and which one a syscall fills is decided by its number,
+ * not by the fact that the caller is 32-bit:
+ *
+ *   __NR_fstatat64 327, __NR_fstat64 197
+ *       -> struct stat64, arch/arm64/include/asm/stat.h:19-48, filled by
+ *          cp_new_stat64() (fs/stat.c:486) through SYSCALL_DEFINE4(fstatat64,...)
+ *          (fs/stat.c:556, enabled by __ARCH_WANT_COMPAT_STAT64).  Note that
+ *          compat_u64/compat_s64 are `__attribute__((aligned(4)))` on arm64
+ *          (include/linux/compat.h:37-38), so the u64 members are packed on
+ *          4-byte boundaries - that is what fixes these offsets, and it is also
+ *          why this struct is NOT the same as struct compat_stat.
+ *
+ *   __NR_stat 106, __NR_lstat 107, __NR_fstat 108
+ *       -> struct compat_stat (arch/arm64/include/asm/compat.h:38-67), filled by
+ *          cp_compat_stat().  This kernel tree's unistd32.h has no mapping for
+ *          those numbers, so nothing reaches them here; they are listed so the
+ *          next reader does not conclude that "compat = compat_stat" and wire the
+ *          wrong offsets (which is exactly what this code used to do: it read
+ *          st_ino at +4, i.e. the HIGH half of st_dev in stat64 - always 0 - so
+ *          the lookup could never match and 32-bit callers got no spoofing at
+ *          all, while a match would have written into st_dev/st_rdev).
+ *
+ * Values verified against D:\kernel_oneplus_sm8550 (5.15.180 OnePlus SM8550):
+ * arch/arm64/include/asm/stat.h, arch/arm64/include/asm/compat.h, fs/stat.c,
+ * arch/arm64/include/asm/unistd32.h:407,667. */
+#define STAT64_ST_DEV_OFF       0	/* compat_u64 */
+#define STAT64_ST_INO_OFF       88	/* compat_u64 (the one glibc reads) */
+#define STAT64_ST_BROKEN_INO_OFF 12	/* compat_ulong_t __st_ino */
+#define STAT64_ST_NLINK_OFF     20	/* compat_uint_t */
+#define STAT64_ST_SIZE_OFF      44	/* compat_s64 */
+#define STAT64_ST_BLKSIZE_OFF   52	/* compat_ulong_t */
+#define STAT64_ST_BLOCKS_OFF    56	/* compat_u64 */
+#define STAT64_ST_ATIME_OFF     64
+#define STAT64_ST_ATIME_NSEC_OFF 68
+#define STAT64_ST_MTIME_OFF     72
+#define STAT64_ST_MTIME_NSEC_OFF 76
+#define STAT64_ST_CTIME_OFF     80
+#define STAT64_ST_CTIME_NSEC_OFF 84
+#define STAT64_ST_SIZE          96
+
+/* ARM EABI syscall numbers that fill struct stat64. */
+#define COMPAT_FSTATAT64_NR	327	/* fstatat64(dfd, path, statbuf, flag) */
+#define COMPAT_FSTAT64_NR	197	/* fstat64(fd, statbuf) */
+
+/* compat (32-bit) statbuf: struct stat64 (see above) - one of the two layouts,
+ * and the one both handled syscalls actually use. */
 static void susfs_kstat_spoof_compat_statbuf(unsigned long statbuf)
 {
 	struct sus_kstat_snapshot snap;
 	const struct sus_kstat_snapshot *e = &snap;
+	unsigned long long v64;
 	unsigned int ino = 0, dev = 0;
 	unsigned int v32;
-	unsigned short v16;
 	int v;
 
 	if (susfs_kstat_table_empty())
@@ -504,71 +546,77 @@ static void susfs_kstat_spoof_compat_statbuf(unsigned long statbuf)
 	if (!susfs_kstat_gate_ok())
 		return;
 
-	if (copy_from_user(&ino, (void __user *)(statbuf + COMPAT_ST_INO_OFF), sizeof(ino)))
+	/* The table is keyed by (ino, dev) as the caller sees them in the struct
+	 * it is about to be given: st_ino (u64, +88) and st_dev (u64, +0). */
+	if (copy_from_user(&v64, (void __user *)(statbuf + STAT64_ST_INO_OFF), sizeof(v64)))
 		return;
-	if (copy_from_user(&dev, (void __user *)(statbuf + COMPAT_ST_DEV_OFF), sizeof(dev)))
+	ino = (unsigned int)v64;
+	if (copy_from_user(&dev, (void __user *)(statbuf + STAT64_ST_DEV_OFF), sizeof(dev)))
 		return;
 	if (!susfs_kstat_lookup(ino, dev, &snap))
 		return;
 
 	if (e->flags & KSTAT_SPOOF_INO) {
 		v32 = (unsigned int)e->spoofed_ino;
-		if (copy_to_user((void __user *)(statbuf + COMPAT_ST_INO_OFF), &v32, sizeof(v32)))
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_BROKEN_INO_OFF), &v32, sizeof(v32)))
+			return;
+		v64 = (unsigned long long)e->spoofed_ino;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_INO_OFF), &v64, sizeof(v64)))
 			return;
 	}
 	if (e->flags & KSTAT_SPOOF_DEV) {
-		v32 = (unsigned int)e->spoofed_dev;
-		if (copy_to_user((void __user *)(statbuf + COMPAT_ST_DEV_OFF), &v32, sizeof(v32)))
+		v64 = (unsigned long long)e->spoofed_dev;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_DEV_OFF), &v64, sizeof(v64)))
 			return;
 	}
 	if (e->flags & KSTAT_SPOOF_NLINK) {
-		v16 = (unsigned short)e->spoofed_nlink;
-		if (copy_to_user((void __user *)(statbuf + COMPAT_ST_NLINK_OFF), &v16, sizeof(v16)))
+		v32 = (unsigned int)e->spoofed_nlink;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_NLINK_OFF), &v32, sizeof(v32)))
 			return;
 	}
 	if (e->flags & KSTAT_SPOOF_SIZE) {
-		v = (int)e->spoofed_size;
-		if (copy_to_user((void __user *)(statbuf + COMPAT_ST_SIZE_OFF), &v, sizeof(v)))
+		v64 = (unsigned long long)e->spoofed_size;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_SIZE_OFF), &v64, sizeof(v64)))
 			return;
 	}
 	if (e->flags & KSTAT_SPOOF_BLKSIZE) {
-		v = (int)e->spoofed_blksize;
-		if (copy_to_user((void __user *)(statbuf + COMPAT_ST_BLKSIZE_OFF), &v, sizeof(v)))
+		v32 = (unsigned int)e->spoofed_blksize;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_BLKSIZE_OFF), &v32, sizeof(v32)))
 			return;
 	}
 	if (e->flags & KSTAT_SPOOF_BLOCKS) {
-		v = (int)e->spoofed_blocks;
-		if (copy_to_user((void __user *)(statbuf + COMPAT_ST_BLOCKS_OFF), &v, sizeof(v)))
+		v64 = (unsigned long long)e->spoofed_blocks;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_BLOCKS_OFF), &v64, sizeof(v64)))
 			return;
 	}
 	if (e->flags & KSTAT_SPOOF_ATIME_TV_SEC) {
 		v = (int)e->spoofed_atime_tv_sec;
-		if (copy_to_user((void __user *)(statbuf + COMPAT_ST_ATIME_OFF), &v, sizeof(v)))
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_ATIME_OFF), &v, sizeof(v)))
 			return;
 	}
 	if (e->flags & KSTAT_SPOOF_ATIME_TV_NSEC) {
 		v32 = (unsigned int)e->spoofed_atime_tv_nsec;
-		if (copy_to_user((void __user *)(statbuf + COMPAT_ST_ATIME_NSEC_OFF), &v32, sizeof(v32)))
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_ATIME_NSEC_OFF), &v32, sizeof(v32)))
 			return;
 	}
 	if (e->flags & KSTAT_SPOOF_MTIME_TV_SEC) {
 		v = (int)e->spoofed_mtime_tv_sec;
-		if (copy_to_user((void __user *)(statbuf + COMPAT_ST_MTIME_OFF), &v, sizeof(v)))
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_MTIME_OFF), &v, sizeof(v)))
 			return;
 	}
 	if (e->flags & KSTAT_SPOOF_MTIME_TV_NSEC) {
 		v32 = (unsigned int)e->spoofed_mtime_tv_nsec;
-		if (copy_to_user((void __user *)(statbuf + COMPAT_ST_MTIME_NSEC_OFF), &v32, sizeof(v32)))
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_MTIME_NSEC_OFF), &v32, sizeof(v32)))
 			return;
 	}
 	if (e->flags & KSTAT_SPOOF_CTIME_TV_SEC) {
 		v = (int)e->spoofed_ctime_tv_sec;
-		if (copy_to_user((void __user *)(statbuf + COMPAT_ST_CTIME_OFF), &v, sizeof(v)))
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_CTIME_OFF), &v, sizeof(v)))
 			return;
 	}
 	if (e->flags & KSTAT_SPOOF_CTIME_TV_NSEC) {
 		v32 = (unsigned int)e->spoofed_ctime_tv_nsec;
-		if (copy_to_user((void __user *)(statbuf + COMPAT_ST_CTIME_NSEC_OFF), &v32, sizeof(v32)))
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_CTIME_NSEC_OFF), &v32, sizeof(v32)))
 			return;
 	}
 }
@@ -589,11 +637,16 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 		return;
 
 	if (is_compat_task()) {
-		if (syscall_get_nr(current, regs) != COMPAT_FSTATAT64_NR)
-			return;
-		/* syscall_get_arguments() returns the raw registers; for a 32-bit
-		 * task only the low half is the argument. */
-		susfs_kstat_spoof_compat_statbuf((unsigned long)compat_ptr((u32)statbuf));
+		/* Both of these fill struct stat64, but the buffer is a different
+		 * argument: fstatat64(dfd, path, statbuf, flag) vs fstat64(fd, statbuf).
+		 * Handling only the first number meant a 32-bit fstat64() was silently
+		 * left unspoofed. */
+		long nr = syscall_get_nr(current, regs);
+
+		if (nr == COMPAT_FSTATAT64_NR)
+			susfs_kstat_spoof_compat_statbuf((unsigned long)compat_ptr((u32)args[2]));
+		else if (nr == COMPAT_FSTAT64_NR)
+			susfs_kstat_spoof_compat_statbuf((unsigned long)compat_ptr((u32)args[1]));
 	} else {
 		if (syscall_get_nr(current, regs) != __NR_newfstatat)
 			return;

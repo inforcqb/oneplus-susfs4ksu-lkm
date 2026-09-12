@@ -309,28 +309,46 @@ static int sus_mount_shown_id(struct mount *mnt)
 #define SUS_MOUNT_MNTID_LABEL		"mnt_id:\t"
 #define SUS_MOUNT_MNTID_LABEL_LEN	8
 
-static DEFINE_PER_CPU(struct seq_file *, sus_mount_fdinfo_seq);
+/* Per-instance state for the four kretprobes below (fdinfo + the two statx
+ * landing points).
+ *
+ * It lives in ri->data, NOT in per-CPU storage: seq_show() formats through
+ * seq_printf(), whose seq_buf_alloc() is GFP_KERNEL and can sleep - with
+ * CONFIG_PREEMPT=y the task may be preempted inside the probed function and
+ * resume on another CPU, where a per-CPU slot would hold NULL or, worse, a
+ * seq_file belonging to an unrelated /proc read that the return handler would
+ * then memmove into.  A kretprobe instance is per-task, which is what makes the
+ * entry/return pair safe; the getdents64 filter in sus_path.c does the same.
+ *
+ * The same struct serves all of them because the fields are disjoint. */
+struct sus_mount_kretprobe_state {
+    struct seq_file *m;		/* fdinfo: the seq_file being filled */
+    unsigned long ubuf;		/* statx: the caller's struct statx __user * */
+    char where;			/* statx: 's' = __arm64_sys_statx, 'd' = do_statx */
+};
 
 static atomic_t n_fdinfo_entry = ATOMIC_INIT(0);
 static atomic_t n_fdinfo_nolabel = ATOMIC_INIT(0);
 
 static int sus_mount_fdinfo_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
+    struct sus_mount_kretprobe_state *st = (struct sus_mount_kretprobe_state *)ri->data;
+
     atomic_inc(&n_fdinfo_entry);
-    this_cpu_write(sus_mount_fdinfo_seq, (struct seq_file *)regs->regs[0]);
+    st->m = (struct seq_file *)regs->regs[0];
     return 0;
 }
 
 static int sus_mount_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    struct seq_file *m = this_cpu_read(sus_mount_fdinfo_seq);
+    struct sus_mount_kretprobe_state *st = (struct sus_mount_kretprobe_state *)ri->data;
+    struct seq_file *m = st->m;
     char *buf, digits[12];
     size_t count, i, pos = 0, len = 0, n = 0;
     long old_id = 0;
     unsigned int v;
     int shown;
 
-    this_cpu_write(sus_mount_fdinfo_seq, NULL);
     if (!m || (long)regs_return_value(regs) != 0)
         return 0;
     if (!m->buf || !m->count)
@@ -391,6 +409,7 @@ static struct kretprobe kr_fdinfo = {
     .kp.symbol_name = "seq_show",		/* fs/proc/fd.c, unique in kallsyms */
     .entry_handler = sus_mount_fdinfo_entry,
     .handler = sus_mount_fdinfo_ret,
+    .data_size = sizeof(struct sus_mount_kretprobe_state),
     .maxactive = 16,
 };
 static bool kr_fdinfo_ok;
@@ -404,15 +423,21 @@ static bool kr_fdinfo_ok;
  *
  * Two landing points, because "the wrapper exists in kallsyms" says nothing
  * about who is really called: __arm64_sys_statx is the syscall entry, do_statx is
- * what it delegates to.  Both take (dfd, filename, flags, mask, buffer), and the
- * rewrite is idempotent (the second one finds a rewritten id that is not in the
- * table), so arming both is safe - which of them fires is reported separately. */
-static DEFINE_PER_CPU(unsigned long, sus_mount_statx_user);
-/* Which landing point this call is at: 's' = __arm64_sys_statx, 'd' = do_statx.
- * struct kretprobe_instance has no back pointer to its kretprobe in 5.15, so the
- * two entry handlers write their own letter instead. */
-static DEFINE_PER_CPU(char, sus_mount_statx_where);
-
+ * what it delegates to.  The rewrite is idempotent (the second one finds a
+ * rewritten id that is not in the table), so arming both is safe - which of them
+ * fires is reported separately.
+ *
+ * The two entry points do NOT read the same register:
+ *   - __arm64_sys_statx is `asmlinkage long __arm64_sys_statx(const struct
+ *     pt_regs *)` (arch/arm64/include/asm/syscall_wrapper.h), i.e. its only
+ *     argument is the pt_regs pointer, so the user buffer is
+ *     ((struct pt_regs *)regs->regs[0])->regs[4].  Reading regs->regs[4] directly
+ *     happens to work only because the dispatcher leaves x1..x7 untouched - the
+ *     same reason the reboot handler in susfs_supercall.c goes through
+ *     PT_REAL_REGS.
+ *   - do_statx(int dfd, const char __user *filename, unsigned flags, unsigned int
+ *     mask, struct statx __user *buffer) is an ordinary function, so x4 IS the
+ *     buffer. */
 static atomic_t n_statx_entry = ATOMIC_INIT(0);
 static atomic_t n_statx_ret = ATOMIC_INIT(0);
 static atomic_t n_statx_nobuf = ATOMIC_INIT(0);
@@ -422,38 +447,43 @@ static atomic_t n_statx_nomap = ATOMIC_INIT(0);
 
 static int sus_mount_statx_entry_sys(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
+    struct sus_mount_kretprobe_state *st = (struct sus_mount_kretprobe_state *)ri->data;
+    const struct pt_regs *uregs = (const struct pt_regs *)regs->regs[0];
+
     atomic_inc(&n_statx_entry);
-    this_cpu_write(sus_mount_statx_where, 's');
-    this_cpu_write(sus_mount_statx_user, regs->regs[4]);
+    st->where = 's';
+    st->ubuf = uregs ? (unsigned long)uregs->regs[4] : 0;
     return 0;
 }
 
 static int sus_mount_statx_entry_do(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
+    struct sus_mount_kretprobe_state *st = (struct sus_mount_kretprobe_state *)ri->data;
+
     atomic_inc(&n_statx_entry);
-    this_cpu_write(sus_mount_statx_where, 'd');
-    this_cpu_write(sus_mount_statx_user, regs->regs[4]);
+    st->where = 'd';
+    st->ubuf = regs->regs[4];
     return 0;
 }
 
 static int sus_mount_statx_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    unsigned long ubuf = this_cpu_read(sus_mount_statx_user);
+    struct sus_mount_kretprobe_state *st = (struct sus_mount_kretprobe_state *)ri->data;
+    unsigned long ubuf = st->ubuf;
     u64 id = 0, shown;
     int new_id;
 
-    this_cpu_write(sus_mount_statx_user, 0);
     atomic_inc(&n_statx_ret);
     if ((long)regs_return_value(regs) != 0) {
         atomic_inc(&n_statx_err);
         return 0;
     }
     if (!ubuf) {
-        /* Which of the two landing points has no user pointer in argument 5 is
-         * worth knowing: the other one is the one doing the work. */
+        /* Named, because "which landing point had no pointer" is the difference
+         * between a wrong register and a wrong understanding of the call. */
         atomic_inc(&n_statx_nobuf);
-        pr_info_ratelimited("sus_mount: statx at %c has no buffer in x4\n",
-                            this_cpu_read(sus_mount_statx_where));
+        pr_info_ratelimited("sus_mount: statx landing point %c had no buffer\n",
+                            st->where);
         return 0;
     }
     if (sus_mount_is_su_domain())
@@ -484,6 +514,7 @@ static struct kretprobe kr_statx = {
     .kp.symbol_name = "__arm64_sys_statx",
     .entry_handler = sus_mount_statx_entry_sys,
     .handler = sus_mount_statx_ret,
+    .data_size = sizeof(struct sus_mount_kretprobe_state),
     .maxactive = 16,
 };
 static bool kr_statx_ok;
@@ -492,6 +523,7 @@ static struct kretprobe kr_statx_do = {
     .kp.symbol_name = "do_statx",
     .entry_handler = sus_mount_statx_entry_do,
     .handler = sus_mount_statx_ret,
+    .data_size = sizeof(struct sus_mount_kretprobe_state),
     .maxactive = 16,
 };
 static bool kr_statx_do_ok;
@@ -910,13 +942,22 @@ void susfs_sus_mount_supercall(void __user **arg)
             goto out;
         }
         /* Only now does the threshold matter, so mark the KSU mounts (also
-         * catches everything mounted since the module was loaded).  A scan
-         * failure is not reported to userspace - the hook itself is live - but
-         * it is never silent: the scan logs its own result. */
+         * catches everything mounted since the module was loaded).
+         *
+         * A failed scan is REPORTED, not just logged: with no mount carrying a
+         * KSU-range id the threshold test never matches, so nothing is hidden -
+         * mountinfo, /proc/mounts, fdinfo and statx all keep showing the mounts.
+         * Answering err=0 there is the "enabled, does nothing" failure mode a
+         * caller cannot see; the hook staying live does not change that.  (A scan
+         * that found zero KSU mounts on purpose is not a failure: that is rc==0.)
+         */
         rc = sus_mount_mark_ksu_mounts();
-        if (rc < 0)
-            pr_warn("sus_mount: scan on enable failed %d, hook is live but no new mount was marked\n",
+        if (rc < 0) {
+            pr_warn("sus_mount: scan on enable failed %d - hook is live but no mount was marked, reporting the failure to userspace\n",
                     rc);
+            info.err = rc;
+            goto out;
+        }
     } else if (mount_registered) {
         unregister_kprobe(&kp_mountinfo);
         unregister_kprobe(&kp_vfsstat);
