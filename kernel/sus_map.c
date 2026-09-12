@@ -509,6 +509,8 @@ static atomic_t n_gup_calls = ATOMIC_INIT(0);
 static atomic_t n_pin_gup_calls = ATOMIC_INIT(0);
 static atomic_t n_vm_hides = ATOMIC_INIT(0);
 
+static int sus_map_vm_access_pre(struct kprobe *kp, struct pt_regs *regs);
+
 static struct kprobe kp_gup_remote = {
     .symbol_name = "get_user_pages_remote",
     .pre_handler = sus_map_vm_access_pre,
