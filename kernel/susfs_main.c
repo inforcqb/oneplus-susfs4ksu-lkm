@@ -16,11 +16,7 @@
 #include "lsm_hook.h"
 #include "susfs.h"
 
-/* The LKM's OWN version, i.e. this repository's release tag - NOT the SUSFS
- * version it implements.  That one is the wire ABI (SUSFS_VERSION_STR "v2.3.0" in
- * susfs_abi.h) and has to stay exactly what upstream's userspace expects, so it
- * must not follow this number. */
-#define SUSFS_LKM_VERSION "2.3.1-gki"
+#define SUSFS_LKM_VERSION "2.3.0-gki"
 /* The directory name the module gets under /sys/module: it has to match what the
  * kernel derives from the module name, because susfs_self_hide_nodes() registers it
  * as a hidden path. */
@@ -178,4 +174,4 @@ static void __exit susfs_exit(void)
 module_init(susfs_init);
 module_exit(susfs_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("SUSFS guard LKM (susfs_guard_lkm) v" SUSFS_LKM_VERSION);
+MODULE_DESCRIPTION("SUSFS guard LKM (susfs_guard_lkm) v2.3.0-gki");
