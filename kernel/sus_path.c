@@ -1946,6 +1946,8 @@ struct sus_path_dirent_args {
     unsigned long buf;
 };
 
+static long sus_path_filter(unsigned long buf, long count);
+
 static int kr_getdents64_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     struct sus_path_dirent_args *a = (struct sus_path_dirent_args *)ri->data;
