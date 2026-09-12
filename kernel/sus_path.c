@@ -1915,7 +1915,6 @@ static void sus_path_path_unregister(void)
  * patching.
  *
  * The LSM hooks are exempt: they are pointer swaps, already cost-free. */
-static bool path_registered;
 static bool hooks_armed;
 /* Serialises the first rule's arming.  The hook table it fills is global state:
  * two rules arriving at once (a supercall task_work and a module_init caller)
@@ -1923,19 +1922,83 @@ static bool hooks_armed;
  * layer on top of the first one's. */
 static DEFINE_MUTEX(sus_path_arm_lock);
 
-/* The tracepoint callback and the filter it drives are defined below. */
-static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret);
+/* ---- the listing filter, on __do_sys_getdents64 ----
+ *
+ * The filter has to run AFTER the kernel has built the directory chain, and no LSM
+ * hook can do it: the chain is built inside the filesystem, entry by entry, with no
+ * per-entry callback a module can reach.  That leaves the function itself, and the
+ * innermost one is the right one:
+ *
+ *   __arm64_sys_getdents64 (wrapper)  -> would need a syscall-table entry
+ *   __do_sys_getdents64 (the body)    -> a kretprobe, and it is the same function
+ *                                        for 32-bit callers, so one probe covers
+ *                                        both ABIs
+ *
+ * A global sys_exit tracepoint does the same job - that is what this used to be -
+ * but it fires for EVERY syscall of every process and then compares the number,
+ * which measured 28 ns on calls that have nothing to do with listings (getpid:
+ * 113 -> 141 ns).  A kretprobe is paid for only by getdents64.
+ *
+ * The entry handler stashes the caller's buffer: by the time the return handler
+ * runs, the argument registers are gone.  For a 32-bit caller the register holds
+ * the zero-extended user pointer, which is the address to use as is. */
+struct sus_path_dirent_args {
+    unsigned long buf;
+};
 
-static void sus_path_tracepoint_register(void)
+static int kr_getdents64_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    int rc = register_trace_sys_exit(sus_path_sys_exit, NULL);
+    struct sus_path_dirent_args *a = (struct sus_path_dirent_args *)ri->data;
+
+    a->buf = regs_get_kernel_argument(regs, 1);
+    return 0;
+}
+
+static int kr_getdents64_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    const struct sus_path_dirent_args *a = (const struct sus_path_dirent_args *)ri->data;
+    long ret = regs_return_value(regs);
+
+    if (ret <= 0 || !a->buf)
+        return 0;
+    if (!READ_ONCE(sus_path_count) && !hide_name[0])
+        return 0;
+
+    regs_set_return_value(regs, sus_path_filter(a->buf, ret));
+    return 0;
+}
+
+static struct kretprobe krp_getdents64 = {
+    .kp.symbol_name = "__do_sys_getdents64",
+    .entry_handler = kr_getdents64_entry,
+    .handler = kr_getdents64_ret,
+    .data_size = sizeof(struct sus_path_dirent_args),
+    .maxactive = 64,
+};
+
+static bool getdents64_probe_registered;
+
+static void sus_path_dirent_register(void)
+{
+    int rc = register_kretprobe(&krp_getdents64);
 
     if (rc) {
-        pr_warn("register_trace_sys_exit(getdents64) failed %d\n", rc);
+        /* This is the one thing the LSM slots cannot do, so say so loudly: without
+         * it a hidden entry shows up in every directory listing. */
+        pr_warn("sus_path: kretprobe(__do_sys_getdents64) failed %d - listings will not be filtered\n",
+                rc);
         return;
     }
-    path_registered = true;
-    pr_info("sus_path: getdents64 filter armed\n");
+    getdents64_probe_registered = true;
+    pr_info("sus_path: listing filter armed (kretprobe __do_sys_getdents64)\n");
+}
+
+static void sus_path_dirent_unregister(void)
+{
+    if (!getdents64_probe_registered)
+        return;
+    unregister_kretprobe(&krp_getdents64);
+    getdents64_probe_registered = false;
 }
 
 static void sus_path_hooks_arm(void)
@@ -1967,14 +2030,14 @@ static void sus_path_hooks_arm(void)
      *
      * no_extra is the isolation switch: no LSM, no dirent filter, no DAC. */
     if (!no_extra)
-        sus_path_tracepoint_register();
+        sus_path_dirent_register();
     else
         pr_warn("sus_path: no_extra - dirent filter off\n");
 
     /* Diagnostic only, and independent of any rule: it is about which path
      * walkers this kernel actually executes. */
     sus_path_cand_register();
-    pr_info("sus_path: hooks armed (LSM + getdents64)\n");
+    pr_info("sus_path: hooks armed (LSM + getdents64 kretprobe)\n");
     mutex_unlock(&sus_path_arm_lock);
 }
 
@@ -2134,51 +2197,6 @@ static long sus_path_filter(unsigned long buf, long count)
     return written;
 }
 
-static void sus_path_sys_exit(void *data, struct pt_regs *regs, long ret)
-{
-    unsigned long args[6];
-    unsigned long dirent_buf;
-    long new_count;
-    int nr;
-
-    nr = syscall_get_nr(current, regs);
-
-
-    /* 32-bit tasks reach getdents64 through the compat table with a different
-     * syscall number, but the dirent64 buffer layout is identical (v5.15 has no
-     * compat_filldir64).  The old code returned early for compat tasks, which
-     * left 32-bit apps able to list hidden entries for no reason. */
-    if (is_compat_task()) {
-        if (nr != __NR_compat_getdents64)
-            return;
-    } else if (nr != __NR_getdents64) {
-        return;
-    }
-
-    if (ret <= 0)
-        return;
-    if (!READ_ONCE(sus_path_count) && !hide_name[0])
-        return;
-
-    /* NOTE: in a sys_exit probe regs->regs[0] already holds the return value,
-     * so only args[1] (the buffer) and args[2] (the byte count) are usable.
-     *
-     * arm64's syscall_get_arguments() hands back the raw registers, and for a
-     * 32-bit task only the low half of each is the argument - every other compat
-     * path in this file masks with compat_ptr(), so this one has to as well or a
-     * 32-bit caller's buffer address is treated as 64-bit garbage. */
-    syscall_get_arguments(current, regs, args);
-    dirent_buf = args[1];
-    if (is_compat_task())
-        dirent_buf = (unsigned long)compat_ptr((u32)dirent_buf);
-    if (!dirent_buf)
-        return;
-
-    new_count = sus_path_filter(dirent_buf, ret);
-
-    if (new_count != ret)
-        regs->regs[0] = new_count;   /* shrink the returned byte count */
-}
 
 /* read-only view of the registered paths, for verification */
 static int sus_path_show_list(char *buf, const struct kernel_param *kp)
@@ -2454,11 +2472,7 @@ void sus_path_exit(void)
     if (sus_path_getattr_hook.entry)
         ksu_unregister_lsm_hook(&sus_path_getattr_hook);
 
-    if (path_registered) {
-        unregister_trace_sys_exit(sus_path_sys_exit, NULL);
-        tracepoint_synchronize_unregister();
-        path_registered = false;
-    }
+    sus_path_dirent_unregister();
     kvfree(dirent_tmp);
     dirent_tmp = NULL;
 
