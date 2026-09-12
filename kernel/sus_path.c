@@ -133,7 +133,7 @@ struct sus_path_entry {
     unsigned int pass;
     /* This rule is one of the module's own control nodes (/proc/susfs_*): hide
      * it from every non-root caller, not only from apps - see
-     * sus_path_entry_gate(). */
+     * sus_path_entry_gate_any() / sus_path_entry_gate_inode(). */
     bool self_protect;
     /* The mode the inode had before this rule relaxed it, or 0 when the rule did
      * not touch it (see sus_path_relax_mode()). */
@@ -338,9 +338,9 @@ static atomic_t sus_path_pend_logged_rc = ATOMIC_INIT(1);   /* rc already report
 static int hide_from_apps = 1;
 module_param(hide_from_apps, int, 0644);
 
-/* UID half of the upstream gate.  Separate because the getdents64 tracepoint
- * only has an inode NUMBER, not an inode, so it cannot apply the ownership
- * check in sus_path_gate_ok(). */
+/* UID half of the upstream gate.  Separate because a rule that has not resolved
+ * its path yet (PENDING, inode == NULL) has no inode to ask about ownership - see
+ * sus_path_entry_gate_any(). */
 static inline bool sus_path_gate_uid_ok(void)
 {
     if (!hide_from_apps)
@@ -374,19 +374,36 @@ static inline bool sus_path_gate_ok(struct inode *inode)
  * module.
  *
  * Ordinary rules keep the upstream semantics untouched. */
-static inline bool sus_path_entry_gate(const struct sus_path_entry *e)
-{
-    if (e->self_protect)
-        return current_uid().val != 0;
-    return sus_path_gate_uid_ok();
-}
-
 static inline bool sus_path_entry_gate_inode(const struct sus_path_entry *e,
                                              struct inode *inode)
 {
     if (e->self_protect)
         return current_uid().val != 0;
     return sus_path_gate_ok(inode);
+}
+
+/* The gate for the layers that match by (ino, name) or by path string rather
+ * than by the inode being accessed: the dirent filter and the path-string
+ * matcher.
+ *
+ * They used to apply the uid half only, which made them answer differently from
+ * the LSM layer for the one case upstream's gate is really about: a file owned
+ * by the calling app.  Registering such a file made it disappear from the
+ * listing while stat()/open() still succeeded - a listing that omits a file the
+ * caller can open is a far louder signal than either behaviour alone.
+ *
+ * The rule keeps its inode ihold()ed, so the ownership question can be asked of
+ * that very inode here: no cached uid, and a chown() of the hidden file moves
+ * both layers together.  A rule whose path has not resolved yet has no inode and
+ * falls back to the uid half (the LSM layer cannot see it either, because
+ * nothing exists at that path yet to be accessed). */
+static inline bool sus_path_entry_gate_any(const struct sus_path_entry *e)
+{
+    if (e->self_protect)
+        return current_uid().val != 0;
+    if (!e->inode)
+        return sus_path_gate_uid_ok();
+    return sus_path_gate_ok(e->inode);
 }
 
 static bool sus_path_is_hidden(u64 ino, const char *name)
@@ -410,7 +427,7 @@ static bool sus_path_is_hidden(u64 ino, const char *name)
         spin_lock(&sus_path_lock);
         list_for_each_entry(e, &sus_path_list, list) {
             if (e->ino && e->ino == ino && !strcmp(e->name, name) &&
-                sus_path_entry_gate(e)) {
+                sus_path_entry_gate_any(e)) {
                 hidden = true;
                 break;
             }
@@ -1329,7 +1346,9 @@ static bool sus_path_match_path(const char *path)
         if (!n || strncmp(path, e->path, n))
             continue;
         if (path[n] == '\0' || path[n] == '/') {
-            if (!sus_path_entry_gate(e))
+            /* Owned-by-the-caller is answered the same way here as in the LSM
+             * layer: see sus_path_entry_gate_any(). */
+            if (!sus_path_entry_gate_any(e))
                 continue;
             hit = true;
             break;
@@ -2343,7 +2362,7 @@ static int sus_path_add_hidden_ex(const char *path, bool self_protect)
 
 /* Register one of the module's own control nodes.  Same table, but the rule is
  * flagged so the gate hides it from every non-root caller rather than only from
- * apps - see sus_path_entry_gate(). */
+ * apps - see sus_path_entry_gate_any(). */
 int sus_path_add_self_hidden(const char *path)
 {
 	return sus_path_add_hidden_ex(path, true);

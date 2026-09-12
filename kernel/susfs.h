@@ -23,7 +23,7 @@ int sus_path_add_hidden(const char *path);
 /* Same, for one of this module's own control nodes: the rule is flagged so the
  * gate hides it from EVERY non-root caller, not merely from apps (uid>=10000).
  * Without that, a probe running as system (1000) or shell (2000) reads the node
- * name straight out of /proc - see sus_path_entry_gate(). */
+ * name straight out of /proc - see sus_path_entry_gate_any(). */
 int sus_path_add_self_hidden(const char *path);
 
 /* Whether the /proc/susfs_* control nodes are created at all.  Defaults to TRUE:
