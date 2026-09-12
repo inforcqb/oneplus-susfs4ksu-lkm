@@ -289,7 +289,8 @@ void mntid_main(long argc, char **argv)
 		}
 		sys6(SYS_close, fd, 0, 0, 0, 0, 0);
 
-		if (sys6(SYS_statx, AT_FDCWD, (long)path, 0, STATX_MNT_ID, (long)&stx) == 0) {
+		if (sys6(SYS_statx, AT_FDCWD, (long)path, 0, STATX_MNT_ID,
+			 (long)&stx, 0) == 0) {
 			int ok = in_mountinfo(stx.stx_mnt_id);
 
 			if (!ok)
