@@ -509,6 +509,16 @@ static atomic_t n_gup_calls = ATOMIC_INIT(0);
 static atomic_t n_pin_gup_calls = ATOMIC_INIT(0);
 static atomic_t n_vm_hides = ATOMIC_INIT(0);
 
+static struct kprobe kp_gup_remote = {
+    .symbol_name = "get_user_pages_remote",
+    .pre_handler = sus_map_vm_access_pre,
+};
+
+static struct kprobe kp_pin_gup = {
+    .symbol_name = "pin_user_pages_remote",
+    .pre_handler = sus_map_vm_access_pre,
+};
+
 static int sus_map_vm_access_pre(struct kprobe *kp, struct pt_regs *regs)
 {
     struct mm_struct *mm = (struct mm_struct *)regs->regs[0];
@@ -541,16 +551,6 @@ static int sus_map_vm_access_pre(struct kprobe *kp, struct pt_regs *regs)
     regs->pc = regs->regs[30];          /* skip the call: nothing is pinned */
     return 1;
 }
-
-static struct kprobe kp_gup_remote = {
-    .symbol_name = "get_user_pages_remote",
-    .pre_handler = sus_map_vm_access_pre,
-};
-
-static struct kprobe kp_pin_gup = {
-    .symbol_name = "pin_user_pages_remote",
-    .pre_handler = sus_map_vm_access_pre,
-};
 
 /* ---- /proc/<pid>/map_files/<start>-<end> ----
  *
