@@ -1689,6 +1689,12 @@ static void sus_path_hooks_arm(void)
         sus_path_syscall_register();
         sus_path_path_register();
         sus_path_getname_register();
+        /* Only here: with no entry layer in front of it, DAC is the first thing
+         * that would refuse a hidden file, and it answers EACCES.  With the fp
+         * layer armed this never fires (measured: dac=0), so it is not armed.
+         * no_extra still means what it says: no LSM, no DAC, no tracepoint. */
+        if (!no_extra)
+            sus_path_dac_register();
     }
     /* Diagnostic only, and independent of any rule: it is about which path
      * walkers this kernel actually executes. */
@@ -2341,12 +2347,17 @@ int sus_path_init(void)
         pr_info("sus_path: perm hook armed, orig=%ps\n",
                 sus_path_perm_hook.original);
 
-    /* And the DAC layer, without which a caller DAC denies gets EACCES instead
-     * of ENOENT (see the note above it).  Registered eagerly because it is the
-     * layer that would otherwise answer EACCES, and it has never been observed
-     * to fire on this kernel anyway. */
-    sus_path_dac_register();
-
+    /* The DAC layer is NOT registered here any more.
+     *
+     * It exists for one case: DAC runs before the LSM chain, so a file whose mode
+     * denies the caller gets EACCES before any LSM hook can turn it into ENOENT.
+     * But an entry layer that refuses before the syscall runs means DAC is never
+     * reached at all - measured: with the fp layer armed, dac stayed 0 across the
+     * whole regression, and even hide_by_dac=0 still answered ENOENT.  It was two
+     * brk exceptions on every inode_permission/generic_permission for nothing.
+     *
+     * So it is armed from sus_path_hooks_arm() only when the fp layer could not be
+     * installed - which is the configuration where it can actually fire. */
     return 0;
 }
 
