@@ -23,6 +23,13 @@ struct susfs_fp_hook {
 	susfs_syscall_fn_t *orig_slot;		/* where the wrapper reads the original */
 	susfs_syscall_fn_t orig;		/* the entry we replaced */
 	bool installed;
+	/* Also replace the 32-bit entry in compat_sys_call_table.  A 32-bit task
+	 * never touches sys_call_table, so without this the whole layer is invisible
+	 * to it - and an entry layer the compat side cannot reach is exactly why the
+	 * compat kprobes exist. */
+	bool compat;
+	susfs_syscall_fn_t *orig_slot_compat;	/* where a wrapper reads the compat original */
+	susfs_syscall_fn_t orig_compat;		/* the compat entry we replaced */
 };
 
 /* Resolves and caches sys_call_table; 0 on the first success. */

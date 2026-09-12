@@ -48,6 +48,31 @@
 #define SUSFS_ARM64_BTI_C	0xd503245fu
 
 static susfs_syscall_fn_t *sys_call_table_ptr;
+static susfs_syscall_fn_t *compat_sys_call_table_ptr;
+
+/* One table patch, with the same ordering rule for both tables: the wrapper reads
+ * its original out of the module slot, so the slot is published first and the
+ * write is verified afterwards. */
+static int fp_patch_entry(susfs_syscall_fn_t *table, int nr, const char *name,
+			  susfs_syscall_fn_t wrapper, susfs_syscall_fn_t old)
+{
+	int err;
+
+	err = ksu_patch_text(&table[nr], &wrapper, sizeof(wrapper),
+			     KSU_PATCH_TEXT_FLUSH_DCACHE);
+	if (err) {
+		pr_warn("susfs_fp: %s: write failed %d\n", name, err);
+		return err;
+	}
+	if (READ_ONCE(table[nr]) != wrapper) {
+		/* A half-written pointer is worse than none: put the old one back. */
+		ksu_patch_text(&table[nr], &old, sizeof(old),
+			       KSU_PATCH_TEXT_FLUSH_DCACHE);
+		pr_warn("susfs_fp: %s: write did not stick, rolled back\n", name);
+		return -EIO;
+	}
+	return 0;
+}
 
 int susfs_fp_init(void)
 {
@@ -81,6 +106,16 @@ int susfs_fp_init(void)
 
 	pr_info("susfs_fp: sys_call_table at %px (entry 0 %px)\n",
 		sys_call_table_ptr, (void *)READ_ONCE(sys_call_table_ptr[0]));
+
+	/* Optional: only the entries marked .compat need it, and a kernel without it
+	 * just means those entries stay native-only. */
+	compat_sys_call_table_ptr =
+		(susfs_syscall_fn_t *)find_kernel_symbol_exact("compat_sys_call_table");
+	if (!compat_sys_call_table_ptr)
+		compat_sys_call_table_ptr =
+			(susfs_syscall_fn_t *)ksu_resolve_symbol_for_functable_hook("compat_sys_call_table");
+	pr_info("susfs_fp: compat_sys_call_table at %px (%s)\n",
+		compat_sys_call_table_ptr, compat_sys_call_table_ptr ? "ok" : "absent");
 	return 0;
 }
 
@@ -171,18 +206,34 @@ int susfs_fp_install(struct susfs_fp_hook *h)
 		WRITE_ONCE(*h->orig_slot, old);
 	smp_wmb();
 
-	err = ksu_patch_text(&sys_call_table_ptr[h->nr], &h->wrapper,
-			     sizeof(h->wrapper), KSU_PATCH_TEXT_FLUSH_DCACHE);
-	if (err) {
-		pr_warn("susfs_fp: %s: write failed %d\n", h->name, err);
+	err = fp_patch_entry(sys_call_table_ptr, h->nr, h->name, h->wrapper, old);
+	if (err)
 		return err;
-	}
-	if (READ_ONCE(sys_call_table_ptr[h->nr]) != h->wrapper) {
-		/* A half-written pointer is worse than none: put the old one back. */
-		ksu_patch_text(&sys_call_table_ptr[h->nr], &old,
-			       sizeof(old), KSU_PATCH_TEXT_FLUSH_DCACHE);
-		pr_warn("susfs_fp: %s: write did not stick, rolled back\n", h->name);
-		return -EIO;
+
+	/* The 32-bit table is a second, independent entry: a compat task never reads
+	 * sys_call_table, so an entry that is only patched natively is simply not
+	 * there for it. */
+	if (h->compat && compat_sys_call_table_ptr) {
+		susfs_syscall_fn_t cold = READ_ONCE(compat_sys_call_table_ptr[h->nr]);
+
+		if (!cold) {
+			pr_warn("susfs_fp: %s: compat entry is NULL, native only\n", h->name);
+		} else {
+			h->orig_compat = cold;
+			if (h->orig_slot_compat)
+				WRITE_ONCE(*h->orig_slot_compat, cold);
+			smp_wmb();
+			err = fp_patch_entry(compat_sys_call_table_ptr, h->nr, h->name,
+					     h->wrapper, cold);
+			if (err) {
+				/* Keep the two tables consistent rather than half-armed. */
+				ksu_patch_text(&sys_call_table_ptr[h->nr], &h->orig,
+					       sizeof(h->orig), KSU_PATCH_TEXT_FLUSH_DCACHE);
+				return err;
+			}
+			pr_info("susfs_fp: nr %d (%s) compat entry armed (original %px)\n",
+				h->nr, h->name, (void *)cold);
+		}
 	}
 
 	h->installed = true;
@@ -204,6 +255,16 @@ void susfs_fp_remove(struct susfs_fp_hook *h)
 		pr_warn("susfs_fp: nr %d is not ours any more, leaving it alone\n", h->nr);
 		h->installed = false;
 		return;
+	}
+
+	if (h->compat && compat_sys_call_table_ptr && h->orig_compat &&
+	    READ_ONCE(compat_sys_call_table_ptr[h->nr]) == h->wrapper) {
+		err = ksu_patch_text(&compat_sys_call_table_ptr[h->nr], &h->orig_compat,
+				     sizeof(h->orig_compat), KSU_PATCH_TEXT_FLUSH_DCACHE);
+		if (err)
+			pr_warn("susfs_fp: nr %d compat restore failed %d\n", h->nr, err);
+		else
+			pr_info("susfs_fp: nr %d (%s) compat entry restored\n", h->nr, h->name);
 	}
 
 	err = ksu_patch_text(&sys_call_table_ptr[h->nr], &h->orig,

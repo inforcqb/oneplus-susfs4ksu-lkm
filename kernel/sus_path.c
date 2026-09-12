@@ -1713,12 +1713,9 @@ static void sus_path_hooks_arm(void)
     }
 
     hooks_armed = true;
-    if (!no_extra) {
-        sus_path_tracepoint_register();
-    } else {
-        /* no_extra is the isolation switch: with the tracepoint gone the dirent
-         * filter is off, and so is the sys_exit rewrite that backstops the
-         * syscalls KernelSU also hooks. */
+    if (no_extra) {
+        /* no_extra is the isolation switch: no dirent filter, no sys_exit
+         * rewrite, no LSM, no DAC. */
         pr_warn("sus_path: no_extra - dirent filter and sys_exit rewrite off\n");
     }
 
@@ -1730,11 +1727,13 @@ static void sus_path_hooks_arm(void)
     }
 
     if (lsm_only) {
-        /* Nothing is armed on purpose: the LSM hooks came up with the module and
-         * the getdents64 tracepoint above is the only other layer.  Whatever the
-         * app sees now is the LSM layer's own coverage - and the sys_exit rewrite
-         * stays off, because the LSM layer decides on the same rule table. */
+        /* Nothing entry-level is armed on purpose, so what the app sees is the LSM
+         * layer's own coverage.  The tracepoint stays because the listing filter
+         * lives there when the fp layer is not the one answering, and the sys_exit
+         * rewrite stays off: the LSM layer decides on the same rule table. */
         sus_path_exit_rewrite = false;
+        if (!no_extra)
+            sus_path_tracepoint_register();
         pr_info("sus_path: hooks armed (lsm_only: LSM + getdents64 only)\n");
         sus_path_cand_register();
         mutex_unlock(&sus_path_arm_lock);
@@ -1746,19 +1745,19 @@ static void sus_path_hooks_arm(void)
      * instruction at all (see susfs_fp_hook.c).  The kprobe layer stays as the
      * fallback for a kernel where the table cannot be resolved. */
     if (fp_enabled && sus_path_fp_arm() > 0) {
-        /* Only the compat layer is added on top of the fp layer.
-         *
-         * The 32-bit wrappers go through compat_sys_call_table, which the fp layer
-         * does not touch - and these probes only cost something when a 32-bit task
-         * actually calls through them, so 64-bit callers pay nothing.
+        /* The compat kprobes are still registered, but only for the entries the fp
+         * layer does not replace; getdents64 is one of them, so the listing filter
+         * no longer needs the sys_exit tracepoint and it stays unregistered - which
+         * is the point: a tracepoint is paid for by every syscall of every process,
+         * an entry by the one syscall that uses it.
          *
          * The path layer (filename_lookup / do_filp_open / user_path_at_empty) and
          * the getname_flags kretprobe are deliberately NOT registered here: they
          * read the same string as the fp wrapper and match it against the same
          * rule table, while the fp wrapper refuses before the real syscall runs -
-         * so nothing they could catch is ever reachable.  Measured: after four
-         * spellings of a hidden path plus 3000 normal accesses, fp=2 and
-         * kp=0 getname=0.  What they did do was put a brk exception and a
+         * so nothing they could catch is ever reachable through those spellings.
+         * Measured: after four spellings of a hidden path plus 3000 normal accesses,
+         * fp=2 and kp=0 getname=0.  What they did do was put a brk exception and a
          * single-step on every ordinary, non-hidden call.  They are registered in
          * the fallback branch below, which is the only case where they can help. */
         sus_path_compat_register();
@@ -1768,9 +1767,12 @@ static void sus_path_hooks_arm(void)
         sus_path_syscall_register();
         sus_path_path_register();
         sus_path_getname_register();
-        /* The kprobe layer cannot take faccessat/faccessat2/newfstatat (KernelSU
-         * owns those entries), so those three are answered on the way out. */
+        /* The listing filter and the answer for faccessat/faccessat2/newfstatat
+         * (KernelSU owns those entries, so the kprobe layer cannot take them) both
+         * live on sys_exit - the only place they can be done without the fp layer. */
         sus_path_exit_rewrite = true;
+        if (!no_extra)
+            sus_path_tracepoint_register();
         /* Only here: with no entry layer in front of it, DAC is the first thing
          * that would refuse a hidden file, and it answers EACCES.  With the fp
          * layer armed this never fires (measured: dac=0), so it is not armed.
@@ -1887,6 +1889,45 @@ static void sus_path_fp_cover_gap(unsigned int base_ns)
  * syscall costs when it fails the real way on this device, minus the ~270 ns the
  * refusal already spends.  readlinkat and execve are estimates of the same shape
  * (a failed execve does more work than a failed stat). */
+/* getdents64 is the one entry that is not an entry decision: the kernel fills the
+ * caller's buffer and we compact the chain afterwards.  That is why it used to sit
+ * on the sys_exit tracepoint - and a tracepoint fires for *every* syscall of every
+ * process, so the dirent filter was being paid for by the whole system.  On the
+ * entry, only getdents64 pays. */
+static long sus_path_filter(unsigned long buf, long count);
+
+static susfs_syscall_fn_t susfs_fp_orig_getdents64;
+static susfs_syscall_fn_t susfs_fp_orig_compat_getdents64;
+
+static __nocfi long susfs_fp_getdents64(const struct pt_regs *regs)
+{
+	susfs_syscall_fn_t orig = is_compat_task() ?
+		READ_ONCE(susfs_fp_orig_compat_getdents64) :
+		READ_ONCE(susfs_fp_orig_getdents64);
+	unsigned long buf;
+	long ret;
+
+	if (!orig)
+		return -ENOSYS;
+
+	ret = orig(regs);
+	if (ret <= 0)
+		return ret;
+	/* The cheap test first: with no rules and no legacy name list there is
+	 * nothing that could match, and this runs on every listed directory. */
+	if (!READ_ONCE(sus_path_count) && !hide_name[0])
+		return ret;
+
+	/* regs still holds the entry arguments - the original ran against user memory
+	 * and only its result travels back through here. */
+	buf = (unsigned long)regs->regs[1];
+	if (is_compat_task())
+		buf = (unsigned long)compat_ptr((u32)buf);
+	if (!buf)
+		return ret;
+	return sus_path_filter(buf, ret);
+}
+
 #define SUSFS_FP_WRAPPER(w, argno, cover_ns)				\
 	static susfs_syscall_fn_t susfs_fp_orig_##w;			\
 	static __nocfi long susfs_fp_##w(const struct pt_regs *regs)	\
@@ -1908,6 +1949,12 @@ SUSFS_FP_WRAPPER(readlinkat, 1, 1550)
 SUSFS_FP_WRAPPER(execve, 0, 1950)
 
 static struct susfs_fp_hook fp_hooks[] = {
+	/* Last field group is the compat one: .compat = true means the 32-bit entry
+	 * in compat_sys_call_table is replaced as well.  A 32-bit task never reads
+	 * sys_call_table, so without it the listing filter simply would not exist for
+	 * 32-bit callers - which is the whole reason the compat kprobes are there. */
+	{ __NR_getdents64,  "susfs_fp_getdents64",  "__arm64_sys_getdents64",  susfs_fp_getdents64,  &susfs_fp_orig_getdents64,  NULL, false,
+	  true,             &susfs_fp_orig_compat_getdents64, NULL },
 	{ __NR_newfstatat,  "susfs_fp_newfstatat",  "__arm64_sys_newfstatat",  susfs_fp_newfstatat,  &susfs_fp_orig_newfstatat,  NULL, false },
 	{ __NR_statx,       "susfs_fp_statx",       "__arm64_sys_statx",       susfs_fp_statx,       &susfs_fp_orig_statx,       NULL, false },
 	{ __NR_faccessat,   "susfs_fp_faccessat",   "__arm64_sys_faccessat",   susfs_fp_faccessat,   &susfs_fp_orig_faccessat,   NULL, false },
