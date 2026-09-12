@@ -1668,13 +1668,22 @@ static void sus_path_hooks_arm(void)
      * instruction at all (see susfs_fp_hook.c).  The kprobe layer stays as the
      * fallback for a kernel where the table cannot be resolved. */
     if (fp_enabled && sus_path_fp_arm() > 0) {
-        /* These target DIFFERENT symbols, so they keep their probes: the 32-bit
-         * wrappers go through compat_sys_call_table, the path layer hooks
-         * filename_lookup / do_filp_open / user_path_at_empty, and getname_flags
-         * is an onLeave hook that an entry layer cannot express. */
-        sus_path_path_register();
+        /* Only the compat layer is added on top of the fp layer.
+         *
+         * The 32-bit wrappers go through compat_sys_call_table, which the fp layer
+         * does not touch - and these probes only cost something when a 32-bit task
+         * actually calls through them, so 64-bit callers pay nothing.
+         *
+         * The path layer (filename_lookup / do_filp_open / user_path_at_empty) and
+         * the getname_flags kretprobe are deliberately NOT registered here: they
+         * read the same string as the fp wrapper and match it against the same
+         * rule table, while the fp wrapper refuses before the real syscall runs -
+         * so nothing they could catch is ever reachable.  Measured: after four
+         * spellings of a hidden path plus 3000 normal accesses, fp=2 and
+         * kp=0 getname=0.  What they did do was put a brk exception and a
+         * single-step on every ordinary, non-hidden call.  They are registered in
+         * the fallback branch below, which is the only case where they can help. */
         sus_path_compat_register();
-        sus_path_getname_register();
     } else {
         pr_warn("sus_path: fp layer unavailable, falling back to kprobes\n");
         sus_path_syscall_register();
