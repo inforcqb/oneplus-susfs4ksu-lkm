@@ -51,16 +51,35 @@ static susfs_syscall_fn_t *sys_call_table_ptr;
 
 int susfs_fp_init(void)
 {
+	void *direct, *walked;
+
 	if (sys_call_table_ptr)
 		return 0;
 
-	sys_call_table_ptr = (susfs_syscall_fn_t *)find_kernel_symbol_exact("sys_call_table");
+	/* Both lookups, because they do not cover the same symbols: on 5.15
+	 * find_kernel_symbol_exact() is kallsyms_lookup_name(), while
+	 * ksu_resolve_symbol_for_functable_hook() also walks kallsyms_on_each_symbol -
+	 * which is how KernelSU resolves this exact symbol.  Data symbols such as
+	 * sys_call_table are the reason to keep both. */
+	direct = (void *)find_kernel_symbol_exact("sys_call_table");
+	sys_call_table_ptr = (susfs_syscall_fn_t *)direct;
 	if (!sys_call_table_ptr) {
-		pr_warn("susfs_fp: sys_call_table not found\n");
+		walked = ksu_resolve_symbol_for_functable_hook("sys_call_table");
+		sys_call_table_ptr = (susfs_syscall_fn_t *)walked;
+	}
+
+	if (!sys_call_table_ptr) {
+		/* Keep the evidence in the log: direct lookup vs the kallsyms walk, on
+		 * this symbol and on a known-good one of each kind. */
+		pr_warn("susfs_fp: sys_call_table not found: direct=%px walk=%px "
+			"(control: jiffies direct=%px, openat walk=%px)\n",
+			direct, walked,
+			(void *)find_kernel_symbol_exact("jiffies"),
+			ksu_resolve_symbol_for_functable_hook("__arm64_sys_openat"));
 		return -ENOENT;
 	}
 
-	pr_info("susfs_fp: sys_call_table at %px (first entry %px)\n",
+	pr_info("susfs_fp: sys_call_table at %px (entry 0 %px)\n",
 		sys_call_table_ptr, (void *)READ_ONCE(sys_call_table_ptr[0]));
 	return 0;
 }

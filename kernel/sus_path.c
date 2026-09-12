@@ -1916,6 +1916,10 @@ static void sus_path_fp_arm(void)
 	 * plain symbol or the .cfi_jt stub" for this exact kernel, and whether our
 	 * wrappers carry the BTI landing pad an indirect call needs. */
 	if (fp_dump) {
+		if (susfs_fp_init()) {
+			pr_warn("sus_path: fp_dump: sys_call_table unavailable, nothing to dump\n");
+			return;
+		}
 		for (i = 0; i < (int)N_FP_HOOKS; i++) {
 			susfs_fp_dump_entry(fp_hooks[i].nr, fp_hooks[i].sym);
 			susfs_fp_dump_wrapper(fp_hooks[i].name, (const void *)fp_hooks[i].wrapper);
