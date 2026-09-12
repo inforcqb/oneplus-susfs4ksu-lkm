@@ -198,3 +198,22 @@ jobs:
           name: susfs_mntid
           path: /tmp/susfs_mntid
           if-no-files-found: warn
+      # A 32-bit client.  Only a real AArch32 caller can exercise the compat stat
+      # path, and the audit showed the module had the compat structure wrong - no
+      # 64-bit test could have seen that.
+      - name: Build 32-bit compat stat client
+        run: |
+          set -e
+          clang --target=armv7a-linux-androideabi -march=armv7-a -O2 -nostdlib \
+                -static-pie -fno-stack-protector -fno-builtin -fuse-ld=lld \
+                -Wl,-e,_start -o /tmp/susfs_compat_stat tools/susfs_compat_stat.c
+          file /tmp/susfs_compat_stat
+          ls -la /tmp/susfs_compat_stat
+
+      - name: Upload 32-bit compat stat client
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs_compat_stat
+          path: /tmp/susfs_compat_stat
+          if-no-files-found: warn
