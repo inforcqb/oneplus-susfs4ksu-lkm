@@ -1870,7 +1870,6 @@ void sus_path_exit(void)
  * hidden from the moment the background walk resolves its inode.  What the pending
  * state delays is every layer - the LSM slots (by inode) and the dirent filter
  * ((ino, name)) - because none of them can match an inode that does not exist yet. */
- * the inode resolves. */
 void sus_path_supercall(unsigned int cmd, void __user **arg)
 {
     struct st_susfs_sus_path info = {0};
