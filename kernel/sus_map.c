@@ -181,6 +181,7 @@ static struct kprobe *const map_probes[] = {
     &kp_map, &kp_map_smap, &kp_map_smaps_rollup,
 };
 #define N_MAP_PROBES ARRAY_SIZE(map_probes)
+static bool map_registered;
 static bool map_probe_armed[N_MAP_PROBES];
 
 /* Registers whichever of the three are not up yet.  Called from init (when a rule
@@ -214,7 +215,6 @@ static int sus_map_register_probes(void)
     return map_registered ? 0 : first_err;
 }
 
-static bool map_registered;
 
 int susfs_sus_map_init(void)
 {
