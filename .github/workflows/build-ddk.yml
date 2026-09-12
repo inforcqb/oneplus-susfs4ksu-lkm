@@ -102,3 +102,24 @@ jobs:
           name: susfs_bench
           path: /tmp/susfs_bench
           if-no-files-found: warn
+
+      # mmap a file, touch it, then read /proc/self/pagemap and
+      # /proc/self/smaps_rollup *in the same process* - a shell cannot do this,
+      # because the child that runs dd has its own mm and therefore its own
+      # addresses.
+      - name: Build mmap/pagemap probe
+        continue-on-error: true
+        run: |
+          clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
+                -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
+                -o /tmp/susfs_mmap tools/susfs_mmap.c
+          file /tmp/susfs_mmap
+          ls -la /tmp/susfs_mmap
+
+      - name: Upload mmap/pagemap probe
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs_mmap
+          path: /tmp/susfs_mmap
+          if-no-files-found: warn
