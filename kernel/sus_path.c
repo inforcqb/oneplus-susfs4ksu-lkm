@@ -2199,11 +2199,16 @@ int sus_path_init(void)
 {
     int rc;
 
-    dirent_tmp = kmalloc(DIRENT_BUF_SIZE, GFP_KERNEL);
-    if (!dirent_tmp) {
-        pr_warn("sus_path: kmalloc failed\n");
-        return -ENOMEM;
-    }
+    /* kvmalloc, not kmalloc: 64 KB of physically contiguous order-4 memory is
+     * simply not available on a phone that has been up for a while (measured:
+     * MemFree 394 MB, and kmalloc_order failed with a WARN in its call trace),
+     * and vmalloc memory is just as usable here - the buffer is only touched from
+     * the getdents64 filter, which never faults on it.  A failure is not fatal
+     * either: it only leaves directory listings unfiltered, so the rest of the
+     * layers still come up. */
+    dirent_tmp = kvmalloc(DIRENT_BUF_SIZE, GFP_KERNEL);
+    if (!dirent_tmp)
+        pr_warn("sus_path: dirent scratch buffer unavailable, listings will not be filtered\n");
 
     /* The getdents64 tracepoint (it sits on every syscall exit), the syscall
      * probes and the getname hooks are armed by sus_path_hooks_arm() once a
@@ -2272,7 +2277,7 @@ void sus_path_exit(void)
         tracepoint_synchronize_unregister();
         path_registered = false;
     }
-    kfree(dirent_tmp);
+    kvfree(dirent_tmp);
     dirent_tmp = NULL;
 
     spin_lock(&sus_path_lock);
@@ -2456,11 +2461,13 @@ void sus_path_supercall(void __user **arg)
     }
 
     if (!dirent_tmp) {
-        dirent_tmp = kmalloc(DIRENT_BUF_SIZE, GFP_KERNEL);
-        if (!dirent_tmp) {
-            info.err = -ENOMEM;
-            goto out;
-        }
+        /* Retry once: the first attempt may have run before the system was
+         * settled.  Still not fatal - the rule is registered either way, and the
+         * entry layers below are what answer the access. */
+        dirent_tmp = kvmalloc(DIRENT_BUF_SIZE, GFP_KERNEL);
+        if (!dirent_tmp)
+            pr_warn("sus_path: dirent scratch buffer still unavailable, listing for '%s' stays unfiltered\n",
+                    info.target_pathname);
     }
 
     /* First rule: arm the tracepoint, the syscall probes and the getname
