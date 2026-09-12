@@ -1978,25 +1978,6 @@ static void sus_path_hooks_arm(void)
     mutex_unlock(&sus_path_arm_lock);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
- * base_ns is per syscall because the four targets do not fail equally fast (the
- * numbers above); the jitter keeps "always exactly N" from becoming the next
- * fingerprint. */
- * entry, only getdents64 pays. */
-
-
 /* Rewrite the dirent chain the kernel just produced, dropping the entries whose
  * (d_ino, name) pair is registered; returns the byte count the caller may parse.
  *
