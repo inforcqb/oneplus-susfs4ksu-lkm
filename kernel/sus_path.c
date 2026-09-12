@@ -136,7 +136,49 @@ struct sus_path_entry {
      * it from every non-root caller, not only from apps - see
      * sus_path_entry_gate(). */
     bool self_protect;
+    /* The mode the inode had before this rule relaxed it, or 0 when the rule did
+     * not touch it (see sus_path_relax_mode()). */
+    umode_t orig_mode;
 };
+
+/* Let DAC through, so that the LSM layer is the only thing that can refuse.
+ *
+ * DAC runs before the LSM chain, and a file whose mode denies the caller is
+ * answered EACCES there - before any LSM hook is called, so a hidden path could
+ * not be turned into ENOENT.  Rather than pay for a brk on every permission check
+ * (the old DAC probes), the mode is relaxed once, here, when the rule is
+ * registered: this is the one moment where the inode is already in hand, and it
+ * costs nothing afterwards.
+ *
+ * It is not disguised back on the way out: only non-root callers are hidden at
+ * all, and root is not a party this module hides from, so whoever can see the
+ * relaxed mode can see the file anyway.
+ *
+ * The inode is ihold'ed for as long as the rule lives, so it cannot be evicted and
+ * re-read from disk with the original mode - one write is enough. */
+static void sus_path_relax_mode(struct sus_path_entry *e)
+{
+    umode_t mode;
+
+    if (!e->inode)
+        return;
+
+    mode = READ_ONCE(e->inode->i_mode);
+    if ((mode & (S_IRWXU | S_IRWXG | S_IRWXO)) == 0777)
+        return;                 /* already open, or another rule did it */
+
+    e->orig_mode = mode;
+    WRITE_ONCE(e->inode->i_mode, (mode & ~(umode_t)(S_IRWXU | S_IRWXG | S_IRWXO)) | 0777);
+}
+
+static void sus_path_restore_mode(struct sus_path_entry *e)
+{
+    if (!e->inode || !e->orig_mode)
+        return;
+
+    WRITE_ONCE(e->inode->i_mode, e->orig_mode);
+    e->orig_mode = 0;
+}
 
 static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path);
 
@@ -537,10 +579,17 @@ static int sus_path_resolve_pending(void)
         }
         spin_unlock(&sus_path_lock);
 
-        if (inode)
+        if (inode) {
             iput(inode);                /* the rule is gone, or already resolved */
-        else if (!rc && !published)
+        } else if (slot && published) {
+            /* Relaxed outside the lock: the inode is published and ihold'ed now, so
+             * it cannot go away under us. */
+            spin_lock(&sus_path_lock);
+            sus_path_relax_mode(slot);
+            spin_unlock(&sus_path_lock);
+        } else if (!rc) {
             atomic_inc(&sus_path_pend_lost);    /* walk ok, nothing to publish */
+        }
     }
 
     if (resolved)
@@ -2311,6 +2360,7 @@ static int sus_path_add_hidden_ex(const char *path, bool self_protect)
 	}
 	list_add_tail(&e->list, &sus_path_list);
 	sus_path_count++;
+	sus_path_relax_mode(e);
 	spin_unlock(&sus_path_lock);
 
 	pr_info("sus_path: hidden (built-in) '%s'%s\n", path,
@@ -2435,9 +2485,13 @@ void sus_path_exit(void)
     atomic_set(&sus_path_n_pending, 0);
     spin_unlock(&sus_path_lock);
 
-    /* iput outside the lock: it can sleep and evict the inode. */
+    /* iput outside the lock: it can sleep and evict the inode.  The mode each rule
+     * relaxed is put back first - and before the inode is released, because the
+     * relaxed value only lives in memory: once the last reference is gone there is
+     * no way to tell a relaxed mode from a real one. */
     list_for_each_entry_safe(e, tmp, &doomed, list) {
         list_del(&e->list);
+        sus_path_restore_mode(e);
         if (e->inode)
             iput(e->inode);
         kfree(e);
@@ -2582,6 +2636,7 @@ void sus_path_supercall(void __user **arg)
                 cur->inode = e->inode;      /* the reference moves over */
                 e->inode = NULL;
                 atomic_dec(&sus_path_n_pending);
+                sus_path_relax_mode(cur);   /* it was pending, so it never ran */
                 spin_unlock(&sus_path_lock);
                 kfree(e);
                 info.err = 0;
@@ -2595,6 +2650,8 @@ void sus_path_supercall(void __user **arg)
     sus_path_count++;
     if (!inode)
         atomic_inc(&sus_path_n_pending);
+    else
+        sus_path_relax_mode(e);
     spin_unlock(&sus_path_lock);
 
     if (inode && !ino) {
