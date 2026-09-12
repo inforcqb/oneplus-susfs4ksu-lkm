@@ -13,6 +13,7 @@ modules.order
 
 # downloaded CI artifacts
 artifacts/
+art*/
 
 # device panic logs (debug artifacts, contain device info)
 last_kmsg*.gz
@@ -31,7 +32,6 @@ abi_layout_check/
 # tools/susfs_sc.c into the supercall client.)
 t_*.sh
 art/
-art2/
 
 # internal working documents: audit findings, subagent reports, implementation
 # notes.  Publishing them would describe exactly how the module hides itself and
