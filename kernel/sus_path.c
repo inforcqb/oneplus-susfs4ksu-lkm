@@ -958,6 +958,14 @@ static atomic_t n_hit_exit = ATOMIC_INIT(0);
  * and this layer only carries calls when the fp layer is off. */
 #define SUS_PATH_KP_COVER_NS 1500
 static void sus_path_fp_cover_gap(unsigned int base_ns);
+/* Diagnostic: arm nothing but the LSM hooks (registered at init) and the
+ * getdents64 tracepoint - no fp layer, no kprobes, no path probes, no getname.
+ * It is how the LSM layer's own coverage gets measured instead of guessed: the
+ * entry layers otherwise refuse first and hide what the LSM layer can or cannot
+ * see.  Useful together with a chmod 777 on the target, which is the other half of
+ * an LSM-only design (DAC runs before the LSM chain and would answer EACCES). */
+static bool lsm_only;
+module_param(lsm_only, bool, 0644);
 
 static bool sus_path_match_path(const char *path)
 {
@@ -1659,6 +1667,16 @@ static void sus_path_hooks_arm(void)
     if (fp_dump) {
         sus_path_fp_dump();
         pr_info("sus_path: hooks armed (fp_dump, read-only)\n");
+        mutex_unlock(&sus_path_arm_lock);
+        return;
+    }
+
+    if (lsm_only) {
+        /* Nothing is armed on purpose: the LSM hooks came up with the module and
+         * the getdents64 tracepoint above is the only other layer.  Whatever the
+         * app sees now is the LSM layer's own coverage. */
+        pr_info("sus_path: hooks armed (lsm_only: LSM + getdents64 only)\n");
+        sus_path_cand_register();
         mutex_unlock(&sus_path_arm_lock);
         return;
     }
