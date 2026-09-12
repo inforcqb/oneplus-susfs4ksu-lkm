@@ -88,8 +88,16 @@ static int __init susfs_init(void)
 
     /* sus_path FIRST: it installs the LSM layer whose state every later feature
      * consults before creating a world-accessible control node (see
-     * susfs_expose_proc).  It has no other dependency. */
-    sus_path_init();
+     * susfs_expose_proc).  It has no other dependency.
+     *
+     * Its failure IS fatal: without the LSM slots a registered path is not hidden
+     * at all, and coming up "healthy" would have add_sus_path() report success
+     * while nothing was hidden. */
+    ret = sus_path_init();
+    if (ret) {
+        pr_err("susfs_guard_lkm: sus_path init failed %d, refusing to load\n", ret);
+        return ret;
+    }
 
     susfs_uname_init();
     susfs_kstat_init();

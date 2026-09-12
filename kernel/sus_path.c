@@ -1916,6 +1916,11 @@ static void sus_path_path_unregister(void)
  *
  * The LSM hooks are exempt: they are pointer swaps, already cost-free. */
 static bool hooks_armed;
+/* Secondary LSM hooks that could not be registered: the core two are fatal, these
+ * only mean one class of operation is uncovered - so they are reported through
+ * hide_list as well as the log. */
+static int n_lsm_ext_fail;
+static const char *first_lsm_ext_fail;
 /* Serialises the first rule's arming.  The hook table it fills is global state:
  * two rules arriving at once (a supercall task_work and a module_init caller)
  * would both pass the hooks_armed check, and the second arm would stack a second
@@ -2221,6 +2226,10 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
                    atomic_read(&n_dirent_rewrite_fail),
                    atomic_read(&n_dirent_all_hidden),
                    atomic_read(&sus_path_n_pending));
+    if (n_lsm_ext_fail)
+        n += scnprintf(buf + n, PAGE_SIZE - n,
+                       "lsm: %d secondary hook(s) FAILED (first: %s) - that operation is not covered\n",
+                       n_lsm_ext_fail, first_lsm_ext_fail);
     if (cand_probe) {
         n += scnprintf(buf + n, PAGE_SIZE - n, "cand:");
         for (i = 0; i < N_CAND; i++)
@@ -2378,20 +2387,26 @@ int sus_path_init(void)
         return 0;
     }
 
-    /* LSM hooks: reject path-based access to registered inodes outright. */
+    /* LSM hooks: reject path-based access to registered inodes outright.
+     *
+     * These two ARE the mechanism: a registered path is hidden only because this
+     * layer answers ENOENT.  Failing to register them used to be a warning with a
+     * zero return, so add_sus_path() reported success while nothing was hidden at
+     * all.  Loading now fails instead - the caller has to know. */
     rc = ksu_register_lsm_hook(&sus_path_getattr_hook);
-    if (rc)
-        pr_warn("sus_path: getattr hook failed %d\n", rc);
-    else
-        pr_info("sus_path: getattr hook armed, orig=%ps\n",
-                sus_path_getattr_hook.original);
+    if (rc) {
+        pr_err("sus_path: getattr hook failed %d - nothing would be hidden, refusing to load\n", rc);
+        return rc;
+    }
+    pr_info("sus_path: getattr hook armed, orig=%ps\n", sus_path_getattr_hook.original);
 
     rc = ksu_register_lsm_hook(&sus_path_perm_hook);
-    if (rc)
-        pr_warn("sus_path: perm hook failed %d\n", rc);
-    else
-        pr_info("sus_path: perm hook armed, orig=%ps\n",
-                sus_path_perm_hook.original);
+    if (rc) {
+        pr_err("sus_path: perm hook failed %d - nothing would be hidden, refusing to load\n", rc);
+        ksu_unregister_lsm_hook(&sus_path_getattr_hook);
+        return rc;
+    }
+    pr_info("sus_path: perm hook armed, orig=%ps\n", sus_path_perm_hook.original);
 
     /* Name-based and metadata operations: without these, an app that can write the
      * parent directory can delete or rename a hidden file, and a hidden file can
@@ -2410,12 +2425,24 @@ int sus_path_init(void)
 
         for (i = 0; i < (int)ARRAY_SIZE(extra); i++) {
             rc = ksu_register_lsm_hook(extra[i]);
-            if (rc)
-                pr_warn("sus_path: %s hook failed %d\n", extra[i]->head_name, rc);
-            else
+            if (rc) {
+                /* Not fatal - the core two slots are up, so a hidden path is still
+                 * hidden - but it means one class of operation is NOT covered
+                 * (deleting it, or probing it through statfs/xattr/inotify), so it
+                 * is counted and named in hide_list rather than only logged. */
+                if (!n_lsm_ext_fail)
+                    first_lsm_ext_fail = extra[i]->head_name;
+                n_lsm_ext_fail++;
+                pr_warn("sus_path: %s hook failed %d - that operation will not be covered\n",
+                        extra[i]->head_name, rc);
+            } else {
                 pr_info("sus_path: %s hook armed, orig=%ps\n",
                         extra[i]->head_name, extra[i]->original);
+            }
         }
+        if (n_lsm_ext_fail)
+            pr_warn("sus_path: %d/%d secondary hooks failed (first: %s)\n",
+                    n_lsm_ext_fail, (int)ARRAY_SIZE(extra), first_lsm_ext_fail);
     }
 
     /* The DAC layer is NOT registered here any more.
