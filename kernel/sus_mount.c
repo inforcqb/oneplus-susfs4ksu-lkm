@@ -238,13 +238,26 @@ static atomic_t n_statx_rewrites = ATOMIC_INIT(0);
 static void sus_mount_idmap_add(int sus_id, int shown_id)
 {
     unsigned long flags;
+    int i;
 
+    if (sus_id <= 0 || shown_id <= 0)
+        return;
     spin_lock_irqsave(&idmap_lock, flags);
+    /* The same mount is seen again on every enable (and by both ways in below),
+     * so an entry that is already there must not be appended twice: the table is
+     * fixed size and a re-enable loop would fill it with copies. */
+    for (i = 0; i < n_idmap; i++) {
+        if (mount_idmap[i].sus_id == sus_id) {
+            mount_idmap[i].shown_id = shown_id;
+            goto out;
+        }
+    }
     if (n_idmap < SUS_MOUNT_IDMAP_MAX) {
         mount_idmap[n_idmap].sus_id = sus_id;
         mount_idmap[n_idmap].shown_id = shown_id;
         n_idmap++;
     }
+out:
     spin_unlock_irqrestore(&idmap_lock, flags);
 }
 
@@ -298,8 +311,12 @@ static int sus_mount_shown_id(struct mount *mnt)
 
 static DEFINE_PER_CPU(struct seq_file *, sus_mount_fdinfo_seq);
 
+static atomic_t n_fdinfo_entry = ATOMIC_INIT(0);
+static atomic_t n_fdinfo_nolabel = ATOMIC_INIT(0);
+
 static int sus_mount_fdinfo_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
+    atomic_inc(&n_fdinfo_entry);
     this_cpu_write(sus_mount_fdinfo_seq, (struct seq_file *)regs->regs[0]);
     return 0;
 }
@@ -333,8 +350,10 @@ static int sus_mount_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *r
             break;
         }
     }
-    if (!pos)
+    if (!pos) {
+        atomic_inc(&n_fdinfo_nolabel);
         return 0;
+    }
 
     while (pos + len < count && len < 10 &&
            buf[pos + len] >= '0' && buf[pos + len] <= '9') {
@@ -381,11 +400,25 @@ static bool kr_fdinfo_ok;
  * vfs_statx() fills stat->mnt_id from the path's mount right after the getattr
  * callback, so the only place a kprobe can change it is the uapi struct the
  * syscall is about to copy out - hence entry (take the user pointer, argument 5)
- * plus return (rewrite the field if the call succeeded). */
+ * plus return (rewrite the field if the call succeeded).
+ *
+ * Two landing points, because "the wrapper exists in kallsyms" says nothing
+ * about who is really called: __arm64_sys_statx is the syscall entry, do_statx is
+ * what it delegates to.  Both take (dfd, filename, flags, mask, buffer), and the
+ * rewrite is idempotent (the second one finds a rewritten id that is not in the
+ * table), so arming both is safe - which of them fires is reported separately. */
 static DEFINE_PER_CPU(unsigned long, sus_mount_statx_user);
+
+static atomic_t n_statx_entry = ATOMIC_INIT(0);
+static atomic_t n_statx_ret = ATOMIC_INIT(0);
+static atomic_t n_statx_nobuf = ATOMIC_INIT(0);
+static atomic_t n_statx_err = ATOMIC_INIT(0);
+static atomic_t n_statx_copyfail = ATOMIC_INIT(0);
+static atomic_t n_statx_nomap = ATOMIC_INIT(0);
 
 static int sus_mount_statx_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
+    atomic_inc(&n_statx_entry);
     this_cpu_write(sus_mount_statx_user, regs->regs[4]);
     return 0;
 }
@@ -397,22 +430,35 @@ static int sus_mount_statx_ret(struct kretprobe_instance *ri, struct pt_regs *re
     int new_id;
 
     this_cpu_write(sus_mount_statx_user, 0);
-    if (!ubuf || (long)regs_return_value(regs) != 0)
+    atomic_inc(&n_statx_ret);
+    if ((long)regs_return_value(regs) != 0) {
+        atomic_inc(&n_statx_err);
         return 0;
+    }
+    if (!ubuf) {
+        atomic_inc(&n_statx_nobuf);
+        return 0;
+    }
     if (sus_mount_is_su_domain())
         return 0;
 
     atomic_inc(&n_statx_hits);
     if (copy_from_user(&id, (void __user *)(ubuf + offsetof(struct statx, stx_mnt_id)),
-                       sizeof(id)))
+                       sizeof(id))) {
+        atomic_inc(&n_statx_copyfail);
         return 0;
+    }
     new_id = sus_mount_shown_for((int)id);
-    if (new_id <= 0)
+    if (new_id <= 0) {
+        atomic_inc(&n_statx_nomap);
         return 0;
+    }
     shown = (u64)new_id;
     if (copy_to_user((void __user *)(ubuf + offsetof(struct statx, stx_mnt_id)),
-                     &shown, sizeof(shown)))
+                     &shown, sizeof(shown))) {
+        atomic_inc(&n_statx_copyfail);
         return 0;
+    }
     atomic_inc(&n_statx_rewrites);
     return 0;
 }
@@ -425,17 +471,31 @@ static struct kretprobe kr_statx = {
 };
 static bool kr_statx_ok;
 
+static struct kretprobe kr_statx_do = {
+    .kp.symbol_name = "do_statx",
+    .entry_handler = sus_mount_statx_entry,
+    .handler = sus_mount_statx_ret,
+    .maxactive = 16,
+};
+static bool kr_statx_do_ok;
+
 /* Reachability/effect counters, one line per hook: "installed" says nothing about
  * whether the rewrite ever happened. */
 static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
 {
     return scnprintf(buf, PAGE_SIZE,
-                     "idmap=%d  fdinfo: hits=%d rewrites=%d  statx: hits=%d rewrites=%d  "
-                     "hide=%d su_domain=%d\n",
-                     n_idmap,
-                     atomic_read(&n_fdinfo_hits), atomic_read(&n_fdinfo_rewrites),
+                     "idmap=%d  hide=%d su_domain=%d\n"
+                     "fdinfo: entry=%d hits=%d rewrites=%d nolabel=%d\n"
+                     "statx: entry=%d ret=%d hits=%d rewrites=%d nobuf=%d err=%d copyfail=%d nomap=%d "
+                     "(sys=%d do=%d)\n",
+                     n_idmap, mount_registered, (int)sus_mount_is_su_domain(),
+                     atomic_read(&n_fdinfo_entry), atomic_read(&n_fdinfo_hits),
+                     atomic_read(&n_fdinfo_rewrites), atomic_read(&n_fdinfo_nolabel),
+                     atomic_read(&n_statx_entry), atomic_read(&n_statx_ret),
                      atomic_read(&n_statx_hits), atomic_read(&n_statx_rewrites),
-                     mount_registered, (int)sus_mount_is_su_domain());
+                     atomic_read(&n_statx_nobuf), atomic_read(&n_statx_err),
+                     atomic_read(&n_statx_copyfail), atomic_read(&n_statx_nomap),
+                     (int)kr_statx_ok, (int)kr_statx_do_ok);
 }
 static const struct kernel_param_ops sus_mount_stat_ops = {
     .get = sus_mount_stat_show,
@@ -757,6 +817,10 @@ void susfs_sus_mount_exit(void)
             unregister_kretprobe(&kr_statx);
             kr_statx_ok = false;
         }
+        if (kr_statx_do_ok) {
+            unregister_kretprobe(&kr_statx_do);
+            kr_statx_do_ok = false;
+        }
         mount_registered = false;
     }
     /* Marked mnt_ids are deliberately NOT restored: upstream assigns an id once
@@ -796,10 +860,17 @@ static int sus_mount_register(void)
     else
         kr_fdinfo_ok = true;
     rc = register_kretprobe(&kr_statx);
-    if (rc)
+    if (rc) {
         pr_warn("sus_mount: register_kretprobe(__arm64_sys_statx) failed %d - statx keeps returning the real stx_mnt_id\n", rc);
-    else
+    } else {
         kr_statx_ok = true;
+    }
+    rc = register_kretprobe(&kr_statx_do);
+    if (rc) {
+        pr_warn("sus_mount: register_kretprobe(do_statx) failed %d - the second statx landing point is not armed\n", rc);
+    } else {
+        kr_statx_do_ok = true;
+    }
     mount_registered = true;
     return 0;
 }
@@ -840,6 +911,10 @@ void susfs_sus_mount_supercall(void __user **arg)
         if (kr_statx_ok) {
             unregister_kretprobe(&kr_statx);
             kr_statx_ok = false;
+        }
+        if (kr_statx_do_ok) {
+            unregister_kretprobe(&kr_statx_do);
+            kr_statx_do_ok = false;
         }
         mount_registered = false;
     }
