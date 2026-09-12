@@ -120,7 +120,17 @@ static bool sus_map_gate_ok(void)
     return current_uid().val >= 10000;
 }
 
-static int sus_map_show_map_vma_pre(struct kprobe *kp, struct pt_regs *regs)
+/* One handler for every per-vma seq_file show on the maps family.
+ *
+ * show_map_vma (maps), show_smap (smaps) and show_smaps_rollup (smaps_rollup) all
+ * take (struct seq_file *m, void *v) with v pointing at the vma, and all of them
+ * emit only what they are given - a show callback returning 0 means "handled,
+ * nothing printed", NOT "end of iteration" (seq_read ignores the value), which is
+ * exactly what upstream does inside those functions with its SUS_MAP check.
+ *
+ * smaps is the one that matters most: maps was already covered, but
+ * /proc/<pid>/smaps named the same files again, path and all. */
+static int sus_map_skip_vma_pre(struct kprobe *kp, struct pt_regs *regs)
 {
     struct vm_area_struct *vma;
     struct inode *inode;
@@ -139,11 +149,12 @@ static int sus_map_show_map_vma_pre(struct kprobe *kp, struct pt_regs *regs)
     if (sus_map_lookup(inode->i_ino, inode->i_sb->s_dev)) {
         /* ratelimited, like sus_path's hit logs; the path is not stored in the
          * rule, so ino/dev identify it */
-        pr_info_ratelimited("sus_map: hid maps line (ino=%lu dev=%lu uid=%u)\n",
-                            inode->i_ino,
+        pr_info_ratelimited("sus_map: hid %s line (ino=%lu dev=%lu uid=%u)\n",
+                            kp->symbol_name, inode->i_ino,
                             (unsigned long)inode->i_sb->s_dev,
                             current_uid().val);
-        /* skip this maps line: return early via the saved return address */
+        regs_set_return_value(regs, 0);
+        /* skip this vma: return early via the saved return address */
         regs->pc = regs->regs[30];
         return 1;
     }
@@ -152,8 +163,25 @@ static int sus_map_show_map_vma_pre(struct kprobe *kp, struct pt_regs *regs)
 
 static struct kprobe kp_map = {
     .symbol_name = "show_map_vma",
-    .pre_handler = sus_map_show_map_vma_pre,
+    .pre_handler = sus_map_skip_vma_pre,
 };
+
+static struct kprobe kp_map_smap = {
+    .symbol_name = "show_smap",
+    .pre_handler = sus_map_skip_vma_pre,
+};
+
+static struct kprobe kp_map_smaps_rollup = {
+    .symbol_name = "show_smaps_rollup",
+    .pre_handler = sus_map_skip_vma_pre,
+};
+
+/* Kept in one table so init and exit cannot drift apart. */
+static struct kprobe *const map_probes[] = {
+    &kp_map, &kp_map_smap, &kp_map_smaps_rollup,
+};
+#define N_MAP_PROBES ARRAY_SIZE(map_probes)
+static bool map_probe_armed[N_MAP_PROBES];
 
 static bool map_registered;
 
@@ -167,22 +195,40 @@ int susfs_sus_map_init(void)
         return 0;
     }
 
-    rc = register_kprobe(&kp_map);
-    if (rc)
-        pr_warn("register_kprobe(show_map_vma) failed %d\n", rc);
-    else {
-        map_registered = true;
-        pr_info("sus_map armed: %d rules\n", nmap);
+    /* Every probe is optional on its own: without show_smap the maps listing is
+     * still filtered, so one missing symbol must not take the rest down. */
+    {
+        int i, n = 0;
+
+        for (i = 0; i < (int)N_MAP_PROBES; i++) {
+            rc = register_kprobe(map_probes[i]);
+            if (rc) {
+                pr_warn("sus_map: register_kprobe(%s) failed %d - that listing is not filtered\n",
+                        map_probes[i]->symbol_name, rc);
+                continue;
+            }
+            map_probe_armed[i] = true;
+            n++;
+        }
+        map_registered = n > 0;
+        if (n)
+            pr_info("sus_map armed: %d rules, %d/%d probes\n",
+                    nmap, n, (int)N_MAP_PROBES);
     }
     return 0;
 }
 
 void susfs_sus_map_exit(void)
 {
-    if (map_registered) {
-        unregister_kprobe(&kp_map);
-        map_registered = false;
+    int i;
+
+    for (i = 0; i < (int)N_MAP_PROBES; i++) {
+        if (!map_probe_armed[i])
+            continue;
+        unregister_kprobe(map_probes[i]);
+        map_probe_armed[i] = false;
     }
+    map_registered = false;
     nmap = 0;
 }
 
