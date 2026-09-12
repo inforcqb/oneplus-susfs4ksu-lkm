@@ -3,13 +3,16 @@
  * sus_map.c - hide mmapped real files from /proc/<pid>/maps (SUSFS SUS_MAP).
  *
  * Upstream SUSFS sets AS_FLAGS_SUS_MAP on the inode's address_space flags and
- * makes show_map_vma() skip the line.  An LKM cannot add a flag bit, so we
- * keep an ino set and hook show_map_vma with a kprobe: when the vma's backing
- * file inode is in the set, skip the line by returning early (regs->pc = x30).
+ * makes show_map_vma() / show_smap() skip the line (and the smaps_rollup loop
+ * skip the vma).  An LKM cannot add a flag bit, so we keep an ino set and hook
+ * show_map_vma and show_smap with a kprobe: when the vma's backing file inode
+ * is in the set, skip the line by returning early (regs->pc = x30).
  *
- * show_map_vma(m, vma): vma is arg #2 (regs->regs[1]); returns non-zero from
- * the pre_handler so the arm64 kprobe core skips singlestep and continues at
- * the modified pc (same trick kprg uses).
+ * show_map_vma(m, vma) / show_smap(m, v): vma is arg #2 (regs->regs[1]);
+ * returning non-zero from the pre_handler makes the arm64 kprobe core skip
+ * singlestep and continue at the modified pc (same trick kprg uses).
+ *
+ * smaps_rollup is deliberately NOT probed - see "the sentinel" below.
  *
  * The skip is gated exactly like upstream's, so only processes the gate treats
  * as apps see the line dropped and root/init keep seeing the real mapping - see
@@ -120,16 +123,34 @@ static bool sus_map_gate_ok(void)
     return current_uid().val >= 10000;
 }
 
-/* One handler for every per-vma seq_file show on the maps family.
+/* One handler for show_map_vma (maps) and show_smap (smaps).
  *
- * show_map_vma (maps), show_smap (smaps) and show_smaps_rollup (smaps_rollup) all
- * take (struct seq_file *m, void *v) with v pointing at the vma, and all of them
- * emit only what they are given - a show callback returning 0 means "handled,
- * nothing printed", NOT "end of iteration" (seq_read ignores the value), which is
- * exactly what upstream does inside those functions with its SUS_MAP check.
+ * Both are seq_operations .show callbacks, i.e. they receive (struct seq_file *m,
+ * struct vm_area_struct *v) and emit only what they are given - a show callback
+ * returning 0 means "handled, nothing printed", NOT "end of iteration" (seq_read
+ * ignores the value), which is exactly what upstream does inside those functions
+ * with its SUS_MAP check.
  *
  * smaps is the one that matters most: maps was already covered, but
- * /proc/<pid>/smaps named the same files again, path and all. */
+ * /proc/<pid>/smaps named the same files again, path and all.
+ *
+ * ---- the sentinel ----
+ *
+ * smaps_rollup is the third listing upstream filters and the one this handler
+ * must NOT be pointed at.  show_smaps_rollup() is reached through single_open(),
+ * whose single_start() hands .show the iterator sentinel (void *)1 instead of a
+ * vma, and the function ignores its v argument entirely (it walks priv->mm->mmap
+ * itself).  Dereferencing that sentinel is not theoretical: with the probe
+ * registered, `cat /proc/<pid>/smaps_rollup` as an app took vma->vm_file at
+ * offset 0xa0 -> ldr from 0xa1 -> "Unable to handle kernel NULL pointer
+ * dereference at virtual address 00000000000000a1", pc sus_map_skip_vma_pre+0x3c,
+ * then a panic (last_kmsg, 41346.347).
+ *
+ * It also cannot be replicated from a kprobe at all: upstream skips the vma
+ * *inside* the rollup loop, and smap_gather_stats() is inlined by LTO here (it is
+ * absent from /proc/kallsyms), so the only call that could be intercepted is
+ * walk_page_range(), which carries no vma and is used by every other page walk.
+ * See TECHNICAL_NOTES.md, "sus_map 与 smaps_rollup". */
 static int sus_map_skip_vma_pre(struct kprobe *kp, struct pt_regs *regs)
 {
     struct vm_area_struct *vma;
@@ -141,7 +162,13 @@ static int sus_map_skip_vma_pre(struct kprobe *kp, struct pt_regs *regs)
         return 0;
 
     vma = (struct vm_area_struct *)regs->regs[1];
-    if (!vma || !vma->vm_file)
+    /* Defence in depth against the sentinel above: a vma is always a slab object
+     * in the linear map, so anything below one page is not one.  Keep this even
+     * though no armed probe passes anything else - it is what turns a future
+     * mis-registration into a lost filter instead of a panic. */
+    if ((unsigned long)vma < PAGE_SIZE)
+        return 0;
+    if (!vma->vm_file)
         return 0;
     inode = file_inode(vma->vm_file);
     if (!inode)
@@ -171,22 +198,17 @@ static struct kprobe kp_map_smap = {
     .pre_handler = sus_map_skip_vma_pre,
 };
 
-static struct kprobe kp_map_smaps_rollup = {
-    .symbol_name = "show_smaps_rollup",
-    .pre_handler = sus_map_skip_vma_pre,
-};
-
 /* Kept in one table so init and exit cannot drift apart. */
 static struct kprobe *const map_probes[] = {
-    &kp_map, &kp_map_smap, &kp_map_smaps_rollup,
+    &kp_map, &kp_map_smap,
 };
 #define N_MAP_PROBES ARRAY_SIZE(map_probes)
 static bool map_registered;
 static bool map_probe_armed[N_MAP_PROBES];
 
-/* Registers whichever of the three are not up yet.  Called from init (when a rule
- * already exists) and from the supercall that adds the first rule, so both paths
- * arm exactly the same set. */
+/* Registers whichever of the probes are not up yet.  Called from init (when a
+ * rule already exists) and from the supercall that adds the first rule, so both
+ * paths arm exactly the same set. */
 static int sus_map_register_probes(void)
 {
     int i, n = 0, first_err = 0;
