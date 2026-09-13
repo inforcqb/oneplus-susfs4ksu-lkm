@@ -922,19 +922,49 @@ static struct kretprobe kr_statx_do = {
 };
 static bool kr_statx_do_ok;
 
+/* Live entries, not slots: after an invalidation the slot is free but the slot
+ * count stays where it was, and a diagnostic that reads "idmap=6" while only two
+ * entries are usable is the kind of number this project keeps catching. */
+static int sus_mount_idmap_live(void)
+{
+    unsigned long flags;
+    int i, live = 0;
+
+    spin_lock_irqsave(&idmap_lock, flags);
+    for (i = 0; i < n_idmap; i++)
+        if (mount_idmap[i].sus_id)
+            live++;
+    spin_unlock_irqrestore(&idmap_lock, flags);
+    return live;
+}
+
+static int sus_mount_ident_live(void)
+{
+    unsigned long flags;
+    int i, live = 0;
+
+    spin_lock_irqsave(&ident_lock, flags);
+    for (i = 0; i < READ_ONCE(n_ident); i++)
+        if (smp_load_acquire(&mount_ident[i].root_ino))
+            live++;
+    spin_unlock_irqrestore(&ident_lock, flags);
+    return live;
+}
+
 /* Reachability/effect counters, one line per hook: "installed" says nothing about
  * whether the rewrite ever happened. */
 static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
 {
     return scnprintf(buf, PAGE_SIZE,
-                     "idmap=%d  ident=%d  hide=%d su_domain=%d\n"
+                     "idmap=%d/%d  ident=%d/%d  hide=%d su_domain=%d\n"
                      "ident: hits=%d learned_ids=%d full=%d dropped_dev=%d\n"
                      "idmap: recycled_dropped=%d dropped_dev=%d\n"
                      "sb: down=%d (probe=%d)\n"
                      "fdinfo: entry=%d hits=%d rewrites=%d nolabel=%d\n"
                      "statx: entry=%d ret=%d hits=%d rewrites=%d nobuf=%d err=%d copyfail=%d nomap=%d "
                      "(sys=%d do=%d)\n",
-                     n_idmap, READ_ONCE(n_ident), mount_registered,
+                     sus_mount_idmap_live(), n_idmap,
+                     sus_mount_ident_live(), READ_ONCE(n_ident), mount_registered,
                      (int)sus_mount_is_su_domain(),
                      atomic_read(&n_ident_hits), atomic_read(&n_ident_learned),
                      atomic_read(&n_ident_full),
