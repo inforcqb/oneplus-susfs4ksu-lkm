@@ -53,11 +53,31 @@
  *   - mnt_devname contains "/data/adb/" (KSU/module bind mounts, whose source is
  *     the file under /data/adb/modules/...);
  *   - the mount POINT - d_path() of {mnt, mnt_root}, i.e. the same path
- *     show_mountinfo() prints - is under /data/adb/modules, /data/adb/ksu or
- *     /data/adb/magisk (catches meta-overlayfs, whose source is a loop device:
- *     "/dev/block/loop48 /data/adb/modules/meta-overlayfs/mnt ext4 rw,...").
+ *     show_mountinfo() prints - is under /data/adb (catches meta-overlayfs, whose
+ *     source is a loop device: "/dev/block/loop48
+ *     /data/adb/modules/meta-overlayfs/mnt ext4 rw,...").
  * Marked ids are never restored on disable, matching upstream, where an id is
  * assigned once at mount time and stays for the mount's lifetime.
+ *
+ * ---- the namespace that matters, and why identity is remembered as well
+ *
+ * KernelSU mounts module content into the ZYGOTE's mount namespace, because that
+ * is the namespace every app is forked into.  The same filesystem is therefore a
+ * different mount OBJECT there, with an id of its own - measured on this device:
+ * /data/adb/modules/meta-overlayfs/mnt is id 2000000000 in the init namespace and
+ * id 1111 in the zygote's.  Marking is what creates the big id, so it could only
+ * cover the namespaces that existed when it ran; the id test alone then hid the
+ * line in one view and left it in the app's own mount table - the one a checker
+ * actually reads.
+ *
+ * Two changes close that:
+ *   - the scan walks EVERY mount namespace reachable from the task list, so each
+ *     existing copy gets a KSU-range id and an id -> shown-id mapping;
+ *   - the mount's IDENTITY (superblock device + root dentry, plus a path-shaped
+ *     source string) is remembered and the hide hooks accept it as well as the id,
+ *     which covers copies created after the scan (those keep a normal id).  Hiding
+ *     such a copy learns its id into the same mapping, so fdinfo/statx keep naming
+ *     a mount line the caller can still see.
  *
  * Known blind spots of the scan (see AUDIT_FINDINGS.md B10):
  *   - overlayfs mounts that KernelSU places on /system have d_path "/system"
@@ -77,6 +97,7 @@
 #include <linux/uaccess.h>
 #include <linux/sched.h>
 #include <linux/cred.h>
+#include <linux/sched/signal.h>	/* for_each_process, to reach every mnt ns */
 #include <linux/nsproxy.h>
 #include <linux/percpu.h>
 #include <linux/rcupdate.h>
@@ -292,6 +313,165 @@ static int sus_mount_shown_id(struct mount *mnt)
            (unsigned int)mnt->mnt_id >= SUS_MOUNT_KSU_ID_MIN)
         mnt = mnt->mnt_parent;
     return mnt ? mnt->mnt_id : 0;
+}
+
+/* ---- "is this mount one of ours", by IDENTITY and not only by id ----
+ *
+ * The id test is a property of ONE mount object in ONE namespace, and the id only
+ * exists because the marking scan put it there.  A mount that KernelSU created
+ * inside the app/zygote namespace carries whatever id the stock allocator gave it
+ * - measured on this device: the meta-overlayfs mount at
+ * /data/adb/modules/meta-overlayfs/mnt has id 2000000000 in the init namespace and
+ * id 1111 in the zygote's, so the id test hid the line in one view and left it in
+ * the other.  That is the view that matters: an app is forked from zygote, so the
+ * zygote namespace IS the app's own mount table, and a checker that reads its own
+ * mountinfo (or /proc/<zygote>/mountinfo) saw a normal-looking mount for a module
+ * path.
+ *
+ * So the identity of a mount is remembered as well, in the three things that
+ * survive a namespace boundary - the mount OBJECT does not, but its filesystem
+ * does:
+ *
+ *   s_dev + root dentry : exact and cheap (two compares).  The root dentry is
+ *                         shared by every mount of the same superblock, and it
+ *                         cannot match an unrelated mount: a second tmpfs instance
+ *                         has its own root dentry.
+ *   mnt_devname         : equality only when it is a path (starts with '/'), so a
+ *                         recorded "tmpfs"/"overlay" cannot hide every mount of
+ *                         that kind.
+ *
+ * Only mounts the scan ACCEPTS are recorded, so this never widens into "hide
+ * anything that looks similar".  The root dentry is dget()'d (the same discipline
+ * the rule tables use for inodes) and released at unload. */
+#define SUS_MOUNT_DEVNAME_MAX 64
+#define SUS_MOUNT_IDENT_MAX 32
+/* How many distinct mount namespaces one scan walks (this device has a handful;
+ * the cap only exists so a pathological system cannot turn the scan into a
+ * task-list sweep). */
+#define SUS_MOUNT_NS_MAX 16
+
+/* Defined with the scan helpers further down; the identity test needs it here. */
+static bool sus_mount_is_adb_devname(const char *devname);
+
+struct sus_mount_ident {
+    dev_t s_dev;
+    struct dentry *root;
+    bool devname_is_path;
+    char devname[SUS_MOUNT_DEVNAME_MAX];
+};
+
+static struct sus_mount_ident mount_ident[SUS_MOUNT_IDENT_MAX];
+static int n_ident;
+static DEFINE_SPINLOCK(ident_lock);
+static atomic_t n_ident_hits = ATOMIC_INIT(0);		/* hidden by identity, not by id */
+static atomic_t n_ident_learned = ATOMIC_INIT(0);	/* ids learned while hiding */
+
+/* Process context (mounting a record takes a reference on the dentry). */
+static void sus_mount_ident_add(struct mount *r)
+{
+    const char *devname = r->mnt_devname;
+    unsigned long flags;
+    int i;
+
+    /* Already known (a re-enable rescans the same mounts)? */
+    for (i = 0; i < READ_ONCE(n_ident); i++) {
+        if (mount_ident[i].root == r->mnt.mnt_root &&
+            mount_ident[i].s_dev == r->mnt.mnt_sb->s_dev)
+            return;
+    }
+    if (!r->mnt.mnt_root)
+        return;
+
+    dget(r->mnt.mnt_root);
+    spin_lock_irqsave(&ident_lock, flags);
+    /* Re-check under the lock: two scans cannot both append. */
+    for (i = 0; i < n_ident; i++) {
+        if (mount_ident[i].root == r->mnt.mnt_root &&
+            mount_ident[i].s_dev == r->mnt.mnt_sb->s_dev) {
+            spin_unlock_irqrestore(&ident_lock, flags);
+            dput(r->mnt.mnt_root);
+            return;
+        }
+    }
+    if (n_ident < SUS_MOUNT_IDENT_MAX) {
+        struct sus_mount_ident *e = &mount_ident[n_ident];
+
+        e->s_dev = r->mnt.mnt_sb->s_dev;
+        e->root = r->mnt.mnt_root;
+        e->devname_is_path = devname && devname[0] == '/';
+        if (e->devname_is_path)
+            strscpy(e->devname, devname, sizeof(e->devname));
+        else
+            e->devname[0] = '\0';
+        smp_store_release(&n_ident, n_ident + 1);
+    } else {
+        dput(r->mnt.mnt_root);
+    }
+    spin_unlock_irqrestore(&ident_lock, flags);
+}
+
+/* Interrupt-context safe (kprobe pre_handler): read-only, no sleeping. */
+static bool sus_mount_ident_match(struct mount *r)
+{
+    int n = smp_load_acquire(&n_ident);
+    const char *devname = r->mnt_devname;
+    int i;
+
+    for (i = 0; i < n; i++) {
+        const struct sus_mount_ident *e = &mount_ident[i];
+
+        if (e->root && e->root == r->mnt.mnt_root &&
+            e->s_dev == r->mnt.mnt_sb->s_dev)
+            return true;
+        if (e->devname_is_path && devname && !strcmp(e->devname, devname))
+            return true;
+    }
+    return false;
+}
+
+/* Is this mount one of KernelSU's?  Two tests, cheapest first:
+ *   - the id range, which is upstream's rule and what the marking scan produces;
+ *   - the identity recorded by that scan, which is what catches the same mount in
+ *     a namespace the scan could not reach (see the note above). */
+static bool sus_mount_is_ours(struct mount *r)
+{
+    if ((unsigned int)r->mnt_id >= SUS_MOUNT_KSU_ID_MIN)
+        return true;
+    if (sus_mount_is_adb_devname(r->mnt_devname))
+        return true;
+    return sus_mount_ident_match(r);
+}
+
+/* The id the caller is allowed to see for a mount we hide: the first ancestor
+ * that is not ours.  Starts at the PARENT when the mount itself is not in the id
+ * range, because an identity-recognised mount keeps a normal id and would
+ * otherwise report its own (hidden) number. */
+static int sus_mount_shown_id_from(struct mount *mnt)
+{
+    if (mnt && (unsigned int)mnt->mnt_id < SUS_MOUNT_KSU_ID_MIN)
+        mnt = mnt->mnt_parent;
+    while (mnt && mnt->mnt_parent && mnt != mnt->mnt_parent &&
+           sus_mount_is_ours(mnt))
+        mnt = mnt->mnt_parent;
+    return mnt ? (int)mnt->mnt_id : 0;
+}
+
+/* Remember the id -> shown-id pair for a mount we are about to hide, so the
+ * fdinfo/statx faces rewrite the very same id the app would otherwise see.  The
+ * hide hooks are the only place that has a mount pointer in an app's namespace,
+ * so learning here is what keeps "the line is gone" and "the number in fdinfo
+ * names a line that exists" consistent for namespaces the scan never saw. */
+static void sus_mount_note_id(struct mount *r)
+{
+    int shown;
+
+    if (sus_mount_shown_for((int)r->mnt_id))
+        return;
+    shown = sus_mount_shown_id_from(r);
+    if (shown > 0 && shown != (int)r->mnt_id) {
+        sus_mount_idmap_add((int)r->mnt_id, shown);
+        atomic_inc(&n_ident_learned);
+    }
 }
 
 /* ---- /proc/<pid>/fdinfo/N ----
@@ -553,11 +733,14 @@ static bool kr_statx_do_ok;
 static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
 {
     return scnprintf(buf, PAGE_SIZE,
-                     "idmap=%d  hide=%d su_domain=%d\n"
+                     "idmap=%d  ident=%d  hide=%d su_domain=%d\n"
+                     "ident: hits=%d learned_ids=%d\n"
                      "fdinfo: entry=%d hits=%d rewrites=%d nolabel=%d\n"
                      "statx: entry=%d ret=%d hits=%d rewrites=%d nobuf=%d err=%d copyfail=%d nomap=%d "
                      "(sys=%d do=%d)\n",
-                     n_idmap, mount_registered, (int)sus_mount_is_su_domain(),
+                     n_idmap, READ_ONCE(n_ident), mount_registered,
+                     (int)sus_mount_is_su_domain(),
+                     atomic_read(&n_ident_hits), atomic_read(&n_ident_learned),
                      atomic_read(&n_fdinfo_entry), atomic_read(&n_fdinfo_hits),
                      atomic_read(&n_fdinfo_rewrites),
                      atomic_read(&n_fdinfo_nolabel),
@@ -580,14 +763,17 @@ static int sus_mount_show_pre(struct kprobe *kp, struct pt_regs *regs)
     if (!mnt)
         return 0;
     r = real_mount(mnt);
-    /* Cheap test first: only the handful of mounts in the KSU id range pay for
-     * the domain lookup below. */
-    if ((unsigned int)r->mnt_id < sus_mount_min_mnt_id())
+    /* Cheap path first, and NOT only the id: a KSU mount in a namespace the
+     * marking scan never reached (the zygote's, hence every app's) keeps a normal
+     * id - see the identity note above sus_mount_is_ours(). */
+    if (!sus_mount_is_ours(r))
         return 0;
     /* P2-12 domain gate, upstream patch:1561-1585: the su/ksu domain is not
      * touched at all, it must be able to see its own mounts. */
     if (sus_mount_is_su_domain())
         return 0;
+    sus_mount_note_id(r);
+    atomic_inc(&n_ident_hits);
     regs->pc = regs->regs[30];   /* skip this mount line */
     /* These show_* callbacks return int and x0 still holds seq_file*.
      * seq_read() treats a negative return as a hard error, so a stray high
@@ -628,9 +814,13 @@ static bool sus_mount_is_adb_mountpoint(const char *path)
 {
     if (!path)
         return false;
-    return strstr(path, "/data/adb/modules") != NULL ||
-           strstr(path, "/data/adb/ksu") != NULL ||
-           strstr(path, "/data/adb/magisk") != NULL;
+    /* Every KernelSU mount lives under /data/adb (its module store), so the
+     * mountpoint test is the same one the devname test uses.  It used to be
+     * narrowed to modules/ksu/magisk, which missed the mounts whose source is a
+     * block device AND whose mountpoint is not one of those three - a tmpfs or an
+     * image mounted at /data/adb/<name> was simply not recognised, and stayed
+     * visible in every namespace (measured: /data/adb/mnt_leak, id 24832). */
+    return strstr(path, "/data/adb/") != NULL;
 }
 
 /* Retro-fit upstream's "KSU mounts carry an id >= DEFAULT_KSU_MNT_ID" onto the
@@ -651,64 +841,64 @@ static bool sus_mount_is_adb_mountpoint(const char *path)
  *     belongs to the ida it is reused after the mount is freed - normal
  *     allocator behaviour, not a leak.
  */
-static int sus_mount_mark_ksu_mounts(void)
+
+/* One namespace's mount list.  Split out of the driver below because the same work
+ * now has to happen in every reachable namespace, and the traversal protocol is
+ * per namespace.
+ *
+ * fs/mount.h documents that protocol as "namespace_sem for read AND ns_lock"
+ * (fs/namespace.c:704-713, :4484-4540).  namespace_sem is static in
+ * fs/namespace.c and down_read() is an inline over rwsem internals, so an
+ * out-of-tree module can only take the ns_lock half:
+ *   - ns_lock keeps us out of the kernel's own list readers and of every list
+ *     mutation that takes it (list_add/list_del under ns_lock);
+ *   - the iteration bound covers the only mutation that does not take ns_lock
+ *     (umount_tree()'s list_del_init under namespace_sem);
+ *   - rcu_read_lock keeps a mount that is being torn down alive: mounts that were
+ *     ever on this list are freed through call_rcu() in cleanup_mnt()
+ *     (fs/namespace.c:1144-1145), so a stale pointer picked up here cannot be
+ *     reused under us.
+ *
+ * ID ALLOCATION happens BEFORE the lock, in a small batch: ida_alloc_range() with
+ * GFP_KERNEL may allocate a radix node and therefore sleep, and this loop runs
+ * with a spinlock held.  A batch that is not fully used is handed back to the ida
+ * afterwards (allocated and freed through the same ida, so the pairing the kernel
+ * expects stays intact). */
+#define SUS_MOUNT_ID_BATCH 8
+
+static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long min)
 {
-    struct mnt_namespace *ns;
+    int batch[SUS_MOUNT_ID_BATCH];
+    int n_batch = 0, used = 0;
     struct list_head *pos;
-    char *buf;
-    unsigned long min;
-    int marked = 0;
     unsigned int seen = 0;
     int scan_logged = 0;
+    int marked = 0;
     unsigned int n_devname = 0, n_dpath_ok = 0, n_dpath_err = 0;
     unsigned int n_skipped_ns = 0, n_skipped_marked = 0;
     bool hit_cap = false;
     bool failed = false;
+    int i;
 
-    /* Fail closed: without all three symbols we cannot own a real id, and a
-     * self-made id would leave an ida_free WARN behind on umount. */
-    if (!sus_mount_ida_ready()) {
-        pr_warn("sus_mount: NOT marking: mnt_id_ida=%d ida_alloc_range=%d ida_free=%d must all resolve; min_mnt_id stays false, so the feature does nothing\n",
-                !!sus_mount_mnt_id_ida, !!pfn_ida_alloc_range, !!pfn_ida_free);
-        return -ENOSYS;
+    for (i = 0; i < SUS_MOUNT_ID_BATCH; i++) {
+        int id = sus_mount_ida_alloc();
+
+        if (id < 0)
+            break;
+        if (id < (int)DEFAULT_KSU_MNT_ID) {
+            /* Below our floor: the resolved mnt_id_ida is not what we think it is.
+             * Hand this id back and stop allocating. */
+            pfn_ida_free(sus_mount_mnt_id_ida, (unsigned int)id);
+            break;
+        }
+        batch[n_batch++] = id;
+    }
+    if (!n_batch) {
+        pr_warn("sus_mount: could not allocate KSU-range ids for ns %p - that namespace is left unmarked\n",
+                ns);
+        return 0;
     }
 
-    if (!current->nsproxy || !current->nsproxy->mnt_ns) {
-        pr_warn("sus_mount: current has no mnt_ns, cannot scan for KSU mounts\n");
-        return -ENOENT;
-    }
-    ns = current->nsproxy->mnt_ns;
-
-    /* P3: clamp the tunable (a value of 0/1 would match every mount line). */
-    if (param_min_mnt_id < SUS_MOUNT_MIN_SANE_MNT_ID) {
-        pr_warn("sus_mount: min_mnt_id=%lu is below %d, clamping to %llu\n",
-                param_min_mnt_id, SUS_MOUNT_MIN_SANE_MNT_ID, DEFAULT_KSU_MNT_ID);
-        param_min_mnt_id = DEFAULT_KSU_MNT_ID;
-    }
-    min = sus_mount_min_mnt_id();
-
-    buf = kmalloc(PATH_MAX, GFP_KERNEL);
-    if (!buf) {
-        pr_warn("sus_mount: kmalloc(PATH_MAX) failed, no KSU mount marked\n");
-        return -ENOMEM;
-    }
-
-    /* fs/mount.h documents the traversal protocol as "namespace_sem for read AND
-     * ns_lock" (fs/namespace.c:704-713, :4484-4540).  namespace_sem is static in
-     * fs/namespace.c and down_read() is an inline over rwsem internals, so an
-     * out-of-tree module can only take the ns_lock half:
-     *   - ns_lock keeps us out of the kernel's own list readers and of every
-     *     list mutation that takes it (list_add/list_del under ns_lock);
-     *   - the iteration bound above covers the only mutation that does not take
-     *     ns_lock (umount_tree()'s list_del_init under namespace_sem);
-     *   - rcu_read_lock keeps a mount that is being torn down alive: mounts that
-     *     were ever on this list are freed through call_rcu() in
-     *     cleanup_mnt() (fs/namespace.c:1144-1145), so a stale pointer we picked
-     *     up from the list cannot be reused under us.
-     * Nothing called while the lock is held sleeps: d_path() only takes the
-     * rename/mount seqlocks, dentry locks and current->fs->lock, and printk with
-     * a spinlock held is normal.  Lock order ns_lock -> (mount_lock, rename_lock,
-     * fs->lock) has no reverse path in the tree. */
     rcu_read_lock();
     spin_lock(&ns->ns_lock);
     for (pos = ns->list.next; pos != &ns->list; pos = pos->next) {
@@ -735,13 +925,19 @@ static int sus_mount_mark_ksu_mounts(void)
          * lifetime) AND the cover for KernelSU's own mounts, which this kernel
          * already hands such an id to - on this device exactly one, the
          * meta-overlayfs loop mount at 2000000000.  Their line is skipped by that
-         * id alone (no marking needed), so they need the very same "the id the
-         * app is allowed to see" mapping, or fdinfo/statx keep printing a number
+         * id alone (no marking needed), so they need the very same "the id the app
+         * is allowed to see" mapping, or fdinfo/statx keep printing a number
          * mountinfo no longer lists.  Compares against the constant, not the
-         * tunable, see SUS_MOUNT_KSU_ID_MIN. */
+         * tunable, see SUS_MOUNT_KSU_ID_MIN.
+         *
+         * The identity is remembered as well: this namespace's mount is a different
+         * OBJECT from the one the same filesystem has in the next namespace, so
+         * without a record the next namespace's copy cannot be recognised once its
+         * id is out of the range (measured: 2000000000 here, 1111 in the zygote's). */
         if ((unsigned int)r->mnt_id >= SUS_MOUNT_KSU_ID_MIN) {
             n_skipped_marked++;
             sus_mount_idmap_add((int)r->mnt_id, sus_mount_shown_id(r));
+            sus_mount_ident_add(r);
             continue;
         }
 
@@ -750,14 +946,14 @@ static int sus_mount_mark_ksu_mounts(void)
             shown = r->mnt_devname;
         } else {
             /* meta-overlayfs style: the source is /dev/block/loopNN, so only the
-             * mount point says /data/adb/... .  d_path() of {mnt, mnt_root} is
-             * the mountpoint path show_mountinfo() prints. */
+             * mount point says /data/adb/... .  d_path() of {mnt, mnt_root} is the
+             * mountpoint path show_mountinfo() prints. */
             mnt_path.mnt = &r->mnt;
             mnt_path.dentry = r->mnt.mnt_root;
             dp = sus_mount_d_path(&mnt_path, buf, PATH_MAX);
-            /* Diagnostic while the matching rule is being validated: the first
-             * few mounts show what d_path() actually renders for them. */
-            if (scan_logged < 400) {
+            /* Diagnostic while the matching rule is being validated: the first few
+             * mounts show what d_path() actually renders for them. */
+            if (scan_logged < 40) {
                 scan_logged++;
                 SUSFS_LOGI("sus_mount: scan %s -> %s\n", r->mnt_devname,
                         IS_ERR_OR_NULL(dp) ? "(d_path failed)" : dp);
@@ -772,25 +968,13 @@ static int sus_mount_mark_ksu_mounts(void)
             shown = dp;
         }
 
-        /* A real id out of the kernel's mnt_id_ida: never write a bogus value
-         * into mnt_id, and never invent one (a hand-made id would make the
-         * kernel's paired ida_free() WARN on umount). */
-        new_id = sus_mount_ida_alloc();
-        if (new_id < 0) {
-            pr_warn("sus_mount: ida_alloc_range failed %d, stopping (remaining mounts left unmarked)\n",
-                    new_id);
+        if (used >= n_batch) {
+            pr_warn("sus_mount: id batch exhausted in ns %p, remaining mounts left unmarked\n",
+                    ns);
             failed = true;
             break;
         }
-        if (new_id < (int)DEFAULT_KSU_MNT_ID) {
-            /* Below our floor, i.e. the ida handed out something outside the
-             * requested [DEFAULT_KSU_MNT_ID, INT_MAX-1] range: the resolved
-             * mnt_id_ida is not what we think it is.  Stop before writing. */
-            pr_warn("sus_mount: ida_alloc_range returned %d (< %llu) - resolved mnt_id_ida is suspect, stopping\n",
-                    new_id, DEFAULT_KSU_MNT_ID);
-            failed = true;
-            break;
-        }
+        new_id = batch[used++];
         SUSFS_LOGI("sus_mount: marked mnt_id %d -> %d (%s, devname %s)\n",
                 r->mnt_id, new_id, shown,
                 r->mnt_devname ? r->mnt_devname : "none");
@@ -799,28 +983,115 @@ static int sus_mount_mark_ksu_mounts(void)
          * mount that now carries a KSU-range id and stops at the first ancestor
          * that does not - i.e. the id mountinfo still prints for the host. */
         sus_mount_idmap_add(new_id, sus_mount_shown_id(r));
+        /* And the identity, so the same filesystem mounted in another namespace
+         * (where this scan cannot reach) is recognised by the hide hooks. */
+        sus_mount_ident_add(r);
         marked++;
     }
     spin_unlock(&ns->ns_lock);
     rcu_read_unlock();
 
-    kfree(buf);
+    /* Hand back whatever the batch did not use. */
+    for (i = used; i < n_batch; i++)
+        pfn_ida_free(sus_mount_mnt_id_ida, (unsigned int)batch[i]);
 
     if (hit_cap)
-        pr_warn("sus_mount: walk stopped after %u entries (cap %d), result may be incomplete\n",
-                seen, SUS_MOUNT_MAX_SCAN);
+        pr_warn("sus_mount: walk of ns %p stopped after %u entries (cap %d), result may be incomplete\n",
+                ns, seen, SUS_MOUNT_MAX_SCAN);
     if (failed)
-        pr_warn("sus_mount: marking stopped early (see the warning above), %d mount(s) marked\n",
-                marked);
+        pr_warn("sus_mount: marking in ns %p stopped early, %d mount(s) marked\n",
+                ns, marked);
+    SUSFS_LOGI("sus_mount: ns %p: seen=%u devname_hits=%u dpath_ok=%u dpath_err=%u skipped(other ns/cursor)=%u skipped(already marked)=%u marked=%d ids_alloc=%d\n",
+            ns, seen, n_devname, n_dpath_ok, n_dpath_err, n_skipped_ns,
+            n_skipped_marked, marked, n_batch);
+    return marked;
+}
+
+static int sus_mount_mark_ksu_mounts(void)
+{
+    struct mnt_namespace *list[SUS_MOUNT_NS_MAX];
+    struct task_struct *p;
+    char *buf;
+    unsigned long min;
+    int n_ns = 0, i;
+    int marked = 0;
+
+    /* Fail closed: without all three symbols we cannot own a real id, and a
+     * self-made id would leave an ida_free WARN behind on umount. */
+    if (!sus_mount_ida_ready()) {
+        pr_warn("sus_mount: NOT marking: mnt_id_ida=%d ida_alloc_range=%d ida_free=%d must all resolve; min_mnt_id stays false, so the feature does nothing\n",
+                !!sus_mount_mnt_id_ida, !!pfn_ida_alloc_range, !!pfn_ida_free);
+        return -ENOSYS;
+    }
+
+    if (!current->nsproxy || !current->nsproxy->mnt_ns) {
+        pr_warn("sus_mount: current has no mnt_ns, cannot scan for KSU mounts\n");
+        return -ENOENT;
+    }
+
+    /* P3: clamp the tunable (a value of 0/1 would match every mount line). */
+    if (param_min_mnt_id < SUS_MOUNT_MIN_SANE_MNT_ID) {
+        pr_warn("sus_mount: min_mnt_id=%lu is below %d, clamping to %llu\n",
+                param_min_mnt_id, SUS_MOUNT_MIN_SANE_MNT_ID, DEFAULT_KSU_MNT_ID);
+        param_min_mnt_id = DEFAULT_KSU_MNT_ID;
+    }
+    min = sus_mount_min_mnt_id();
+
+    buf = kmalloc(PATH_MAX, GFP_KERNEL);
+    if (!buf) {
+        pr_warn("sus_mount: kmalloc(PATH_MAX) failed, no KSU mount marked\n");
+        return -ENOMEM;
+    }
+
+    /* EVERY mount namespace, not just this task's.
+     *
+     * A mount that KernelSU created inside another namespace (the zygote's, and
+     * therefore every app's) is a different mount OBJECT with an id of its own -
+     * measured: the same path is 2000000000 in the init namespace and 1111 in the
+     * zygote's.  Marking only the current namespace left that second object
+     * unmarked, so the id test could not see it and the module mount stayed
+     * visible to anything that reads the app's own mountinfo.
+     *
+     * Namespaces are collected from the task list: every task's nsproxy points at
+     * the namespace it runs in, and the list is deduplicated by pointer.  This
+     * runs at load/enable time in process context, and the result is cached in the
+     * identity table (see sus_mount_ident_add) so a namespace created later is
+     * still covered by the hide hooks. */
+    list[n_ns++] = current->nsproxy->mnt_ns;
+    rcu_read_lock();
+    for_each_process(p) {
+        struct mnt_namespace *cand = NULL;
+
+        if (p->nsproxy)
+            cand = p->nsproxy->mnt_ns;
+        if (!cand)
+            continue;
+        for (i = 0; i < n_ns; i++) {
+            if (list[i] == cand)
+                break;
+        }
+        if (i < n_ns)
+            continue;
+        if (n_ns >= SUS_MOUNT_NS_MAX)
+            break;
+        list[n_ns++] = cand;
+    }
+    rcu_read_unlock();
+
+    SUSFS_LOGI("sus_mount: scanning %d mount namespace(s) reachable from the task list\n",
+            n_ns);
+
+    for (i = 0; i < n_ns; i++)
+        marked += sus_mount_scan_ns(list[i], buf, min);
+
+    kfree(buf);
+
     if (marked)
-        SUSFS_LOGI("sus_mount: %d KSU mount(s) marked with real mnt_id_ida ids (>= %llu)\n",
-                marked, DEFAULT_KSU_MNT_ID);
+        SUSFS_LOGI("sus_mount: %d KSU mount(s) marked with real mnt_id_ida ids (>= %llu), %d identity record(s) cached\n",
+                marked, DEFAULT_KSU_MNT_ID, READ_ONCE(n_ident));
     else
-        SUSFS_LOGI("sus_mount: 0 KSU mounts marked (nothing under /data/adb matched in this mnt ns, hide threshold %lu)\n",
-                min);
-    SUSFS_LOGI("sus_mount: scan stats: seen=%u devname_hits=%u dpath_ok=%u dpath_err=%u skipped(other ns/cursor)=%u skipped(already marked)=%u marked=%d\n",
-            seen, n_devname, n_dpath_ok, n_dpath_err, n_skipped_ns,
-            n_skipped_marked, marked);
+        SUSFS_LOGI("sus_mount: 0 KSU mounts marked (nothing under /data/adb matched in %d namespace(s), hide threshold %lu)\n",
+                n_ns, min);
     return marked;
 }
 
@@ -875,6 +1146,8 @@ int susfs_sus_mount_init(void)
 
 void susfs_sus_mount_exit(void)
 {
+    int i;
+
     if (mount_registered) {
         unregister_kprobe(&kp_mountinfo);
         unregister_kprobe(&kp_vfsstat);
@@ -898,6 +1171,17 @@ void susfs_sus_mount_exit(void)
      * lifetime (and a later enable only has to scan for new mounts).  The id
      * itself goes back to mnt_id_ida through the kernel's own mnt_free_id()
      * when the mount is finally freed - we never free it ourselves. */
+
+    /* The cached mount identities DO hold a reference each (dget on the root
+     * dentry), so they are released here.  The records themselves stay: the hide
+     * hooks compare against them lock-free, and after exit nothing reads them. */
+    for (i = 0; i < READ_ONCE(n_ident); i++) {
+        if (mount_ident[i].root) {
+            dput(mount_ident[i].root);
+            mount_ident[i].root = NULL;
+        }
+    }
+    WRITE_ONCE(n_ident, 0);
 }
 
 static int sus_mount_register(void)
