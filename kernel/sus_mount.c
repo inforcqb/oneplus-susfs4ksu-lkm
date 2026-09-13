@@ -268,8 +268,15 @@ static bool mount_registered;
  * when a mount dies, so a number learned for OUR mount can later belong to a
  * completely unrelated one, and a stale hit would rewrite an innocent mount's id
  * (the app would then see, for its own fd, a number that names another mount's
- * line).  Invalidation, in the order the cases matter:
+ * line).  Measured on this device: a freed mnt id IS handed out again immediately
+ * (mount tmpfs, note the id, umount, mount again - same id), so this is not a
+ * theoretical window.  Each entry therefore carries the s_dev it was learned on,
+ * and is invalidated in three places, in the order the cases matter:
  *
+ *   - superblock teardown: the mount's filesystem is being unmounted, so the entry
+ *     can only ever match a recycled id from now on.  A kprobe on
+ *     generic_shutdown_super() drops every entry with that s_dev, which is also
+ *     the earliest point where nothing can have taken the freed id yet.
  *   - sighting: every hide hook walks a namespace's mount list and sees each mount
  *     with its CURRENT id and whether it is ours.  A mount that is NOT ours and
  *     carries an id we have an entry for proves that id was recycled, so the entry
@@ -290,19 +297,21 @@ static bool mount_registered;
 struct sus_mount_idmap_entry {
     int sus_id;
     int shown_id;
+    dev_t s_dev;	/* the superblock the mount lived on (see the drop note) */
 };
 
 static struct sus_mount_idmap_entry mount_idmap[SUS_MOUNT_IDMAP_MAX];
 static int n_idmap;
 static DEFINE_SPINLOCK(idmap_lock);
 static atomic_t n_idmap_recycled = ATOMIC_INIT(0);	/* stale entries dropped */
+static atomic_t n_idmap_dropped_dev = ATOMIC_INIT(0);	/* dropped at sb teardown */
 
 static atomic_t n_fdinfo_hits = ATOMIC_INIT(0);
 static atomic_t n_fdinfo_rewrites = ATOMIC_INIT(0);
 static atomic_t n_statx_hits = ATOMIC_INIT(0);
 static atomic_t n_statx_rewrites = ATOMIC_INIT(0);
 
-static void sus_mount_idmap_add(int sus_id, int shown_id)
+static void sus_mount_idmap_add(int sus_id, int shown_id, dev_t s_dev)
 {
     unsigned long flags;
     int i, slot = -1;
@@ -316,6 +325,7 @@ static void sus_mount_idmap_add(int sus_id, int shown_id)
     for (i = 0; i < n_idmap; i++) {
         if (mount_idmap[i].sus_id == sus_id) {
             mount_idmap[i].shown_id = shown_id;
+            mount_idmap[i].s_dev = s_dev;
             goto out;
         }
         if (!mount_idmap[i].sus_id && slot < 0)
@@ -328,7 +338,26 @@ static void sus_mount_idmap_add(int sus_id, int shown_id)
     }
     mount_idmap[slot].sus_id = sus_id;
     mount_idmap[slot].shown_id = shown_id;
+    mount_idmap[slot].s_dev = s_dev;
 out:
+    spin_unlock_irqrestore(&idmap_lock, flags);
+}
+
+/* Every entry whose mount lived on @s_dev is worthless now: that superblock is
+ * being shut down (see the note on sus_mount_ident_drop_dev()). */
+static void sus_mount_idmap_drop_dev(dev_t s_dev)
+{
+    unsigned long flags;
+    int i;
+
+    spin_lock_irqsave(&idmap_lock, flags);
+    for (i = 0; i < n_idmap; i++) {
+        if (mount_idmap[i].sus_id && mount_idmap[i].s_dev == s_dev) {
+            mount_idmap[i].sus_id = 0;
+            mount_idmap[i].shown_id = 0;
+            atomic_inc(&n_idmap_dropped_dev);
+        }
+    }
     spin_unlock_irqrestore(&idmap_lock, flags);
 }
 
@@ -409,18 +438,28 @@ static int sus_mount_shown_id(struct mount *mnt)
  *                         tmpfs instance has its own root dentry and inode.
  *                         The NUMBER is stored, not the dentry pointer: a pointer
  *                         kept across the mount's life would have to either hold a
- *                         reference (dget pins the dentry, hence the inode and the
- *                         whole superblock - an unmounted module image would then
- *                         keep its loop device busy until rmmod) or be used
- *                         unlocked after the mount is gone.  Reading the live
- *                         mount's root inode number at compare time has neither
- *                         problem and needs no release step on unload.
+ *                         reference (dget pins the dentry, hence the inode - and a
+ *                         record whose filesystem is later unmounted then keeps
+ *                         that inode alive past its superblock's shutdown; measured
+ *                         on this device: rmmod of that build dput()'d it and
+ *                         panicked in shmem_evict_inode, "Oops: Fatal exception")
+ *                         or be used unlocked after the mount is gone.  Reading the
+ *                         live mount's root inode number at compare time has
+ *                         neither problem and needs no release step on unload.
  *   mnt_devname         : equality only when it is a path (starts with '/'), so a
  *                         recorded "tmpfs"/"overlay" cannot hide every mount of
  *                         that kind.
  *
  * Only mounts the scan ACCEPTS are recorded, so this never widens into "hide
- * anything that looks similar". */
+ * anything that looks similar".
+ *
+ * A record is valid only while its filesystem is mounted, and the numbers it is
+ * keyed by are reusable (measured: the tmpfs mounted, recorded and unmounted by
+ * this test left s_dev 0:304 and root inode 1 behind, and the very next tmpfs mount
+ * got both - i.e. a stale record matched an unrelated filesystem and hid it).  So a
+ * kprobe on generic_shutdown_super() drops every record whose s_dev is going away
+ * (sus_mount_ident_drop_dev()), and the record survives exactly as long as its
+ * superblock - which is the case the identity test exists for. */
 #define SUS_MOUNT_DEVNAME_MAX 64
 #define SUS_MOUNT_IDENT_MAX 32
 /* Defined with the scan helpers further down; the identity test needs it here. */
@@ -439,6 +478,8 @@ static DEFINE_SPINLOCK(ident_lock);
 static atomic_t n_ident_hits = ATOMIC_INIT(0);		/* hidden by identity, not by id */
 static atomic_t n_ident_learned = ATOMIC_INIT(0);	/* ids learned while hiding */
 static atomic_t n_ident_full = ATOMIC_INIT(0);		/* records that found no slot */
+static atomic_t n_ident_dropped_dev = ATOMIC_INIT(0);	/* records dropped at sb teardown */
+static atomic_t n_sb_down = ATOMIC_INIT(0);		/* superblocks seen shut down */
 
 static int mount_dbg;
 module_param_named(mount_dbg, mount_dbg, int, 0644);
@@ -528,6 +569,60 @@ static bool sus_mount_ident_match(struct mount *r)
     return false;
 }
 
+/**
+ * sus_mount_ident_drop_dev() - forget every record that lived on @s_dev
+ *
+ * Called from a kprobe on generic_shutdown_super(), i.e. the moment a superblock
+ * is torn down - which is the only moment that makes these records wrong rather
+ * than merely old.  Without it a record outlives its filesystem, and the numbers
+ * it is keyed by are exactly the recyclable ones (measured on this device: a fresh
+ * tmpfs got the same s_dev 0:304 AND the same root inode number 1 as the tmpfs
+ * mounted, recorded and unmounted just before it, so a stale record matched a
+ * completely unrelated filesystem and hid it).  Letting the record die with its
+ * superblock closes that hole at the source, while keeping the record for as long
+ * as the filesystem is mounted - which is the case the identity test exists for
+ * (the same fs mounted in a namespace the scan cannot reach).
+ *
+ * Process context (umount/sb shutdown), takes only our own spinlock, never sleeps.
+ */
+static void sus_mount_ident_drop_dev(dev_t s_dev)
+{
+    unsigned long flags;
+    int i;
+
+    spin_lock_irqsave(&ident_lock, flags);
+    for (i = 0; i < n_ident; i++) {
+        if (smp_load_acquire(&mount_ident[i].root_ino) && mount_ident[i].s_dev == s_dev) {
+            smp_store_release(&mount_ident[i].root_ino, 0);
+            atomic_inc(&n_ident_dropped_dev);
+        }
+    }
+    spin_unlock_irqrestore(&ident_lock, flags);
+}
+
+/* generic_shutdown_super(struct super_block *sb) - fs/super.c, EXPORT_SYMBOL, so
+ * it is a real function in kallsyms and not an inlined call site.  Runs before the
+ * device number is handed back (free_anon_bdev()/blkdev_put() happen in
+ * kill_anon_super()/kill_block_super() after this returns), so a record cannot
+ * survive into the window where a new filesystem holds the same s_dev. */
+static int sus_mount_sb_down_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+    struct super_block *sb = (struct super_block *)regs->regs[0];
+
+    atomic_inc(&n_sb_down);
+    if (!sb)
+        return 0;
+    sus_mount_ident_drop_dev(sb->s_dev);
+    sus_mount_idmap_drop_dev(sb->s_dev);
+    return 0;
+}
+
+static struct kprobe kp_sb_down = {
+    .symbol_name = "generic_shutdown_super",
+    .pre_handler = sus_mount_sb_down_pre,
+};
+static bool kp_sb_down_ok;
+
 /* Is this mount one of KernelSU's?  Two tests, cheapest first:
  *   - the id range, which is upstream's rule and what the marking scan produces;
  *   - the identity recorded by that scan, which is what catches the same mount in
@@ -568,7 +663,7 @@ static void sus_mount_note_id(struct mount *r)
         return;
     shown = sus_mount_shown_id_from(r);
     if (shown > 0 && shown != (int)r->mnt_id) {
-        sus_mount_idmap_add((int)r->mnt_id, shown);
+        sus_mount_idmap_add((int)r->mnt_id, shown, r->mnt.mnt_sb->s_dev);
         atomic_inc(&n_ident_learned);
     }
 }
@@ -833,8 +928,9 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
 {
     return scnprintf(buf, PAGE_SIZE,
                      "idmap=%d  ident=%d  hide=%d su_domain=%d\n"
-                     "ident: hits=%d learned_ids=%d full=%d\n"
-                     "idmap: recycled_dropped=%d\n"
+                     "ident: hits=%d learned_ids=%d full=%d dropped_dev=%d\n"
+                     "idmap: recycled_dropped=%d dropped_dev=%d\n"
+                     "sb: down=%d (probe=%d)\n"
                      "fdinfo: entry=%d hits=%d rewrites=%d nolabel=%d\n"
                      "statx: entry=%d ret=%d hits=%d rewrites=%d nobuf=%d err=%d copyfail=%d nomap=%d "
                      "(sys=%d do=%d)\n",
@@ -842,7 +938,10 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      (int)sus_mount_is_su_domain(),
                      atomic_read(&n_ident_hits), atomic_read(&n_ident_learned),
                      atomic_read(&n_ident_full),
+                     atomic_read(&n_ident_dropped_dev),
                      atomic_read(&n_idmap_recycled),
+                     atomic_read(&n_idmap_dropped_dev),
+                     atomic_read(&n_sb_down), (int)kp_sb_down_ok,
                      atomic_read(&n_fdinfo_entry), atomic_read(&n_fdinfo_hits),
                      atomic_read(&n_fdinfo_rewrites),
                      atomic_read(&n_fdinfo_nolabel),
@@ -1048,7 +1147,7 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
          * id is out of the range (measured: 2000000000 here, 1111 in the zygote's). */
         if ((unsigned int)r->mnt_id >= SUS_MOUNT_KSU_ID_MIN) {
             n_skipped_marked++;
-            sus_mount_idmap_add((int)r->mnt_id, sus_mount_shown_id(r));
+            sus_mount_idmap_add((int)r->mnt_id, sus_mount_shown_id(r), r->mnt.mnt_sb->s_dev);
             sus_mount_ident_add(r);
             continue;
         }
@@ -1094,7 +1193,7 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
         /* After the id is replaced, exactly like upstream: the climb starts at a
          * mount that now carries a KSU-range id and stops at the first ancestor
          * that does not - i.e. the id mountinfo still prints for the host. */
-        sus_mount_idmap_add(new_id, sus_mount_shown_id(r));
+        sus_mount_idmap_add(new_id, sus_mount_shown_id(r), r->mnt.mnt_sb->s_dev);
         /* And the identity, so the same filesystem mounted in another namespace
          * (where this scan cannot reach) is recognised by the hide hooks. */
         sus_mount_ident_add(r);
@@ -1225,28 +1324,40 @@ int susfs_sus_mount_init(void)
     return 0;
 }
 
+/* One unregister path for both callers (module exit and the disable supercall):
+ * two copies drifted apart once already in this project, leaving a hook armed
+ * after "disabled". */
+static void sus_mount_unregister(void)
+{
+    if (!mount_registered)
+        return;
+    unregister_kprobe(&kp_mountinfo);
+    unregister_kprobe(&kp_vfsstat);
+    unregister_kprobe(&kp_vfsmnt);
+    if (kr_fdinfo_ok) {
+        unregister_kretprobe(&kr_fdinfo);
+        kr_fdinfo_ok = false;
+    }
+    if (kr_statx_ok) {
+        unregister_kretprobe(&kr_statx);
+        kr_statx_ok = false;
+    }
+    if (kr_statx_do_ok) {
+        unregister_kretprobe(&kr_statx_do);
+        kr_statx_do_ok = false;
+    }
+    if (kp_sb_down_ok) {
+        unregister_kprobe(&kp_sb_down);
+        kp_sb_down_ok = false;
+    }
+    mount_registered = false;
+}
+
 void susfs_sus_mount_exit(void)
 {
     unsigned long flags;
 
-    if (mount_registered) {
-        unregister_kprobe(&kp_mountinfo);
-        unregister_kprobe(&kp_vfsstat);
-        unregister_kprobe(&kp_vfsmnt);
-        if (kr_fdinfo_ok) {
-            unregister_kretprobe(&kr_fdinfo);
-            kr_fdinfo_ok = false;
-        }
-        if (kr_statx_ok) {
-            unregister_kretprobe(&kr_statx);
-            kr_statx_ok = false;
-        }
-        if (kr_statx_do_ok) {
-            unregister_kretprobe(&kr_statx_do);
-            kr_statx_do_ok = false;
-        }
-        mount_registered = false;
-    }
+    sus_mount_unregister();
     /* Marked mnt_ids are deliberately NOT restored: upstream assigns an id once
      * per mount and never rewrites it, so a marked id stays for the mount's
      * lifetime (and a later enable only has to scan for new mounts).  The id
@@ -1310,6 +1421,16 @@ static int sus_mount_register(void)
     } else {
         kr_statx_do_ok = true;
     }
+    /* Optional too, but it is the ONLY thing that invalidates a record when its
+     * filesystem is unmounted, and the numbers the records are keyed by do get
+     * reused (measured).  A missing symbol means records can outlive their fs and
+     * falsely match another one, so say so instead of quietly degrading. */
+    rc = register_kprobe(&kp_sb_down);
+    if (rc)
+        pr_warn("sus_mount: register_kprobe(generic_shutdown_super) failed %d - records are NOT dropped when their filesystem is unmounted, a reused s_dev can match an unrelated mount\n",
+                rc);
+    else
+        kp_sb_down_ok = true;
     mount_registered = true;
     return 0;
 }
@@ -1349,22 +1470,7 @@ void susfs_sus_mount_supercall(void __user **arg)
             goto out;
         }
     } else if (mount_registered) {
-        unregister_kprobe(&kp_mountinfo);
-        unregister_kprobe(&kp_vfsstat);
-        unregister_kprobe(&kp_vfsmnt);
-        if (kr_fdinfo_ok) {
-            unregister_kretprobe(&kr_fdinfo);
-            kr_fdinfo_ok = false;
-        }
-        if (kr_statx_ok) {
-            unregister_kretprobe(&kr_statx);
-            kr_statx_ok = false;
-        }
-        if (kr_statx_do_ok) {
-            unregister_kretprobe(&kr_statx_do);
-            kr_statx_do_ok = false;
-        }
-        mount_registered = false;
+        sus_mount_unregister();
     }
     info.err = 0;
     SUSFS_LOGI("sus_mount: %s (supercall)\n", info.enabled ? "hide" : "unhide");
