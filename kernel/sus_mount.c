@@ -382,6 +382,13 @@ static DEFINE_SPINLOCK(ident_lock);
 static atomic_t n_ident_hits = ATOMIC_INIT(0);		/* hidden by identity, not by id */
 static atomic_t n_ident_learned = ATOMIC_INIT(0);	/* ids learned while hiding */
 
+static int mount_dbg;
+module_param_named(mount_dbg, mount_dbg, int, 0644);
+/* Diagnostic: name the fields the identity test compares, for the first few mounts
+ * the hide hook looks at, so "why did identity not match" is answerable from dmesg
+ * instead of guessed. */
+static atomic_t n_dbg_logged = ATOMIC_INIT(0);
+
 /* Process context (mounting a record takes a reference on the dentry). */
 static void sus_mount_ident_add(struct mount *r)
 {
@@ -419,6 +426,10 @@ static void sus_mount_ident_add(struct mount *r)
             strscpy(e->devname, devname, sizeof(e->devname));
         else
             e->devname[0] = '\0';
+        if (mount_dbg)
+            SUSFS_LOGI("sus_mount: ident[%d] s_dev=%u root=%px devname=%s\n",
+                    n_ident, (unsigned int)e->s_dev, e->root,
+                    e->devname_is_path ? e->devname : "(not path-shaped)");
         smp_store_release(&n_ident, n_ident + 1);
     } else {
         dput(r->mnt.mnt_root);
@@ -782,8 +793,15 @@ static int sus_mount_show_pre(struct kprobe *kp, struct pt_regs *regs)
     /* Cheap path first, and NOT only the id: a KSU mount in a namespace the
      * marking scan never reached (the zygote's, hence every app's) keeps a normal
      * id - see the identity note above sus_mount_is_ours(). */
-    if (!sus_mount_is_ours(r))
+    if (!sus_mount_is_ours(r)) {
+        /* mount_dbg: say why - the id, s_dev, root dentry and source are exactly
+         * what sus_mount_is_ours() compared. */
+        if (mount_dbg && atomic_inc_return(&n_dbg_logged) <= 40)
+            SUSFS_LOGI("sus_mount: hook: NOT ours id=%d s_dev=%u root=%px devname=%s\n",
+                    r->mnt_id, (unsigned int)r->mnt.mnt_sb->s_dev,
+                    r->mnt.mnt_root, r->mnt_devname ? r->mnt_devname : "none");
         return 0;
+    }
     /* P2-12 domain gate, upstream patch:1561-1585: the su/ksu domain is not
      * touched at all, it must be able to see its own mounts. */
     if (sus_mount_is_su_domain())
