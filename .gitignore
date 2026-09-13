@@ -49,3 +49,6 @@ kernel/*_test*.c
 kernel/*_probe_main.c
 kernel/ih_hook_main.c
 kernel/ih_hook_stub.S
+
+# namespace-probe helper used by t_clonens.sh
+nsprobe.sh
