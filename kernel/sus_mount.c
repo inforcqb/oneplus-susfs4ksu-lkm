@@ -70,14 +70,20 @@
  * line in one view and left it in the app's own mount table - the one a checker
  * actually reads.
  *
- * Two changes close that:
- *   - the scan walks EVERY mount namespace reachable from the task list, so each
- *     existing copy gets a KSU-range id and an id -> shown-id mapping;
- *   - the mount's IDENTITY (superblock device + root dentry, plus a path-shaped
- *     source string) is remembered and the hide hooks accept it as well as the id,
- *     which covers copies created after the scan (those keep a normal id).  Hiding
- *     such a copy learns its id into the same mapping, so fdinfo/statx keep naming
- *     a mount line the caller can still see.
+ * The fix is identity, not a wider scan: sweeping every namespace from the task
+ * list would mean walking another namespace's mount list, and only the ns_lock
+ * half of that protocol is reachable from a module (namespace_sem is static in
+ * fs/namespace.c) - a foreign namespace mounts and unmounts while we walk it,
+ * which is exactly the class of thing that takes a device down.  Instead the
+ * mount's IDENTITY is remembered by the scan that already runs safely in the
+ * caller's namespace:
+ *
+ *   - superblock device + root dentry (both belong to the filesystem, so the same
+ *     filesystem mounted in the zygote is matched), plus a path-shaped source
+ *     string for equality;
+ *   - the hide hooks accept identity as well as a KSU-range id, and hiding an
+ *     identity-matched mount learns its id into the same id -> shown-id mapping, so
+ *     fdinfo/statx keep naming a mount line the caller can still see.
  *
  * Known blind spots of the scan (see AUDIT_FINDINGS.md B10):
  *   - overlayfs mounts that KernelSU places on /system have d_path "/system"
@@ -97,7 +103,6 @@
 #include <linux/uaccess.h>
 #include <linux/sched.h>
 #include <linux/cred.h>
-#include <linux/sched/signal.h>	/* for_each_process, to reach every mnt ns */
 #include <linux/nsproxy.h>
 #include <linux/percpu.h>
 #include <linux/rcupdate.h>
@@ -205,6 +210,22 @@ static __nocfi int sus_mount_ida_alloc(void)
     return pfn_ida_alloc_range(sus_mount_mnt_id_ida,
                                (unsigned int)DEFAULT_KSU_MNT_ID,
                                (unsigned int)(INT_MAX - 1), GFP_KERNEL);
+}
+
+/* Hand an unused id back to the same ida it came from.  MUST go through a
+ * __nocfi function, like every other call this module makes through a resolved
+ * kernel symbol: an indirect call from a normally-instrumented function is
+ * type-checked by clang CFI, and an out-of-tree module's type hash for a kernel
+ * prototype does not match the kernel's own - measured, and expensive to learn:
+ *
+ *   Kernel panic - not syncing: CFI failure (target: ida_free+0x0/0x480)
+ *   Call trace: sus_mount_mark_ksu_mounts+0x9b0 [susfs_guard_lkm]
+ *
+ * (The first version of this helper was missing the annotation.  The allocation
+ * side never hit it because sus_mount_ida_alloc() is __nocfi.) */
+static __nocfi void sus_mount_ida_release(int id)
+{
+    pfn_ida_free(sus_mount_mnt_id_ida, (unsigned int)id);
 }
 
 static __nocfi char *sus_mount_d_path(const struct path *path, char *buf, int buflen)
@@ -345,11 +366,6 @@ static int sus_mount_shown_id(struct mount *mnt)
  * the rule tables use for inodes) and released at unload. */
 #define SUS_MOUNT_DEVNAME_MAX 64
 #define SUS_MOUNT_IDENT_MAX 32
-/* How many distinct mount namespaces one scan walks (this device has a handful;
- * the cap only exists so a pathological system cannot turn the scan into a
- * task-list sweep). */
-#define SUS_MOUNT_NS_MAX 16
-
 /* Defined with the scan helpers further down; the identity test needs it here. */
 static bool sus_mount_is_adb_devname(const char *devname);
 
@@ -888,7 +904,7 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
         if (id < (int)DEFAULT_KSU_MNT_ID) {
             /* Below our floor: the resolved mnt_id_ida is not what we think it is.
              * Hand this id back and stop allocating. */
-            pfn_ida_free(sus_mount_mnt_id_ida, (unsigned int)id);
+            sus_mount_ida_release(id);
             break;
         }
         batch[n_batch++] = id;
@@ -993,7 +1009,7 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
 
     /* Hand back whatever the batch did not use. */
     for (i = used; i < n_batch; i++)
-        pfn_ida_free(sus_mount_mnt_id_ida, (unsigned int)batch[i]);
+        sus_mount_ida_release(batch[i]);
 
     if (hit_cap)
         pr_warn("sus_mount: walk of ns %p stopped after %u entries (cap %d), result may be incomplete\n",
@@ -1009,12 +1025,9 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
 
 static int sus_mount_mark_ksu_mounts(void)
 {
-    struct mnt_namespace *list[SUS_MOUNT_NS_MAX];
-    struct task_struct *p;
     char *buf;
     unsigned long min;
-    int n_ns = 0, i;
-    int marked = 0;
+    int marked;
 
     /* Fail closed: without all three symbols we cannot own a real id, and a
      * self-made id would leave an ida_free WARN behind on umount. */
@@ -1043,46 +1056,18 @@ static int sus_mount_mark_ksu_mounts(void)
         return -ENOMEM;
     }
 
-    /* EVERY mount namespace, not just this task's.
+    /* ONE namespace: the caller's.  A sweep over every namespace reachable from
+     * the task list was tried and is NOT done here, because walking another
+     * namespace's mount list is only safe under namespace_sem - which is static in
+     * fs/namespace.c and therefore out of reach for this module (see the protocol
+     * note above sus_mount_scan_ns).  Only the ns_lock half could be taken, and a
+     * foreign namespace mounts and unmounts while we walk it.
      *
-     * A mount that KernelSU created inside another namespace (the zygote's, and
-     * therefore every app's) is a different mount OBJECT with an id of its own -
-     * measured: the same path is 2000000000 in the init namespace and 1111 in the
-     * zygote's.  Marking only the current namespace left that second object
-     * unmarked, so the id test could not see it and the module mount stayed
-     * visible to anything that reads the app's own mountinfo.
-     *
-     * Namespaces are collected from the task list: every task's nsproxy points at
-     * the namespace it runs in, and the list is deduplicated by pointer.  This
-     * runs at load/enable time in process context, and the result is cached in the
-     * identity table (see sus_mount_ident_add) so a namespace created later is
-     * still covered by the hide hooks. */
-    list[n_ns++] = current->nsproxy->mnt_ns;
-    rcu_read_lock();
-    for_each_process(p) {
-        struct mnt_namespace *cand = NULL;
-
-        if (p->nsproxy)
-            cand = p->nsproxy->mnt_ns;
-        if (!cand)
-            continue;
-        for (i = 0; i < n_ns; i++) {
-            if (list[i] == cand)
-                break;
-        }
-        if (i < n_ns)
-            continue;
-        if (n_ns >= SUS_MOUNT_NS_MAX)
-            break;
-        list[n_ns++] = cand;
-    }
-    rcu_read_unlock();
-
-    SUSFS_LOGI("sus_mount: scanning %d mount namespace(s) reachable from the task list\n",
-            n_ns);
-
-    for (i = 0; i < n_ns; i++)
-        marked += sus_mount_scan_ns(list[i], buf, min);
+     * The zygote's copy of a KSU mount (the one every app inherits) is reached
+     * through the identity table instead: same superblock, same root dentry, and
+     * the hide hooks accept that as well as a KSU-range id, with no cross-namespace
+     * walk at all.  That is what closes the leak this file's header describes. */
+    marked = sus_mount_scan_ns(current->nsproxy->mnt_ns, buf, min);
 
     kfree(buf);
 
@@ -1090,8 +1075,8 @@ static int sus_mount_mark_ksu_mounts(void)
         SUSFS_LOGI("sus_mount: %d KSU mount(s) marked with real mnt_id_ida ids (>= %llu), %d identity record(s) cached\n",
                 marked, DEFAULT_KSU_MNT_ID, READ_ONCE(n_ident));
     else
-        SUSFS_LOGI("sus_mount: 0 KSU mounts marked (nothing under /data/adb matched in %d namespace(s), hide threshold %lu)\n",
-                n_ns, min);
+        SUSFS_LOGI("sus_mount: 0 KSU mounts marked (nothing under /data/adb matched in this mnt ns, hide threshold %lu)\n",
+                min);
     return marked;
 }
 
