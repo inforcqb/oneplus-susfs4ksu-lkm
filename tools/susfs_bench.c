@@ -27,14 +27,33 @@
  * Usage:
  *
  *     susfs_bench <path> [iterations]      # default 200000 iterations
+ *
+ * Timing side channel mode.  The question it answers is not "how much does the
+ * hook cost" but "can a process tell the difference between a path that is hidden
+ * and a path that is simply not there" - both answer ENOENT, so if their timings
+ * separate, the denial itself is the leak.  Measuring two paths in separate runs
+ * would compare thermal/scheduler drift instead of the paths, so the two are
+ * measured ALTERNATELY, one batch each, and the printed statistics are of the
+ * paired differences:
+ *
+ *     susfs_bench -p <kind> <iters-per-sample> <samples> <pathA> <pathB>
+ *
+ * kinds: 1=faccessat 2=fchownat 3=newfstatat 4=statx 5=openat+close
+ *
+ * Each sample is the average of <iters-per-sample> calls (the clock is read per
+ * batch, not per call - a syscall-based clock costs more than the thing being
+ * measured).  The verdict line prints YES only when the paired differences do not
+ * change sign, i.e. when a checker could classify a single batch.
  */
 
 typedef unsigned long u64;
 typedef long s64;
 
 #define SYS_faccessat   48
+#define SYS_fchownat    54
 #define SYS_openat      56
 #define SYS_close       57
+#define SYS_getdents64  61
 #define SYS_write       64
 #define SYS_newfstatat  79
 #define SYS_exit        93
@@ -46,11 +65,16 @@ typedef long s64;
 #define AT_FDCWD      (-100)
 #define CLOCK_MONOTONIC 1
 #define O_RDONLY       0
+#define O_DIRECTORY    0x10000
 
 #define STATX_BASIC_STATS 0x7ff
+#define MAX_SAMPLES 300
+#define DBUF 4096
 
 static char out[512];
 static char statbuf[512] __attribute__((aligned(16)));
+static char dbuf[DBUF] __attribute__((aligned(16)));
+static long sa[MAX_SAMPLES], sb[MAX_SAMPLES], sd[MAX_SAMPLES];
 
 static long sys6(long n, long a, long b, long c, long d, long e, long f)
 {
@@ -138,6 +162,208 @@ static u64 parse_num(const char *s)
 	return v;
 }
 
+static long parse_signed(const char *s)
+{
+	long v = 0;
+	int neg = 0;
+
+	if (*s == '-') {
+		neg = 1;
+		s++;
+	}
+	while (*s >= '0' && *s <= '9')
+		v = v * 10 + (long)(*s++ - '0');
+	return neg ? -v : v;
+}
+
+/* ---- timing side channel mode ---- */
+
+static u64 putstr(u64 pos, const char *s)
+{
+	return put(out, pos, s);
+}
+
+static u64 putnum_s(u64 pos, long v)
+{
+	if (v < 0) {
+		out[pos++] = '-';
+		return putnum(out, pos, (u64)(-v));
+	}
+	return putnum(out, pos, (u64)v);
+}
+
+static long one_call(int kind, const char *path)
+{
+	long fd;
+
+	switch (kind) {
+	case 1:
+		return sys6(SYS_faccessat, AT_FDCWD, (long)path, 0, 0, 0, 0);
+	case 2:
+		return sys6(SYS_fchownat, AT_FDCWD, (long)path, -1, -1, 0, 0);
+	case 3:
+		return sys6(SYS_newfstatat, AT_FDCWD, (long)path, (long)statbuf, 0, 0, 0);
+	case 4:
+		return sys6(SYS_statx, AT_FDCWD, (long)path, 0, STATX_BASIC_STATS,
+			    (long)statbuf, 0);
+	case 5:
+		fd = sys6(SYS_openat, AT_FDCWD, (long)path, O_RDONLY, 0, 0, 0);
+		if (fd >= 0)
+			sys6(SYS_close, fd, 0, 0, 0, 0, 0);
+		return fd;
+	case 6:
+		/* Directory listing: the dirent layer rewrites the buffer, so this is the
+		 * face where a per-call cost is most likely to show up. */
+		fd = sys6(SYS_openat, AT_FDCWD, (long)path, O_RDONLY | O_DIRECTORY, 0, 0, 0);
+		if (fd < 0)
+			return fd;
+		sys6(SYS_getdents64, fd, (long)dbuf, DBUF, 0, 0, 0);
+		sys6(SYS_close, fd, 0, 0, 0, 0, 0);
+		return 0;
+	}
+	return -1;
+}
+
+/* Written straight into the output buffer instead of returning a literal: a switch
+ * returning string literals made clang emit a table of absolute addresses in
+ * .rodata, which ld.lld refuses for a static-PIE binary ("relocation
+ * R_AARCH64_ABS64 cannot be used against local symbol; recompile with -fPIC"). */
+static u64 put_kind(u64 pos, int kind)
+{
+	if (kind == 1)
+		return putstr(pos, "faccessat");
+	if (kind == 2)
+		return putstr(pos, "fchownat");
+	if (kind == 3)
+		return putstr(pos, "newfstatat");
+	if (kind == 4)
+		return putstr(pos, "statx");
+	if (kind == 5)
+		return putstr(pos, "openat+close");
+	if (kind == 6)
+		return putstr(pos, "getdents64(dir)");
+	return putstr(pos, "?");
+}
+
+static void isort(long *a, int n)
+{
+	int i, j;
+
+	for (i = 1; i < n; i++) {
+		long v = a[i];
+
+		for (j = i - 1; j >= 0 && a[j] > v; j--)
+			a[j + 1] = a[j];
+		a[j + 1] = v;
+	}
+}
+
+static long pct(const long *sorted, int n, int p)
+{
+	int idx = (n * p) / 100;
+
+	if (idx >= n)
+		idx = n - 1;
+	return sorted[idx];
+}
+
+/* Both paths are measured alternately, one batch each, so that a frequency drop
+ * or a background task hits both sides of the pair instead of one of them. */
+static void paired(int kind, u64 k, int n, const char *pa, const char *pb)
+{
+	int i, j;
+	u64 t0, t1;
+	long rca = 0, rcb = 0;
+	u64 pos;
+
+	for (i = 0; i < n; i++) {
+		t0 = now_ns();
+		for (j = 0; j < (int)k; j++)
+			rca = one_call(kind, pa);
+		t1 = now_ns();
+		sa[i] = (long)((t1 - t0) / k);
+
+		t0 = now_ns();
+		for (j = 0; j < (int)k; j++)
+			rcb = one_call(kind, pb);
+		t1 = now_ns();
+		sb[i] = (long)((t1 - t0) / k);
+		sd[i] = sb[i] - sa[i];
+	}
+
+	isort(sa, n);
+	isort(sb, n);
+	/* The differences get sorted for percentiles; the sign test below only needs
+	 * the ends, which survive sorting. */
+	{
+		long dmin = sd[0], dmax = sd[0];
+
+		for (i = 1; i < n; i++) {
+			if (sd[i] < dmin)
+				dmin = sd[i];
+			if (sd[i] > dmax)
+				dmax = sd[i];
+		}
+		isort(sd, n);
+		pos = putstr(0, "paired kind=");
+		pos = put_kind(pos, kind);
+		pos = putstr(pos, " batch=");
+		pos = putnum(out, pos, k);
+		pos = putstr(pos, " samples=");
+		pos = putnum(out, pos, (u64)n);
+		pos = putstr(pos, "\n  A=");
+		pos = putstr(pos, pa);
+		pos = putstr(pos, " rc=");
+		pos = putnum_s(pos, rca);
+		pos = putstr(pos, " p10=");
+		pos = putnum(out, pos, (u64)pct(sa, n, 10));
+		pos = putstr(pos, " p50=");
+		pos = putnum(out, pos, (u64)pct(sa, n, 50));
+		pos = putstr(pos, " p90=");
+		pos = putnum(out, pos, (u64)pct(sa, n, 90));
+		pos = putstr(pos, "\n  B=");
+		pos = putstr(pos, pb);
+		pos = putstr(pos, " rc=");
+		pos = putnum_s(pos, rcb);
+		pos = putstr(pos, " p10=");
+		pos = putnum(out, pos, (u64)pct(sb, n, 10));
+		pos = putstr(pos, " p50=");
+		pos = putnum(out, pos, (u64)pct(sb, n, 50));
+		pos = putstr(pos, " p90=");
+		pos = putnum(out, pos, (u64)pct(sb, n, 90));
+		pos = putstr(pos, "\n  diff B-A: min=");
+		pos = putnum_s(pos, dmin);
+		pos = putstr(pos, " p10=");
+		pos = putnum_s(pos, pct(sd, n, 10));
+		pos = putstr(pos, " p50=");
+		pos = putnum_s(pos, pct(sd, n, 50));
+		pos = putstr(pos, " p90=");
+		pos = putnum_s(pos, pct(sd, n, 90));
+		pos = putstr(pos, " max=");
+		pos = putnum_s(pos, dmax);
+		/* The verdict has to be an error rate, not "did every sample agree": one
+		 * disturbed sample out of 120 is not what a checker would trip over, it
+		 * would put a threshold at zero and be right the rest of the time. */
+		pos = putstr(pos, "  sign(neg=");
+		{
+			int neg = 0;
+
+			for (i = 0; i < n; i++)
+				if (sd[i] < 0)
+					neg++;
+			pos = putnum(out, pos, (u64)neg);
+			pos = putstr(pos, "/");
+			pos = putnum(out, pos, (u64)n);
+			pos = putstr(pos, ") best_threshold_accuracy=");
+			pos = putnum(out, pos, (u64)(neg * 100 / n));
+			pos = putstr(pos, "%");
+			pos = putstr(pos, (neg == n || neg == 0) ? " (perfect)" : "");
+		}
+		pos = putstr(pos, "\n");
+		sys6(SYS_write, 1, (long)out, pos, 0, 0, 0);
+	}
+}
+
 /* Same entry stub susfs_sc uses: sp points at argc, then argv[0..]. */
 __asm__(
 ".text\n"
@@ -174,6 +400,22 @@ void bench_main(long argc, char **argv)
 		unsigned long mask = 1ul << 7;
 
 		sys6(SYS_sched_setaffinity, 0, (long)sizeof(mask), (long)&mask, 0, 0, 0);
+	}
+
+	/* Timing side channel mode: -p <kind> <batch> <samples> <pathA> <pathB>. */
+	if (argc > 1 && argv[1][0] == '-' && argv[1][1] == 'p' && argc >= 7) {
+		long kind = parse_signed(argv[2]);
+		u64 batch = parse_num(argv[3]);
+		long samples = parse_signed(argv[4]);
+
+		if (batch < 1)
+			batch = 1;
+		if (samples < 2)
+			samples = 2;
+		if (samples > MAX_SAMPLES)
+			samples = MAX_SAMPLES;
+		paired((int)kind, batch, (int)samples, argv[5], argv[6]);
+		return;
 	}
 
 	/* Warm up: the first pass over a cold path resolver is not what we measure,
