@@ -668,6 +668,110 @@ static void sus_mount_note_id(struct mount *r)
     }
 }
 
+/* ---- namespaces created AFTER the enable ----
+ *
+ * Marking is a property of one mount object in one namespace and it does NOT
+ * travel: fs/namespace.c:1054 clone_mnt() builds the copy with alloc_vfsmnt()
+ * (:196), which calls mnt_alloc_id() (:126) - every mount in a namespace copied by
+ * fork/unshare gets a BRAND NEW id, as measured on this device (the copy of the
+ * marked mount has no 2e9 id at all).  So after an app unshares, or after zygote
+ * restarts, nothing in that namespace carries a marked id.
+ *
+ * Hiding still works - the identity test (superblock + root inode) is namespace
+ * independent and does not care about ids (measured: the module mount and a
+ * recorded tmpfs are both hidden inside a freshly cloned namespace).  What does NOT
+ * work before this kretprobe existed is the fdinfo/statx face: the rewrite feeds on
+ * the id table, that table only learns an id when somebody READS a mount table, so
+ * a process that opens a file in the new namespace and reads /proc/self/fdinfo/N
+ * first gets an id its own mountinfo does not list (measured: mnt_id=29127,
+ * listed_in_my_mountinfo=0 - the "fdinfo names a mount that is not there" pattern),
+ * and only the first mount-table read makes it consistent (29117, listed=1).
+ * Upstream has no such window: it assigns the big id at mount creation, so the copy
+ * is marked from the start.
+ *
+ * So: when a namespace is copied, learn the ids of every mount in the NEW tree that
+ * we would hide, right there.
+ *
+ * Safety of walking that tree (this is the trap that once panicked this device):
+ *   - we only ever walk a namespace this task has just built and that is not yet
+ *     installed anywhere: copy_mnt_ns() returns to create_new_namespaces()/
+ *     unshare_nsproxy_namespaces(), and the nsproxy is switched in afterwards
+ *     (switch_task_namespaces), so no other task can add or remove a mount in it.
+ *     namespace_sem is released inside copy_mnt_ns() (fs/namespace.c:3490
+ *     namespace_unlock()), and it is not needed for a tree nobody else can reach.
+ *   - the flags are checked first: without CLONE_NEWNS copy_mnt_ns() returns the
+ *     CURRENT namespace (fs/namespace.c:3436) - that is the plain fork path, which
+ *     runs constantly, and walking a live namespace there would be exactly the bug
+ *     that took the device down before.
+ *   - no allocation and no sleeping: the id table is fixed size (the scan's id
+ *     batch trick is not needed here because we allocate no ids). */
+static atomic_t n_clone_walks = ATOMIC_INIT(0);
+static atomic_t n_clone_learned = ATOMIC_INIT(0);
+
+static void sus_mount_learn_ns(struct mnt_namespace *ns)
+{
+    struct list_head *pos;
+    int learned = 0;
+
+    spin_lock(&ns->ns_lock);
+    for (pos = ns->list.next; pos != &ns->list; pos = pos->next) {
+        struct mount *r = list_entry(pos, struct mount, mnt_list);
+        int shown;
+
+        if (r->mnt_ns != ns || (r->mnt.mnt_flags & MNT_CURSOR))
+            continue;
+        if (!sus_mount_is_ours(r))
+            continue;
+        if (sus_mount_shown_for((int)r->mnt_id))
+            continue;
+        shown = sus_mount_shown_id_from(r);
+        if (shown > 0 && shown != (int)r->mnt_id) {
+            sus_mount_idmap_add((int)r->mnt_id, shown, r->mnt.mnt_sb->s_dev);
+            learned++;
+        }
+    }
+    spin_unlock(&ns->ns_lock);
+    atomic_inc(&n_clone_walks);
+    if (learned)
+        atomic_add(learned, &n_clone_learned);
+}
+
+struct sus_mount_clone_state {
+    unsigned long flags;
+};
+
+static int sus_mount_clone_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct sus_mount_clone_state *st = (struct sus_mount_clone_state *)ri->data;
+
+    st->flags = regs->regs[0];
+    return 0;
+}
+
+static int sus_mount_clone_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct sus_mount_clone_state *st = (struct sus_mount_clone_state *)ri->data;
+    struct mnt_namespace *ns = (struct mnt_namespace *)regs_return_value(regs);
+
+    if (!(st->flags & CLONE_NEWNS))
+        return 0;			/* plain fork: the current namespace, not a copy */
+    if (IS_ERR_OR_NULL(ns))
+        return 0;
+    sus_mount_learn_ns(ns);
+    return 0;
+}
+
+/* copy_mnt_ns() is not static (fs/namespace.c:3424) and is on every namespace
+ * creation path (fork with CLONE_NEWNS, unshare, clone3). */
+static struct kretprobe kr_clone_ns = {
+    .kp.symbol_name = "copy_mnt_ns",
+    .entry_handler = sus_mount_clone_entry,
+    .handler = sus_mount_clone_ret,
+    .data_size = sizeof(struct sus_mount_clone_state),
+    .maxactive = 16,
+};
+static bool kr_clone_ns_ok;
+
 /* ---- /proc/<pid>/fdinfo/N ----
  *
  * fs/proc/fd.c:seq_show() formats pos/flags/mnt_id/ino into the seq_file buffer
@@ -960,6 +1064,7 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      "ident: hits=%d learned_ids=%d full=%d dropped_dev=%d\n"
                      "idmap: recycled_dropped=%d dropped_dev=%d\n"
                      "sb: down=%d (probe=%d)\n"
+                     "clone: walks=%d learned=%d (probe=%d)\n"
                      "fdinfo: entry=%d hits=%d rewrites=%d nolabel=%d\n"
                      "statx: entry=%d ret=%d hits=%d rewrites=%d nobuf=%d err=%d copyfail=%d nomap=%d "
                      "(sys=%d do=%d)\n",
@@ -972,6 +1077,8 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      atomic_read(&n_idmap_recycled),
                      atomic_read(&n_idmap_dropped_dev),
                      atomic_read(&n_sb_down), (int)kp_sb_down_ok,
+                     atomic_read(&n_clone_walks), atomic_read(&n_clone_learned),
+                     (int)kr_clone_ns_ok,
                      atomic_read(&n_fdinfo_entry), atomic_read(&n_fdinfo_hits),
                      atomic_read(&n_fdinfo_rewrites),
                      atomic_read(&n_fdinfo_nolabel),
@@ -1380,6 +1487,10 @@ static void sus_mount_unregister(void)
         unregister_kprobe(&kp_sb_down);
         kp_sb_down_ok = false;
     }
+    if (kr_clone_ns_ok) {
+        unregister_kretprobe(&kr_clone_ns);
+        kr_clone_ns_ok = false;
+    }
     mount_registered = false;
 }
 
@@ -1461,6 +1572,15 @@ static int sus_mount_register(void)
                 rc);
     else
         kp_sb_down_ok = true;
+    /* Optional as well: without it a namespace copied after the enable keeps
+     * working for the mount TABLE (identity hides the lines) but fdinfo/statx stay
+     * inconsistent until somebody reads a mount table in that namespace. */
+    rc = register_kretprobe(&kr_clone_ns);
+    if (rc)
+        pr_warn("sus_mount: register_kretprobe(copy_mnt_ns) failed %d - ids of mounts in a namespace copied later are only learned when its mount table is read\n",
+                rc);
+    else
+        kr_clone_ns_ok = true;
     mount_registered = true;
     return 0;
 }
