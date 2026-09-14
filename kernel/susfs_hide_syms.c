@@ -122,12 +122,13 @@ static void hide_modules_sync_sysfs(void)
 		snprintf(path, sizeof(path), "/sys/module/%s", hide_modules[i]);
 		rc = sus_path_add_self_hidden(path);
 		if (rc) {
-			/* Not fatal: the /proc/modules line is already filtered by the
-			 * probe, and a module that is not loaded yet has no sysfs
-			 * directory.  Counted, and named in the read-back. */
+			/* Not fatal: the /proc/modules line is filtered by the probe whether or
+			 * not the module has a sysfs directory, and a module that is not loaded
+			 * yet has none (-ENOENT).  Counted, and named here, so "listed but
+			 * /sys/module is not hidden" is visible instead of assumed. */
 			atomic_inc(&n_sysfs_rules_failed);
-			SUSFS_LOGI("hide_modules: %s not hidden in /sys/module (%d)\n",
-				path, rc);
+			SUSFS_LOGI("hide_modules: %s: no sus_path rule (%d%s)\n", path, rc,
+				rc == -ENOENT ? " - not loaded, so its sysfs directory does not exist yet" : "");
 			continue;
 		}
 		strscpy(hide_modules_applied[n_hide_modules_applied++],
@@ -220,25 +221,34 @@ static int hide_modules_command(const char *val)
 		memcpy(staged, hide_modules, (size_t)n * MODULE_NAME_LEN);
 		spin_unlock(&hide_modules_lock);
 
-		for (i = 0; i < n; i++) {
-			if (!strcmp(staged[i], arg)) {
+		/* `found` is kept separate from `i` on purpose: after a del the index and
+		 * the new count coincide whenever the removed entry was the last one, and
+		 * reusing `i` for both questions answered -ENOENT for a name that was
+		 * right there (measured: `del <last entry>` always failed). */
+		{
+			bool found = false;
+
+			for (i = 0; i < n; i++) {
+				if (strcmp(staged[i], arg))
+					continue;
+				found = true;
 				if (adding)
-					return 0;			/* already listed */
+					return 0;		/* already listed */
 				memmove(&staged[i], &staged[i + 1],
 					(size_t)(n - i - 1) * MODULE_NAME_LEN);
 				n--;
 				break;
 			}
-		}
-		if (adding) {
-			if (i == n) {
+			if (adding) {
+				if (found)
+					return 0;
 				if (n >= HIDE_MODULES_MAX)
 					return -ENOSPC;
 				strscpy(staged[n], arg, MODULE_NAME_LEN);
 				n++;
+			} else if (!found) {
+				return -ENOENT;			/* not listed */
 			}
-		} else if (i == n) {
-			return -ENOENT;				/* not listed */
 		}
 		hide_modules_commit(staged, n);
 		hide_modules_sync_sysfs();
