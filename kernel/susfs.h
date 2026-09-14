@@ -43,6 +43,21 @@ int sus_path_add_hidden(const char *path);
  * name straight out of /proc - see sus_path_entry_gate_any(). */
 int sus_path_add_self_hidden(const char *path);
 
+/* Undo sus_path_add_self_hidden(): drop the rule for @path and restore whatever it
+ * changed (the relaxed mode, the inode reference).  Returns the number of rules
+ * removed, so 0 means "it was not registered".  Process context only (iput). */
+int sus_path_del_path(const char *path);
+
+/* The module's own name, in the two spellings the kernel derives from it: the
+ * /sys/module directory and the "modinfo name" are both the module file name, and
+ * the self-hide rules and the /proc/modules filter have to agree with it. */
+#define SUSFS_LKM_MODULE_NAME "susfs_guard_lkm"
+#define SUSFS_LKM_SYSFS_DIR   "/sys/module/" SUSFS_LKM_MODULE_NAME
+
+/* Whether the module hides its own traces (see susfs_hide_syms.c: /proc/modules,
+ * /sys/module/<name>, and its own /proc/kallsyms lines).  Runtime switchable. */
+bool susfs_hide_module_enabled(void);
+
 /* Whether the /proc/susfs_* control nodes are created at all.  Defaults to TRUE:
  * the nodes are the module's own interface, and sus_path hides them from every
  * non-root caller (ENOENT, not EACCES).  They are only created when the LSM

@@ -1573,6 +1573,56 @@ static int sus_path_list_puts(char *buf, int n, bool *trunc, const char *fmt, ..
     return n + written;
 }
 
+
+/* Remove every rule whose registered path is @path (normalised the same way
+ * sus_path_entry_set_path() stores it) and undo what those rules changed.  Returns
+ * how many were removed, so 0 is "nothing was registered under that path".
+ *
+ * Process context: sus_path_restore_mode() writes inode->i_mode and iput() can sleep
+ * and evict.  Both happen outside the spinlock, and no matcher can still be holding an
+ * entry: the matchers walk the list only while holding the lock, and these entries are
+ * off it by then. */
+int sus_path_del_path(const char *path)
+{
+    struct sus_path_entry *e, *tmp;
+    LIST_HEAD(doomed);
+    char want[SUS_PATH_LEN];
+    int removed = 0;
+    int i;
+
+    if (!path || !*path)
+        return 0;
+
+    strscpy(want, path, sizeof(want));
+    for (i = (int)strlen(want); i > 1 && want[i - 1] == '/'; i--)
+        want[i - 1] = '\0';
+
+    spin_lock(&sus_path_lock);
+    list_for_each_entry_safe(e, tmp, &sus_path_list, list) {
+        if (strcmp(e->path, want))
+            continue;
+        list_del(&e->list);
+        list_add(&e->list, &doomed);
+        sus_path_count--;
+        removed++;
+    }
+    spin_unlock(&sus_path_lock);
+
+    list_for_each_entry_safe(e, tmp, &doomed, list) {
+        list_del(&e->list);
+        if (!e->inode)
+            atomic_dec(&sus_path_n_pending);
+        sus_path_restore_mode(e);
+        if (e->inode)
+            iput(e->inode);
+        kfree(e);
+    }
+    if (removed)
+        SUSFS_LOGI("sus_path: removed %d rule(s) for %s, %d left\n", removed, want,
+                sus_path_count);
+    return removed;
+}
+
 /* View of the registered paths, for verification.  Writable so that a rule can be
  * taken back: before this, sus_path rules could only be removed by unloading the
  * module, so one mistyped `add_sus_path /data` hid that path machine-wide - and,
@@ -1589,7 +1639,6 @@ static int sus_path_store_list(const char *val, const struct kernel_param *kp)
     struct sus_path_entry *e, *tmp;
     LIST_HEAD(doomed);
     char cmd[SUS_PATH_LEN + 16];
-    const char *want = NULL;
     int i, removed = 0;
 
     strscpy(cmd, val, sizeof(cmd));
@@ -1608,23 +1657,12 @@ static int sus_path_store_list(const char *val, const struct kernel_param *kp)
 
         while (*w == ' ')
             w++;
-        /* Same normalisation sus_path_entry_set_path() applies when storing. */
-        for (i = (int)strlen(w); i > 1 && w[i - 1] == '/'; i--)
-            w[i - 1] = '\0';
-        want = w;
-        if (!*want)
+        if (!*w)
             return -EINVAL;
-
-        spin_lock(&sus_path_lock);
-        list_for_each_entry_safe(e, tmp, &sus_path_list, list) {
-            if (strcmp(e->path, want))
-                continue;
-            list_del(&e->list);
-            list_add(&e->list, &doomed);
-            sus_path_count--;
-            removed++;
-        }
-        spin_unlock(&sus_path_lock);
+        removed = sus_path_del_path(w);
+        SUSFS_LOGI("sus_path: hide_list del, %d rule(s) removed, %d left\n",
+                removed, sus_path_count);
+        return 0;
     } else {
         return -EINVAL;
     }
