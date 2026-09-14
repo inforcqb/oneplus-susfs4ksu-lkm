@@ -95,6 +95,13 @@ echo "add frida" > /sys/module/susfs_guard_lkm/parameters/hide_modules
 
 默认列表只有**本模块自己**：builtin 版 SUSFS 没有模块条目，留一个下来就是上游没有的痕迹。`clear` 是排查用的模式（`lsmod` 会重新列出本模块）。
 
+**另一个边界（实测）**：只过滤"这个模块自己的那一行"。如果别的模块**依赖**它，`/proc/modules` 的"used by"列里仍会出现它的名字，例如隐藏 `explorer` 之后：
+
+```
+camera 10440704 35 explorer, Live 0x0000000000000000 (OE)
+```
+
+要连这一列一起抹掉，需要在 `m_show` 的**返回**处改写那一行（本模块在别处已有这类改写工具），代价是新加一个 kretprobe 与缓冲改写；当前版本不做，按"只有被依赖的模块才会漏"记在这里。
 已知边界：给一个**尚未加载**的模块名时，`/proc/modules` 的行照样会被过滤，但 `/sys/module/<名字>` 此刻还不存在，那条 sus_path 规则加不上——节点里会记 `failed=` 并写出原因，模块加载后重新 `add` 一次即可（或用 `add_sus_path_loop /sys/module/<名字>` 让路径层等它出现）。
 
 ## 使用前必读：隐藏 ≠ 访问控制
