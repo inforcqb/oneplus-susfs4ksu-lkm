@@ -66,7 +66,39 @@ ls /sys/module/susfs_guard_lkm/parameters/   # 参数节点在，也说明已加
 ksu_susfs add_open_redirect <target> <redirected> <uid_scheme>   # uid_scheme: 0..4
 ```
 
+## hide_modules：按名字隐藏其它内核模块
+
+`/proc/modules` 是 0444、任何进程都能读，而且按名字列出**每一个**已加载模块——所以一个读它的检查器能看到全部，包括正在做隐藏的那个模块。`hide_modules` 维护一份**模块名列表**，把列表里的名字从这些地方去掉：
+
+| 面 | 效果 |
+|---|---|
+| `/proc/modules` | 该模块的行被过滤掉，**对所有读者都一样，root 也不例外**（检查器很可能就是 root，而它比对的就是这份列表）；计数在控制接口里可读 |
+| `/sys/module/<名字>` | 以 sus_path 的 `self_protect` 规则注册 ⇒ 非 root 调用者的 stat/open/readdir 得到 `ENOENT`；root 仍可见（那是模块参数所在的地方）——这是唯一需要知道的不对称 |
+| `/proc/kallsyms` | `module_name` 匹配的那些行同样被过滤（对所有读者） |
+
+### 控制接口（两个前端、同一份列表）
+
+```sh
+# /proc 节点：只接受命令（root），其它调用者得到 ENOENT
+echo "add kernelsu"            > /proc/susfs_hide_modules   # 加一个名字
+echo "del kernelsu"            > /proc/susfs_hide_modules   # 去掉一个
+echo "set kernelsu frida"      > /proc/susfs_hide_modules   # 整份替换
+echo clear                     > /proc/susfs_hide_modules   # 一个都不隐藏（调试模式）
+cat /proc/susfs_hide_modules                                # 看状态：列表 + 计数
+
+# 模块参数：同样的命令，另外还接受裸列表（insmod 就是这么传值的）
+ksud insmod susfs_guard_lkm.ko hide_modules=kernelsu,frida
+echo "add frida" > /sys/module/susfs_guard_lkm/parameters/hide_modules
+```
+
+节点遵循本项目其它控制节点的约定：**0777**（这样 DAC 会让路，唯一给出回答的是 sus_path 的隐藏集合 ⇒ `ENOENT`，与"没有这个文件"无法区分），并在 `open()` **和** `write()` 里都做 uid 检查（传出去的 fd 不能成为入口），同时登记在 sus_path 的自隐藏集合里：非 root 的 `cat` 与 `>` 重定向都是 `No such file or directory`（已在设备上验证）。
+
+默认列表只有**本模块自己**：builtin 版 SUSFS 没有模块条目，留一个下来就是上游没有的痕迹。`clear` 是排查用的模式（`lsmod` 会重新列出本模块）。
+
+已知边界：给一个**尚未加载**的模块名时，`/proc/modules` 的行照样会被过滤，但 `/sys/module/<名字>` 此刻还不存在，那条 sus_path 规则加不上——节点里会记 `failed=` 并写出原因，模块加载后重新 `add` 一次即可（或用 `add_sus_path_loop /sys/module/<名字>` 让路径层等它出现）。
+
 ## 使用前必读：隐藏 ≠ 访问控制
+
 
 `sus_path` 隐藏一个路径时，会**把这个 inode 的权限位放宽到 0777**。这不是疏忽，是必须的：
 

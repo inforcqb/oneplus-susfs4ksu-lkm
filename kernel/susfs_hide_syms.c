@@ -184,9 +184,16 @@ static void hide_modules_commit(char dst[][MODULE_NAME_LEN], int n)
 	spin_unlock_irqrestore(&hide_modules_lock, flags);
 }
 
-/* One implementation for both frontends.  "clear" / "add <name>" / "del <name>" are
- * commands; anything else is a whole new list. */
-static int hide_modules_command(const char *val)
+/* One implementation for both frontends.
+ *
+ * Commands: `clear`, `add <name>`, `del <name>`, `set <name> [<name>...]`.
+ *
+ * @bare_list is the one difference between the frontends: insmod hands the parameter
+ * a bare value (`hide_modules=a,b`), so its setter accepts a command-less list.  The
+ * /proc node does NOT: a typo there would otherwise silently *replace* the list with
+ * whatever was typed - measured during the first device test, where a deliberately
+ * bogus command discarded the list and the next read showed a name nobody meant. */
+static int hide_modules_command(const char *val, bool bare_list)
 {
 	char cmd[HIDE_MODULES_CMDLINE];
 	char staged[HIDE_MODULES_MAX][MODULE_NAME_LEN];
@@ -201,6 +208,16 @@ static int hide_modules_command(const char *val)
 		hide_modules_commit(staged, 0);
 		hide_modules_sync_sysfs();
 		SUSFS_LOGI("hide_modules: list cleared (no module is filtered)\n");
+		return 0;
+	}
+
+	if (!strncmp(cmd, "set ", 4)) {
+		n = hide_modules_parse(cmd + 4, staged, HIDE_MODULES_MAX);
+		if (n < 0)
+			return n;
+		hide_modules_commit(staged, n);
+		hide_modules_sync_sysfs();
+		SUSFS_LOGI("hide_modules: list set to %d name(s)\n", n);
 		return 0;
 	}
 
@@ -257,6 +274,9 @@ static int hide_modules_command(const char *val)
 		return 0;
 	}
 
+	if (!bare_list)
+		return -EINVAL;
+
 	n = hide_modules_parse(cmd, staged, HIDE_MODULES_MAX);
 	if (n < 0)
 		return n;
@@ -288,7 +308,8 @@ static int hide_modules_format(char *buf, size_t size)
 
 static int hide_modules_param_set(const char *val, const struct kernel_param *kp)
 {
-	return hide_modules_command(val);
+	/* insmod passes a bare value, so the parameter accepts a command-less list. */
+	return hide_modules_command(val, true);
 }
 
 static int hide_modules_param_get(char *buf, const struct kernel_param *kp)
@@ -341,7 +362,8 @@ static ssize_t hide_modules_proc_write(struct file *file, const char __user *buf
 		return -EFAULT;
 	cmd[len] = '\0';
 
-	rc = hide_modules_command(cmd);
+	/* The node takes commands only: a typo must not silently replace the list. */
+	rc = hide_modules_command(cmd, false);
 	if (rc)
 		return rc;
 	return len;
