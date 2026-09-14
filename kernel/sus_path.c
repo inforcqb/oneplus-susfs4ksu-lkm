@@ -1712,6 +1712,11 @@ int sus_path_init(void)
     rc = ksu_register_lsm_hook(&sus_path_getattr_hook);
     if (rc) {
         pr_err("sus_path: getattr hook failed %d - nothing would be hidden, refusing to load\n", rc);
+        /* The scratch buffer is already allocated; the caller is about to fail the
+         * load, and a vmalloc'd buffer is not part of the module's own memory, so
+         * nobody else would ever free it. */
+        kvfree(dirent_tmp);
+        dirent_tmp = NULL;
         return rc;
     }
     SUSFS_LOGI("sus_path: getattr hook armed, orig=%ps\n", sus_path_getattr_hook.original);
@@ -1720,6 +1725,8 @@ int sus_path_init(void)
     if (rc) {
         pr_err("sus_path: perm hook failed %d - nothing would be hidden, refusing to load\n", rc);
         ksu_unregister_lsm_hook(&sus_path_getattr_hook);
+        kvfree(dirent_tmp);
+        dirent_tmp = NULL;
         return rc;
     }
     SUSFS_LOGI("sus_path: perm hook armed, orig=%ps\n", sus_path_perm_hook.original);

@@ -504,12 +504,17 @@ void ksu_unregister_lsm_hook(struct ksu_lsm_hook *hook)
     ksu_lsm_unhook(hook);
 }
 
-void __init ksu_lsm_hook_init(void)
+/* No __init/__exit annotation on these two, on purpose: the module's layer table
+ * (susfs_main.c) holds their addresses and calls the exit from the rollback path of
+ * a FAILED load, i.e. from plain .text.  Keeping them in the init/exit sections
+ * would make the table hold a pointer into a section modpost reports as a mismatch
+ * and the kernel frees after a successful load.  They are a few dozen bytes. */
+void ksu_lsm_hook_init(void)
 {
     SUSFS_LOGI("lsm_hook: init, tracked hooks=%d\n", READ_ONCE(ksu_lsm_hook_count));
 }
 
-void __exit ksu_lsm_hook_exit(void)
+void ksu_lsm_hook_exit(void)
 {
     struct ksu_lsm_hook *hooks[ARRAY_SIZE(ksu_lsm_hook_entries)];
     int count;
