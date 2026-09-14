@@ -66,6 +66,37 @@ ls /sys/module/susfs_guard_lkm/parameters/   # 参数节点在，也说明已加
 ksu_susfs add_open_redirect <target> <redirected> <uid_scheme>   # uid_scheme: 0..4
 ```
 
+## 使用前必读：隐藏 ≠ 访问控制
+
+`sus_path` 隐藏一个路径时，会**把这个 inode 的权限位放宽到 0777**。这不是疏忽，是必须的：
+
+`inode_permission()` 先做 DAC 再进 LSM 链，所以一个 0600 的目标在 DAC 层就被回 `EACCES`——"这文件存在，只是你没权限"——LSM 层根本没有机会把它变成 `ENOENT`。实测过：`ls -l` 得到 `No such file or directory`（`inode_getattr` 生效），而 `cat` 得到 `Permission denied`，且 perm 计数保持 0。所以只能让 DAC 放行，把唯一的判断留给 LSM 层。
+
+由此带来几个**必须知道**的后果：
+
+- **"隐藏"＝ 路径名不可见 + LSM 拦截，不是权限控制。** 不经过路径名的通道都不受影响：已经打开的 fd（`/proc/<pid>/fd/N`）、注册规则**之前**已经持有的引用、注册前的硬链接/bind mount、以及按 `(dev, ino)` 而不是按路径工作的接口（本项目里 `/proc/<pid>/map_files`、`maps`/`smaps` 的 inode 面就是这类）。**不要用它保护真正敏感的数据。**
+- 权限改写**只发生在内存里的 inode 上**，磁盘上的 mode 从未被改动；`rmmod`、以及规则被 `del`/`clear` 删除时会恢复。但**崩溃或强杀不会**执行恢复——那种情况下重启即可（重启后是磁盘上的原值）。
+- 门控是 `uid >= 10000 且不是文件属主`（上游 `TIF_PROC_UMOUNTED` 的近似）。也就是说 **root、system(1000)、shell(2000) 本来就能看到全部隐藏路径**——以这些身份运行的检查器不受影响。这是移植取舍，不是漏洞，但也意味着"只有 app 被隐藏"。
+- 规则此前只能加不能删（一条误加的 `add_sus_path` 会让该路径整机不可见，直到卸载模块）。现在可以撤销，删掉的同时会把放宽的权限恢复回去：
+
+  ```sh
+  echo "del /data/adb/xxx" > /sys/module/susfs_guard_lkm/parameters/hide_list   # 单条
+  echo clear              > /sys/module/susfs_guard_lkm/parameters/hide_list   # 全部
+  ```
+
+  `hide_list` 是 0600（只读时是隐藏路径清单，不能让 app 读到），列表超过一页会截断并标注 `(truncated)`。
+
+## 另一个需要知道的取舍：被隐藏的路径"更快"
+
+我们的拒绝发生在 DAC/SELinux **之前**，所以隐藏路径的耗时接近"路径存在"那一类。实测（配对采样，`tools/susfs_bench.c -p`，一批 200 次调用、120 个样本）：
+
+| 对比 | 结果 |
+|---|---|
+| 被隐藏 vs 真正不存在（都返回 ENOENT） | 阈值判 0 的分类正确率 95–99%，差值 0.3–1.4 µs |
+| **模块完全没加载时**：存在 vs 不存在 | 97–100%，差值 0.25–1.35 µs |
+
+也就是说这个信号**几乎全是内核固有的**（正 dentry 比负 dentry 贵），本模块只把差值改了 ±0.2 µs，`openat`/`statx` 甚至更快。它只给出 1 bit："这个我猜得到名字的路径存在、只是被拒了"，拿不到内容、也不能用来扫描。想关掉这个面，只能让查找阶段本身就失败（需要重做一层入口拦截）或把 dentry 摘出缓存——两者代价都更大，属设计取舍。
+
 ## 移植参考
 
 - [susfs4ksu](https://gitlab.com/simonpunk/susfs4ksu) — SUSFS 功能逻辑与 hook 点（GPL-3.0）
