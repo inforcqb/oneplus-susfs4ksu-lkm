@@ -38,6 +38,8 @@ art/
 # what it is checked against - the opposite of the point.  They stay on disk.
 *.md
 !README.md
+# 接口文档是要给使用者的，与 README 同级发布；其余 *.md 仍是内部文档（会写清隐藏手法本身）。
+!PROC_INTERFACES.md
 
 # development-only scaffolding: the probe/test modules and C test programs used
 # while working the hooks out.  They are not built by kernel/Makefile and are not
