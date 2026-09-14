@@ -136,6 +136,10 @@ camera 10440704 35 explorer, Live 0x0000000000000000 (OE)
 
 也就是说这个信号**几乎全是内核固有的**（正 dentry 比负 dentry 贵），本模块只把差值改了 ±0.2 µs，`openat`/`statx` 甚至更快。它只给出 1 bit："这个我猜得到名字的路径存在、只是被拒了"，拿不到内容、也不能用来扫描。想关掉这个面，只能让查找阶段本身就失败（需要重做一层入口拦截）或把 dentry 摘出缓存——两者代价都更大，属设计取舍。
 
+## 接口文档
+
+全部 `/proc` 控制节点（读回格式、写命令、错误契约、以及它们共同遵守的三条规则：0777 让 DAC 让路、open/write 都查 uid、由 sus_path 自隐藏给出 ENOENT）与相关 sysfs 参数，见 **[PROC_INTERFACES.md](PROC_INTERFACES.md)**。
+
 ## 移植参考
 
 - [susfs4ksu](https://gitlab.com/simonpunk/susfs4ksu) — SUSFS 功能逻辑与 hook 点（GPL-3.0）
