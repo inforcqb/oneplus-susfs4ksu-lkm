@@ -21,104 +21,331 @@
 #include <linux/seq_file.h>
 #include <linux/kallsyms.h>
 #include <linux/string.h>
+#include <linux/proc_fs.h>	/* the runtime control node */
+#include <linux/cred.h>		/* current_uid() */
 #include "susfs_log.h"
 #include "susfs.h"		/* sus_path_add_self_hidden / sus_path_del_path */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact (kallsyms_op) */
 
-/* ---- hide_module: the module's own traces, as a switchable feature ----
+/* ---- hide_modules: filter other kernel modules out of /proc/modules ----
  *
- * Upstream's HIDE_KSU_SUSFS_SYMBOLS (below) hides KernelSU's symbols, and a built-in
- * SUSFS has no module entry at all - so "the hiding machinery is not visible AS A
- * MODULE" is something only this port has to provide.  It has three parts, which is
- * why they are one feature with one switch instead of three ad-hoc behaviours:
+ * /proc/modules is world-readable (0444) and lists every loaded module by name, so a
+ * checker that greps it sees the whole set - including whichever module is doing the
+ * hiding.  This feature keeps a list of module NAMES and removes them from:
  *
- *   1. /proc/modules is world-readable and lists one line per module.  Ours is
- *      printed by m_show(): answering success without emitting anything leaves the
- *      listing exactly as a built-in kernel's would be.
- *   2. /sys/module/susfs_guard_lkm is a world-readable directory whose NAME alone
- *      says what is loaded (and `ls` of it is enough).  Registered in sus_path as a
- *      self-protected rule, so it answers ENOENT for every non-root caller while
- *      root keeps access to the parameters inside it.
- *   3. /proc/kallsyms lines whose module_name is this module.
+ *   1. /proc/modules - the m_show() line, for EVERY reader, root included.  A checker
+ *      may well run as root, and this listing is what it compares against; the counter
+ *      in the node below shows the filter is running.
+ *   2. /sys/module/<name> - registered in sus_path with self_protect, so stat/open/
+ *      readdir of that path answer ENOENT for every non-root caller.  Root keeps
+ *      access (that is where a module's parameters live), which is the one asymmetry
+ *      to know about: a root checker can still list /sys/module.
+ *   3. /proc/kallsyms lines whose module_name matches (also for every reader).
  *
- * hide_module=0 turns all three off.  That is for debugging the module itself (its
- * other hiding is unaffected, `lsmod` simply lists it again); the default is on,
- * because a built-in SUSFS leaves no module entry and matching that is the point.
+ * Control surface, two frontends over one list:
  *
- * A module parameter, NOT a new supercall command: the CMD_* space is shared with
- * KernelSU's own copy of SUSFS, and a new id there is a compatibility risk that buys
- * nothing - the operator is root and this parameter sits in the directory this very
- * feature controls. */
-bool susfs_hide_module = true;
-static bool sysfs_rule_present;
-static atomic_t n_modlines_skipped = ATOMIC_INIT(0);	/* /proc/modules lines */
-static atomic_t n_kallsyms_own_skipped = ATOMIC_INIT(0);	/* our own kallsyms lines */
-static atomic_t n_sysfs_rule_fail = ATOMIC_INIT(0);
+ *   /proc/susfs_hide_modules       (write, root only, ENOENT for everyone else)
+ *       add <name> | del <name> | clear | <name> [<name> ...]
+ *   .../parameters/hide_modules    (same commands; settable at insmod time)
+ *
+ * The node follows the house pattern of this module's other control nodes: 0777 so
+ * that DAC passes and sus_path's hidden set is the only thing that answers - ENOENT,
+ * which is indistinguishable from "no such file" - plus a uid check in open() AND
+ * write() so a passed-on fd is not a way in.
+ *
+ * The default list holds just this module: a built-in SUSFS has no module entry, so
+ * leaving one behind would be a trace upstream does not have.  `clear` is the
+ * debugging mode (`lsmod` lists us again).
+ *
+ * Not a new CMD_SUSFS_* command: the command space is shared with KernelSU's own copy
+ * of SUSFS and a new id there is a compatibility risk that buys nothing here. */
+#define HIDE_MODULES_MAX 16
+#define HIDE_MODULES_CMDLINE (HIDE_MODULES_MAX * (MODULE_NAME_LEN + 1) + 96)
 
-bool susfs_hide_module_enabled(void)
+static char hide_modules[HIDE_MODULES_MAX][MODULE_NAME_LEN];
+static char hide_modules_applied[HIDE_MODULES_MAX][MODULE_NAME_LEN];	/* sysfs rules live */
+static int n_hide_modules;
+static int n_hide_modules_applied;
+static DEFINE_SPINLOCK(hide_modules_lock);
+
+static atomic_t n_modlines_skipped = ATOMIC_INIT(0);	/* /proc/modules lines removed */
+static atomic_t n_kallsyms_mod_skipped = ATOMIC_INIT(0);	/* kallsyms lines of those modules */
+static atomic_t n_sysfs_rules_added = ATOMIC_INIT(0);
+static atomic_t n_sysfs_rules_failed = ATOMIC_INIT(0);
+
+/* Interrupt/kprobe safe: no allocation, no sleeping - both callers are probe handlers
+ * and the list is only ever swapped by the two process-context frontends below. */
+static bool hide_module_name_match(const char *name)
 {
-	return READ_ONCE(susfs_hide_module);
+	unsigned long flags;
+	bool hit = false;
+	int i;
+
+	if (!name || !name[0])
+		return false;
+
+	spin_lock_irqsave(&hide_modules_lock, flags);
+	for (i = 0; i < n_hide_modules; i++) {
+		if (!strcmp(hide_modules[i], name)) {
+			hit = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&hide_modules_lock, flags);
+	return hit;
 }
 
-/* Add or drop the /sys/module/<name> rule so it follows the switch.  Best effort,
- * but never silent: a failure shows up as sysfs_rule=absent in the read-back below. */
-static void hide_module_apply_sysfs(void)
+bool susfs_hide_modules_active(void)
 {
-	bool want = READ_ONCE(susfs_hide_module);
-	int rc;
+	return n_hide_modules > 0;
+}
 
-	if (want == sysfs_rule_present)
-		return;
+/* Reconcile the /sys/module/<name> rules with the list: every name that gained an
+ * entry gets one, every name that lost one loses it.  Process context (kern_path and
+ * iput inside sus_path). */
+static void hide_modules_sync_sysfs(void)
+{
+	char path[64];
+	int i;
 
-	if (want) {
-		rc = sus_path_add_self_hidden(SUSFS_LKM_SYSFS_DIR);
+	/* Drop what is no longer listed.  sus_path_del_path() is a no-op for a name that
+	 * was never registered, so this is safe even after a failed add. */
+	for (i = 0; i < n_hide_modules_applied; i++) {
+		snprintf(path, sizeof(path), "/sys/module/%s", hide_modules_applied[i]);
+		sus_path_del_path(path);
+	}
+	n_hide_modules_applied = 0;
+
+	for (i = 0; i < n_hide_modules; i++) {
+		int rc;
+
+		snprintf(path, sizeof(path), "/sys/module/%s", hide_modules[i]);
+		rc = sus_path_add_self_hidden(path);
 		if (rc) {
-			atomic_inc(&n_sysfs_rule_fail);
-			pr_warn("susfs_hide_syms: cannot register %s in sus_path (%d) - /sys/module/%s stays visible to apps\n",
-				SUSFS_LKM_SYSFS_DIR, rc, SUSFS_LKM_MODULE_NAME);
-			return;
+			/* Not fatal: the /proc/modules line is already filtered by the
+			 * probe, and a module that is not loaded yet has no sysfs
+			 * directory.  Counted, and named in the read-back. */
+			atomic_inc(&n_sysfs_rules_failed);
+			SUSFS_LOGI("hide_modules: %s not hidden in /sys/module (%d)\n",
+				path, rc);
+			continue;
 		}
-		sysfs_rule_present = true;
-	} else {
-		sus_path_del_path(SUSFS_LKM_SYSFS_DIR);
-		sysfs_rule_present = false;
+		strscpy(hide_modules_applied[n_hide_modules_applied++],
+			hide_modules[i], MODULE_NAME_LEN);
+		atomic_inc(&n_sysfs_rules_added);
 	}
 }
 
-static int hide_module_set(const char *val, const struct kernel_param *kp)
+/* Parse @val into @dst and return the count, or a negative errno.  Separators are
+ * spaces, commas and tabs, so both the insmod form (hide_modules=a,b) and the /proc
+ * form (a b) work. */
+static int hide_modules_parse(const char *val, char dst[][MODULE_NAME_LEN], int max)
 {
-	bool want;
-	int rc;
+	char buf[HIDE_MODULES_CMDLINE];
+	const char *p;
+	int n = 0;
 
-	rc = kstrtobool(val, &want);
-	if (rc)
-		return rc;
+	strscpy(buf, val, sizeof(buf));
+	p = buf;
+	while (*p) {
+		char *tok = (char *)p;
+		int len;
 
-	WRITE_ONCE(susfs_hide_module, want);
-	hide_module_apply_sysfs();
-	SUSFS_LOGI("susfs_hide_syms: hide_module=%d (/proc/modules + kallsyms + sysfs rule=%s)\n",
-		(int)want, sysfs_rule_present ? "present" : "absent");
+		while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n' || *p == '\r')
+			p++;
+		if (!*p)
+			break;
+		tok = (char *)p;
+		while (*p && *p != ' ' && *p != ',' && *p != '\t' && *p != '\n' && *p != '\r')
+			p++;
+		len = (int)(p - tok);
+		if (len <= 0)
+			continue;
+		if (len >= MODULE_NAME_LEN)
+			return -ENAMETOOLONG;	/* longer than any module name */
+		if (n >= max)
+			return -ENOSPC;
+		memcpy(dst[n], tok, len);
+		dst[n][len] = '\0';
+		n++;
+	}
+	return n;
+}
+
+static void hide_modules_commit(char dst[][MODULE_NAME_LEN], int n)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&hide_modules_lock, flags);
+	memset(hide_modules, 0, sizeof(hide_modules));
+	memcpy(hide_modules, dst, (size_t)n * MODULE_NAME_LEN);
+	n_hide_modules = n;
+	spin_unlock_irqrestore(&hide_modules_lock, flags);
+}
+
+/* One implementation for both frontends.  "clear" / "add <name>" / "del <name>" are
+ * commands; anything else is a whole new list. */
+static int hide_modules_command(const char *val)
+{
+	char cmd[HIDE_MODULES_CMDLINE];
+	char staged[HIDE_MODULES_MAX][MODULE_NAME_LEN];
+	const char *arg;
+	int i, n;
+
+	strscpy(cmd, val, sizeof(cmd));
+	for (i = (int)strlen(cmd) - 1; i >= 0 && (cmd[i] == '\n' || cmd[i] == '\r' || cmd[i] == ' '); i--)
+		cmd[i] = '\0';
+
+	if (!strcmp(cmd, "clear")) {
+		hide_modules_commit(staged, 0);
+		hide_modules_sync_sysfs();
+		SUSFS_LOGI("hide_modules: list cleared (no module is filtered)\n");
+		return 0;
+	}
+
+	if (!strncmp(cmd, "add ", 4) || !strncmp(cmd, "del ", 4)) {
+		bool adding = (cmd[0] == 'a');
+
+		arg = cmd + 4;
+		while (*arg == ' ')
+			arg++;
+		if (!*arg || strlen(arg) >= MODULE_NAME_LEN)
+			return -EINVAL;
+
+		/* Rebuild from the current list: one entry added or dropped. */
+		spin_lock(&hide_modules_lock);
+		n = n_hide_modules;
+		if (n > HIDE_MODULES_MAX)
+			n = HIDE_MODULES_MAX;
+		memcpy(staged, hide_modules, (size_t)n * MODULE_NAME_LEN);
+		spin_unlock(&hide_modules_lock);
+
+		for (i = 0; i < n; i++) {
+			if (!strcmp(staged[i], arg)) {
+				if (adding)
+					return 0;			/* already listed */
+				memmove(&staged[i], &staged[i + 1],
+					(size_t)(n - i - 1) * MODULE_NAME_LEN);
+				n--;
+				break;
+			}
+		}
+		if (adding) {
+			if (i == n) {
+				if (n >= HIDE_MODULES_MAX)
+					return -ENOSPC;
+				strscpy(staged[n], arg, MODULE_NAME_LEN);
+				n++;
+			}
+		} else if (i == n) {
+			return -ENOENT;				/* not listed */
+		}
+		hide_modules_commit(staged, n);
+		hide_modules_sync_sysfs();
+		SUSFS_LOGI("hide_modules: %s %s -> %d name(s) filtered\n",
+			adding ? "add" : "del", arg, n);
+		return 0;
+	}
+
+	n = hide_modules_parse(cmd, staged, HIDE_MODULES_MAX);
+	if (n < 0)
+		return n;
+	hide_modules_commit(staged, n);
+	hide_modules_sync_sysfs();
+	SUSFS_LOGI("hide_modules: list set to %d name(s)\n", n);
 	return 0;
 }
 
-static int hide_module_get(char *buf, const struct kernel_param *kp)
+static int hide_modules_format(char *buf, size_t size)
 {
-	return scnprintf(buf, PAGE_SIZE,
-		"hide_module=%d  sysfs_rule=%s  /proc/modules lines skipped=%d  own /proc/kallsyms lines skipped=%d  sysfs_rule failures=%d\n",
-		(int)READ_ONCE(susfs_hide_module),
-		sysfs_rule_present ? "present" : "absent",
-		atomic_read(&n_modlines_skipped),
-		atomic_read(&n_kallsyms_own_skipped),
-		atomic_read(&n_sysfs_rule_fail));
+	int n = 0;
+	int i;
+
+	n += scnprintf(buf + n, size - n,
+		"hide_modules: %d/%d name(s), /sys/module rules=%d (failed=%d), "
+		"/proc/modules lines removed=%d, kallsyms lines removed=%d\n",
+		n_hide_modules, HIDE_MODULES_MAX, n_hide_modules_applied,
+		atomic_read(&n_sysfs_rules_failed),
+		atomic_read(&n_modlines_skipped), atomic_read(&n_kallsyms_mod_skipped));
+	n += scnprintf(buf + n, size - n, "names:");
+	for (i = 0; i < n_hide_modules && n < (int)size - 64; i++)
+		n += scnprintf(buf + n, size - n, " %s", hide_modules[i]);
+	n += scnprintf(buf + n, size - n, "\n");
+	return n;
 }
 
-static const struct kernel_param_ops hide_module_ops = {
-	.get = hide_module_get,
-	.set = hide_module_set,
+/* ---- the two frontends ---- */
+
+static int hide_modules_param_set(const char *val, const struct kernel_param *kp)
+{
+	return hide_modules_command(val);
+}
+
+static int hide_modules_param_get(char *buf, const struct kernel_param *kp)
+{
+	return hide_modules_format(buf, PAGE_SIZE);
+}
+
+static const struct kernel_param_ops hide_modules_ops = {
+	.get = hide_modules_param_get,
+	.set = hide_modules_param_set,
 };
-/* 0600: root reads the state and flips it; the path itself is inside the directory
- * this feature hides from everyone else. */
-module_param_cb(hide_module, &hide_module_ops, NULL, 0600);
+/* 0600: root reads and writes it, and the whole directory is inside the one the
+ * hide_modules feature hides from everyone else. */
+module_param_cb(hide_modules, &hide_modules_ops, NULL, 0600);
+
+static int hide_modules_proc_show(struct seq_file *m, void *v)
+{
+	char buf[512];
+
+	hide_modules_format(buf, sizeof(buf));
+	seq_puts(m, buf);
+	return 0;
+}
+
+static int hide_modules_proc_open(struct inode *inode, struct file *file)
+{
+	/* 0777 node + this check, exactly like the other control nodes: a restrictive
+	 * mode would answer EACCES (which advertises that the node exists) before
+	 * sus_path could answer ENOENT. */
+	if (current_uid().val != 0)
+		return -ENOENT;
+	return single_open(file, hide_modules_proc_show, NULL);
+}
+
+static ssize_t hide_modules_proc_write(struct file *file, const char __user *buf,
+				       size_t len, loff_t *off)
+{
+	char cmd[HIDE_MODULES_CMDLINE];
+	int rc;
+
+	/* Same reason as the open check: an fd opened before the process dropped
+	 * privileges must not become a way in. */
+	if (current_uid().val != 0)
+		return -ENOENT;
+	if (len == 0)
+		return 0;
+	if (len >= sizeof(cmd))
+		return -EINVAL;
+	if (copy_from_user(cmd, buf, len))
+		return -EFAULT;
+	cmd[len] = '\0';
+
+	rc = hide_modules_command(cmd);
+	if (rc)
+		return rc;
+	return len;
+}
+
+static const struct proc_ops hide_modules_proc_ops = {
+	.proc_open = hide_modules_proc_open,
+	.proc_read = seq_read,
+	.proc_write = hide_modules_proc_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+static struct proc_dir_entry *hide_modules_entry;
 
 /* local mirror of kernel/kallsyms.c struct kallsym_iter (layout is KMI-frozen);
  * only the name field matters here. */
@@ -181,22 +408,19 @@ static int hide_syms_s_show_pre(struct kprobe *kp, struct pt_regs *regs)
 	if (!iter->name[0])
 		return 0;
 
-	/* hide by name prefix OR by our module name (module symbols carry the
-	 * real name like __kstrtab_susfs_xxx, with susfs_guard_lkm in module_name).
-	 *
-	 * The two tests belong to two different features and are counted apart: the
-	 * prefix list is upstream's HIDE_KSU_SUSFS_SYMBOLS (KernelSU's own symbols),
-	 * the module_name test is this port's hide_module (our own traces). */
+	/* Two different features, counted apart:
+	 *   - the prefix list is upstream's HIDE_KSU_SUSFS_SYMBOLS (KernelSU's names);
+	 *   - the module_name test is hide_modules, which filters the lines of whichever
+	 *     modules the operator listed (module symbols carry their own spelling, e.g.
+	 *     __kstrtab_foo, with the module's name in module_name). */
 	if (name_should_hide(iter->name)) {
 		atomic_inc(&hide_hit_count);
 		regs->regs[0] = 0;              /* s_show returns 0 */
 		regs->pc = regs->regs[30];      /* skip the line */
 		return 1;
 	}
-	if (!READ_ONCE(susfs_hide_module))
-		return 0;
-	if (!strcmp(iter->module_name, SUSFS_LKM_MODULE_NAME)) {
-		atomic_inc(&n_kallsyms_own_skipped);
+	if (iter->module_name[0] && hide_module_name_match(iter->module_name)) {
+		atomic_inc(&n_kallsyms_mod_skipped);
 		regs->regs[0] = 0;
 		regs->pc = regs->regs[30];
 		return 1;
@@ -231,15 +455,16 @@ static struct kprobe kp_s_show = {
  * module from the iterator is safe. */
 static int hide_syms_m_show_pre(struct kprobe *kp, struct pt_regs *regs)
 {
+	struct module *mod;
 	void *p = (void *)regs_get_kernel_argument(regs, 1);
 
 	if (!p)
 		return 0;
-	/* The entry for OUR module is hide_module's business, not the symbol filter's:
-	 * with the switch off, `lsmod` must list us again. */
-	if (!READ_ONCE(susfs_hide_module))
-		return 0;
-	if ((struct module *)((char *)p - offsetof(struct module, list)) != THIS_MODULE)
+
+	/* Same recovery the kernel's own m_show() does with list_entry(): the iterator
+	 * hands over &module->list, so the module (and its name) is one offset away. */
+	mod = (struct module *)((char *)p - offsetof(struct module, list));
+	if (!hide_module_name_match(mod->name))
 		return 0;
 
 	atomic_inc(&n_modlines_skipped);
@@ -292,22 +517,40 @@ int susfs_hide_syms_init(void)
 		(table_show && (unsigned long)kp_s_show.addr == table_show) ?
 		" - same address" : " - different address (expected: table holds the CFI thunk)");
 
-	/* Separate probe, separate failure: hiding the symbol names and hiding the
-	 * module entry are independent, and neither should stop the other. */
+	/* Separate probe, separate failure: hiding the symbol names and hiding module
+	 * entries are independent, and neither should stop the other. */
 	rc = register_kprobe(&kp_m_show);
 	if (rc)
-		pr_warn("susfs_hide_syms: register_kprobe(m_show) failed %d - /proc/modules still lists the module\n",
+		pr_warn("susfs_hide_syms: register_kprobe(m_show) failed %d - /proc/modules keeps listing the modules in hide_modules\n",
 			rc);
 	else
 		m_show_registered = true;
 
-	/* Arm the hide_module feature: its sysfs rule has to be registered by sus_path,
-	 * which is up by now (this layer is last in the init table), so the directory is
-	 * hidden from the moment the module is loaded rather than from the first
-	 * supercall. */
-	hide_module_apply_sysfs();
-	if (READ_ONCE(susfs_hide_module) && !sysfs_rule_present)
-		pr_warn("susfs_hide_syms: hide_module is on but the sysfs rule is missing\n");
+	/* hide_modules starts with just this module in its list: a built-in SUSFS has no
+	 * module entry, so leaving ours visible would be a trace upstream does not have.
+	 * The sysfs rule can only be registered now, because sus_path is up (this layer is
+	 * last in the init table) - hence the default list is seeded here and not from the
+	 * parameter's initial value. */
+	{
+		char staged[HIDE_MODULES_MAX][MODULE_NAME_LEN] = { { 0 } };
+
+		strscpy(staged[0], SUSFS_LKM_MODULE_NAME, MODULE_NAME_LEN);
+		hide_modules_commit(staged, 1);
+	}
+	hide_modules_sync_sysfs();
+
+	/* The runtime control node, same shape as the other control nodes: only when the
+	 * LSM layer that hides it is installed, so an unprotected world-writable node
+	 * cannot exist (see susfs_control_node_allowed()). */
+	if (susfs_control_node_allowed()) {
+		hide_modules_entry = proc_create("susfs_hide_modules", 0777, NULL,
+						 &hide_modules_proc_ops);
+		if (!hide_modules_entry)
+			pr_warn("susfs_hide_syms: proc_create(susfs_hide_modules) failed - runtime control unavailable, use the hide_modules parameter\n");
+	} else {
+		SUSFS_LOGI("susfs_hide_syms: /proc/susfs_hide_modules not created (expose_proc=%d lsm=%d)\n",
+			(int)susfs_expose_proc, (int)sus_path_lsm_active());
+	}
 
 	return 0;
 }
@@ -317,8 +560,17 @@ bool susfs_hide_syms_active(void)
 	return hide_registered;
 }
 
+bool susfs_hide_modules_node_ready(void)
+{
+	return hide_modules_entry != NULL;
+}
+
 void susfs_hide_syms_exit(void)
 {
+	if (hide_modules_entry) {
+		proc_remove(hide_modules_entry);
+		hide_modules_entry = NULL;
+	}
 	if (m_show_registered) {
 		unregister_kprobe(&kp_m_show);
 		m_show_registered = false;
@@ -327,13 +579,11 @@ void susfs_hide_syms_exit(void)
 		unregister_kprobe(&kp_s_show);
 		hide_registered = false;
 	}
-	/* The sysfs rule is our own; drop it here rather than leaving it to sus_path's
-	 * table teardown, so this layer cleans up exactly what it registered. */
-	if (sysfs_rule_present) {
-		sus_path_del_path(SUSFS_LKM_SYSFS_DIR);
-		sysfs_rule_present = false;
-	}
-	SUSFS_LOGI("susfs_hide_syms: exit enter=%d hit=%d (module lines=%d own syms=%d)\n",
+	/* The /sys/module rules are ours; drop them here rather than leaving it to
+	 * sus_path's table teardown, so this layer cleans up exactly what it registered. */
+	hide_modules_commit(hide_modules_applied, 0);
+	hide_modules_sync_sysfs();
+	SUSFS_LOGI("susfs_hide_syms: exit enter=%d hit=%d (module lines=%d listed modules' syms=%d)\n",
 		atomic_read(&hide_enter_count), atomic_read(&hide_hit_count),
-		atomic_read(&n_modlines_skipped), atomic_read(&n_kallsyms_own_skipped));
+		atomic_read(&n_modlines_skipped), atomic_read(&n_kallsyms_mod_skipped));
 }

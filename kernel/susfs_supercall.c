@@ -95,10 +95,10 @@ static const struct feature_entry enabled_features[] = {
 	{ "CONFIG_KSU_SUSFS_OPEN_REDIRECT\n",	NULL },
 	{ "CONFIG_KSU_SUSFS_SUS_MAP\n",		NULL },
 	/* Not an upstream config: a built-in SUSFS has no module entry to hide, so
-	 * "the LKM hides its own traces" only exists in this port (see hide_module in
-	 * susfs_hide_syms.c).  Named so that nobody reads it as an upstream feature.
+	 * "filter module names out of /proc/modules" only exists in this port (see
+	 * hide_modules in susfs_hide_syms.c).  Named so nobody reads it as upstream.
 	 * Only root can ask for this list in the first place. */
-	{ "SUSFS_GUARD_LKM_HIDE_MODULE\n",	susfs_hide_module_enabled },
+	{ "SUSFS_GUARD_LKM_HIDE_MODULES\n",	susfs_hide_modules_active },
 };
 
 static void susfs_show_enabled_features(void __user **arg)

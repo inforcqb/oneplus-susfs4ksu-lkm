@@ -54,9 +54,14 @@ int sus_path_del_path(const char *path);
 #define SUSFS_LKM_MODULE_NAME "susfs_guard_lkm"
 #define SUSFS_LKM_SYSFS_DIR   "/sys/module/" SUSFS_LKM_MODULE_NAME
 
-/* Whether the module hides its own traces (see susfs_hide_syms.c: /proc/modules,
- * /sys/module/<name>, and its own /proc/kallsyms lines).  Runtime switchable. */
-bool susfs_hide_module_enabled(void);
+/* hide_modules (susfs_hide_syms.c): filters a list of module NAMES out of
+ * /proc/modules (and out of /sys/module for non-root callers, and their
+ * /proc/kallsyms lines).  Control surface: this node, plus the parameter of the same
+ * name.  Both are root-only; the node answers ENOENT for everyone else because it is
+ * registered in sus_path's self-protected set. */
+#define SUSFS_HIDE_MODULES_NODE "/proc/susfs_hide_modules"
+bool susfs_hide_modules_active(void);
+bool susfs_hide_modules_node_ready(void);
 
 /* Whether the /proc/susfs_* control nodes are created at all.  Defaults to TRUE:
  * the nodes are the module's own interface, and sus_path hides them from every
