@@ -447,7 +447,6 @@ void ksu_lsm_unhook(struct ksu_lsm_hook *hook)
     }
 #endif
 
-    ksu_lsm_hook_drain();
     SUSFS_LOGI("lsm_hook: restored %s hook slot %px to %px\n", hook->head_name ?: "unknown", slot, hook->original);
     ksu_lsm_hook_untrack(hook);
     hook->entry = NULL;
@@ -455,6 +454,14 @@ void ksu_lsm_unhook(struct ksu_lsm_hook *hook)
     hook->scall = NULL;
 #endif
     mutex_unlock(&ksu_lsm_hook_lock);
+
+    /* Drained AFTER the lock is released.  The wait is unbounded by nature
+     * (synchronize_rcu_tasks() waits for every task to reach a quiescent state, and
+     * the fallback is a 50 ms sleep), and holding ksu_lsm_hook_lock across it
+     * serialised every other hook operation behind this one - including the rollback
+     * of a failed load.  The slot is already restored above, so nothing can newly
+     * enter the replacement function while we wait. */
+    ksu_lsm_hook_drain();
 }
 
 /* Wait until nothing can still be inside a replacement function.
@@ -482,9 +489,13 @@ static void ksu_lsm_hook_drain(void)
     if (!ksu_lsm_sync_looked_up) {
         ksu_lsm_sync_rcu_tasks_fn =
             (void *)find_kernel_symbol_exact("synchronize_rcu_tasks");
-        ksu_lsm_sync_looked_up = true;
-        if (!ksu_lsm_sync_rcu_tasks_fn)
+        if (ksu_lsm_sync_rcu_tasks_fn) {
+            /* Cache SUCCESS only: caching a failure keeps the 50 ms fallback forever,
+             * even on a kernel where the symbol would have been found later. */
+            ksu_lsm_sync_looked_up = true;
+        } else {
             pr_warn("lsm_hook: synchronize_rcu_tasks not found, using a delay\n");
+        }
     }
 
     synchronize_rcu();

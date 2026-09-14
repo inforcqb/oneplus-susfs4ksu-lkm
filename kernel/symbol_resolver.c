@@ -73,6 +73,8 @@ unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
     char buf[KSYM_SYMBOL_LEN];
 
     addr = kallsyms_lookup_name(symbol_name);
+    if (!addr)
+        return 0;	/* walking kallsyms for address 0 answers nothing */
     kallsyms_lookup(addr, NULL, NULL, &module_name, buf);
     if (unlikely(module_name)) {
         pr_warn("ignore symbol %s of module %s\n", symbol_name, module_name);

@@ -469,6 +469,10 @@ struct sus_mount_ident {
     dev_t s_dev;
     unsigned long root_ino;	/* 0 = free slot */
     bool devname_is_path;
+    /* strscpy() truncates a longer devname; without this flag the record could
+     * never match its own live mount again (strcmp of a truncated copy against the
+     * full string is always unequal), which silently disabled this fallback. */
+    bool devname_truncated;
     char devname[SUS_MOUNT_DEVNAME_MAX];
 };
 
@@ -533,10 +537,12 @@ static void sus_mount_ident_add(struct mount *r)
 
         e->s_dev = r->mnt.mnt_sb->s_dev;
         e->devname_is_path = devname && devname[0] == '/';
-        if (e->devname_is_path)
+        if (e->devname_is_path) {
+            e->devname_truncated = strlen(devname) >= sizeof(e->devname);
             strscpy(e->devname, devname, sizeof(e->devname));
-        else
+        } else {
             e->devname[0] = '\0';
+        }
         if (mount_dbg)
             SUSFS_LOGI("sus_mount: ident[%d] s_dev=%u root_ino=%lu devname=%s\n",
                     slot, (unsigned int)e->s_dev, ino,
@@ -563,7 +569,10 @@ static bool sus_mount_ident_match(struct mount *r)
 
         if (e_ino && e_ino == ino && e->s_dev == r->mnt.mnt_sb->s_dev)
             return true;
-        if (e->devname_is_path && devname && !strcmp(e->devname, devname))
+        if (e->devname_is_path && devname &&
+            (e->devname_truncated
+                 ? !strncmp(e->devname, devname, sizeof(e->devname) - 1)
+                 : !strcmp(e->devname, devname)))
             return true;
     }
     return false;
@@ -814,7 +823,11 @@ static int sus_mount_fdinfo_entry(struct kretprobe_instance *ri, struct pt_regs 
     struct sus_mount_kretprobe_state *st = (struct sus_mount_kretprobe_state *)ri->data;
 
     atomic_inc(&n_fdinfo_entry);
-    st->m = (struct seq_file *)regs->regs[0];
+    /* Not dereferenced here - the return handler checks it - but an implausible
+     * value means this kretprobe sits on a function that does not take a seq_file,
+     * and the rewrite below would then read an unrelated object. */
+    st->m = susfs_ptr_plausible((void *)regs->regs[0])
+               ? (struct seq_file *)regs->regs[0] : NULL;
     return 0;
 }
 
@@ -1098,7 +1111,7 @@ static int sus_mount_show_pre(struct kprobe *kp, struct pt_regs *regs)
     struct vfsmount *mnt = (struct vfsmount *)regs->regs[1];
     struct mount *r;
 
-    if (!mnt)
+    if (!susfs_ptr_plausible(mnt))
         return 0;
     r = real_mount(mnt);
     /* Cheap path first, and NOT only the id: a KSU mount in a namespace the
@@ -1155,7 +1168,11 @@ static bool sus_mount_is_adb_devname(const char *devname)
 {
     if (!devname)
         return false;
-    return strstr(devname, "/data/adb/") != NULL;
+    /* Anchored, not a substring search: an app can create a directory whose name
+     * contains "/data/adb/", and a devname such as "/mnt/media_rw/x/data/adb/y" is
+     * not a KernelSU mount.  Matching those hid unrelated mounts (and handed them a
+     * KSU-range id) - an over-hide, which is the loud direction for a detector. */
+    return strncmp(devname, "/data/adb/", 10) == 0;
 }
 
 static bool sus_mount_is_adb_mountpoint(const char *path)
@@ -1168,7 +1185,7 @@ static bool sus_mount_is_adb_mountpoint(const char *path)
      * block device AND whose mountpoint is not one of those three - a tmpfs or an
      * image mounted at /data/adb/<name> was simply not recognised, and stayed
      * visible in every namespace (measured: /data/adb/mnt_leak, id 24832). */
-    return strstr(path, "/data/adb/") != NULL;
+    return strncmp(path, "/data/adb/", 10) == 0;
 }
 
 /* Retro-fit upstream's "KSU mounts carry an id >= DEFAULT_KSU_MNT_ID" onto the

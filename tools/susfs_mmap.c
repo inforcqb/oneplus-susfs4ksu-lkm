@@ -271,8 +271,9 @@ static u64 emit_maps_line(char *out, u64 pos, u64 addr)
 			while (k < j && fbuf[k] != ' ')
 				end = (end << 4) | hexval(fbuf[k++]);
 			if (addr >= start && addr < end) {
-				for (k = i; k < j; k++)
+				for (k = i; k < j && pos + 1 < sizeof(out); k++)
 					out[pos++] = fbuf[k];
+				out[pos] = 0;
 				found = 1;
 				break;
 			}

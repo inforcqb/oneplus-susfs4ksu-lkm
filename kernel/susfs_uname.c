@@ -140,7 +140,8 @@ void susfs_uname_supercall(void __user **arg)
         goto out;
     }
     if (*info.release == '\0' || *info.version == '\0') {
-        info.err = -EFAULT;
+        /* -EINVAL: the buffer came across fine, the VALUE is what is wrong. */
+        info.err = -EINVAL;
         goto out;
     }
     /* char[65] ABI fields the caller need not terminate; strcmp() below and

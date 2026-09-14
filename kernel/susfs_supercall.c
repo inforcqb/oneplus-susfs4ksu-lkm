@@ -188,7 +188,12 @@ static void susfs_tw_func(struct callback_head *cb)
 		/* Unreachable: reboot_pre() only defers a command that
 		 * susfs_cmd_handled() accepted.  Kept as a net in case the two
 		 * lists ever drift apart. */
-		SUSFS_LOGI("susfs supercall: unsupported cmd 0x%x\n", tw->cmd);
+		/* Cannot write `err` here: this branch has no payload type, so there is no
+		 * field to write it into.  pr_warn, not SUSFS_LOGI, because unlike every other
+		 * line around it this one means the two command lists have drifted apart - and
+		 * the deferred work has already swallowed the syscall. */
+		pr_warn("susfs_guard_lkm: supercall: unsupported cmd 0x%x reached the worker (susfs_cmd_handled() and the switch disagree)\n",
+			tw->cmd);
 		break;
 	}
 	kfree(tw);

@@ -22,31 +22,31 @@
  * as a hidden path. */
 #define SUSFS_LKM_MODULE_NAME "susfs_guard_lkm"
 
-/* The /proc/susfs_* control nodes are OFF by default.
+/* The /proc/susfs_* control nodes are created by default and are 0777 on purpose.
  *
- * Measured on device: with the nodes present and 0600, an app got
+ * An earlier revision created them 0600 and had them hidden by sus_path.  Measured
+ * on device, that does not work:
  *   ls -l /proc/susfs_kstat -> No such file or directory   (sus_path inode_getattr fired)
  *   cat  /proc/susfs_kstat -> Permission denied            (it did NOT)
- * and the sus_path perm counter stayed at 0.  Reason: inode_permission() runs
- * the DAC check BEFORE security_inode_permission(), so a 0600 root-owned node
- * fails DAC first and the LSM hook is never reached - the caller sees EACCES,
- * which advertises that the node exists.
+ * and the sus_path perm counter stayed at 0.  Reason: inode_permission() runs the
+ * DAC check BEFORE security_inode_permission(), so a 0600 root-owned node fails DAC
+ * first and the LSM hook is never reached - the caller gets EACCES, which advertises
+ * that the node exists.
  *
- * That is a general property of sus_path's path layer, not specific to these
- * nodes: it can only turn an ENOENT-shaped answer out of files DAC would have
- * ALLOWED (which is why a 0644 file like /data/local/tmp/susfs.ko works, and a
- * 0600 one does not).
+ * That is a general property of sus_path's path layer, not specific to these nodes:
+ * it can only turn an ENOENT-shaped answer out of files DAC would have ALLOWED
+ * (which is why a 0644 file like /data/local/tmp/susfs.ko works and a 0600 one does
+ * not).  Hence 0777: DAC passes, and the LSM layer is the only thing that answers -
+ * ENOENT for every non-root caller.
  *
- * Therefore the nodes are not created at all by default - absent is the only
- * answer that cannot be distinguished from "no such file".  Set expose_proc=1
- * to create them for hand configuration; they are then also registered in
- * sus_path (see susfs_self_hide_nodes), which still hides stat/open for callers
- * DAC would allow. */
-/* Default ON: the nodes are this module's interface, and they are protected by
- * sus_path (every non-root caller sees ENOENT).  They are only created when the
- * LSM layer that does the hiding is installed, so an unprotected node cannot
- * happen; expose_proc=0 removes them entirely for operators who want nothing
- * under /proc at all. */
+ * Two consequences, both deliberate:
+ *   - the nodes exist only when the LSM layer that hides them is installed
+ *     (susfs_control_node_allowed()), so an unprotected world-writable node cannot
+ *     happen;
+ *   - "readable/writable by root only" is enforced by the handlers' uid checks, not
+ *     by the mode.
+ * expose_proc=0 removes the nodes entirely for operators who want nothing under
+ * /proc at all. */
 bool susfs_expose_proc = true;
 module_param_named(expose_proc, susfs_expose_proc, bool, 0600);
 

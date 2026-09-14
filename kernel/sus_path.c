@@ -681,6 +681,14 @@ static void sus_path_pending_work(struct work_struct *w)
  * directory's inode, so they are not blocked here.)
  * ------------------------------------------------------------------------- */
 
+/* Every replacement in this file answers -EACCES when its hook has no original to
+ * call.
+ *
+ * ksu_lsm_hook() only patches a slot after resolving the original, so a NULL `orig`
+ * cannot happen today (and sus_path_init() refuses the load when the two core slots
+ * fail).  Returning 0 there would be FAIL OPEN in the worst place: the slot being
+ * replaced is SELinux own implementation, so "allow everything" would silently
+ * disable SELinux for that operation while every rule still looks installed. */
 static int sus_path_inode_getattr(const struct path *path);
 static int sus_path_inode_permission(struct inode *inode, int mask);
 
@@ -938,7 +946,7 @@ static int sus_path_inode_getattr(const struct path *path)
         }
     }
     if (!orig)
-        return 0;
+        return -EACCES;
     return orig(path);
 }
 
@@ -951,7 +959,7 @@ static int sus_path_inode_permission(struct inode *inode, int mask)
         return -ENOENT;
     }
     if (!orig)
-        return 0;
+        return -EACCES;
     return orig(inode, mask);
 }
 
@@ -983,7 +991,7 @@ static int sus_path_inode_unlink(struct inode *dir, struct dentry *dentry)
     if (sus_path_dentry_hidden(dentry))
         return sus_path_nameop_hit();
     if (!orig)
-        return 0;
+        return -EACCES;
     return orig(dir, dentry);
 }
 
@@ -994,7 +1002,7 @@ static int sus_path_inode_rmdir(struct inode *dir, struct dentry *dentry)
     if (sus_path_dentry_hidden(dentry))
         return sus_path_nameop_hit();
     if (!orig)
-        return 0;
+        return -EACCES;
     return orig(dir, dentry);
 }
 
@@ -1009,7 +1017,7 @@ static int sus_path_inode_rename(struct inode *old_dir, struct dentry *old_dentr
     if (sus_path_dentry_hidden(old_dentry) || sus_path_dentry_hidden(new_dentry))
         return sus_path_nameop_hit();
     if (!orig)
-        return 0;
+        return -EACCES;
     return orig(old_dir, old_dentry, new_dir, new_dentry);
 }
 
@@ -1024,7 +1032,7 @@ static int sus_path_inode_link(struct dentry *old_dentry, struct inode *dir,
     if (sus_path_dentry_hidden(old_dentry))
         return sus_path_nameop_hit();
     if (!orig)
-        return 0;
+        return -EACCES;
     return orig(old_dentry, dir, new_dentry);
 }
 
@@ -1046,7 +1054,7 @@ static int sus_path_sb_statfs(struct dentry *dentry)
     if (sus_path_dentry_hidden(dentry))
         return sus_path_meta_hit();
     if (!orig)
-        return 0;
+        return -EACCES;
     return orig(dentry);
 }
 
@@ -1057,7 +1065,7 @@ static int sus_path_inode_setattr(struct dentry *dentry, struct iattr *attr)
     if (sus_path_dentry_hidden(dentry))
         return sus_path_meta_hit();
     if (!orig)
-        return 0;
+        return -EACCES;
     return orig(dentry, attr);
 }
 
@@ -1068,7 +1076,7 @@ static int sus_path_inode_getxattr(struct dentry *dentry, const char *name)
     if (sus_path_dentry_hidden(dentry))
         return sus_path_meta_hit();
     if (!orig)
-        return 0;
+        return -EACCES;
     return orig(dentry, name);
 }
 
@@ -1079,7 +1087,7 @@ static int sus_path_inode_listxattr(struct dentry *dentry)
     if (sus_path_dentry_hidden(dentry))
         return sus_path_meta_hit();
     if (!orig)
-        return 0;
+        return -EACCES;
     return orig(dentry);
 }
 
@@ -1093,7 +1101,7 @@ static int sus_path_inode_setxattr(struct user_namespace *mnt_userns,
     if (sus_path_dentry_hidden(dentry))
         return sus_path_meta_hit();
     if (!orig)
-        return 0;
+        return -EACCES;
     return orig(mnt_userns, dentry, name, value, size, flags);
 }
 
@@ -1106,7 +1114,7 @@ static int sus_path_inode_removexattr(struct user_namespace *mnt_userns,
     if (sus_path_dentry_hidden(dentry))
         return sus_path_meta_hit();
     if (!orig)
-        return 0;
+        return -EACCES;
     return orig(mnt_userns, dentry, name);
 }
 
@@ -1120,7 +1128,7 @@ static int sus_path_path_notify(const struct path *path, u64 mask, unsigned int 
     if (path && sus_path_dentry_hidden(path->dentry))
         return sus_path_meta_hit();
     if (!orig)
-        return 0;
+        return -EACCES;
     return orig(path, mask, obj_type);
 }
 
@@ -1532,18 +1540,124 @@ static long sus_path_filter(unsigned long buf, long count,
 }
 
 
-/* read-only view of the registered paths, for verification */
+/* Appending to a sysfs .get buffer is bounded HERE, not at each call site.
+ *
+ * The kernel hands such a callback ONE page and no length at all (fs/sysfs/file.c:
+ * sysfs_kf_seq_show() -> seq_get_buf() + memset(buf, 0, PAGE_SIZE) + ops->show(kobj,
+ * priv, buf)), so "n += scnprintf(buf + n, PAGE_SIZE - n, ...)" is a heap overflow
+ * waiting for the first listing that fills the page: once n passes PAGE_SIZE the
+ * expression PAGE_SIZE - n is a size_t underflow (about 2^64), scnprintf believes it
+ * has unlimited room, and the following lines go past the end of the page - after
+ * which read(2) hands the caller whatever followed it in the heap.  About 50 rules
+ * with ordinary paths are enough. */
+#define SUS_PATH_LIST_SLACK 400		/* longest line below (two names, 2x20 digits) */
+static int sus_path_list_puts(char *buf, int n, bool *trunc, const char *fmt, ...)
+{
+    va_list args;
+    int room, written;
+
+    if (n < 0 || n >= (int)PAGE_SIZE - 1) {
+        *trunc = true;
+        return n;
+    }
+    room = (int)PAGE_SIZE - n;
+    va_start(args, fmt);
+    written = vsnprintf(buf + n, room, fmt, args);
+    va_end(args);
+    if (written >= room) {
+        /* vsnprintf reports what it WOULD have written; room-1 bytes plus the
+         * terminator are all that fits. */
+        *trunc = true;
+        return (int)PAGE_SIZE - 1;
+    }
+    return n + written;
+}
+
+/* View of the registered paths, for verification.  Writable so that a rule can be
+ * taken back: before this, sus_path rules could only be removed by unloading the
+ * module, so one mistyped `add_sus_path /data` hid that path machine-wide - and,
+ * because hiding works by relaxing the target's mode (sus_path_relax_mode()), it
+ * left the mode relaxed for just as long.
+ *
+ *   echo clear        > .../hide_list      all rules
+ *   echo "del /path"  > .../hide_list      one rule (exact path, trailing / ignored)
+ *
+ * Deliberately NOT a new CMD_SUSFS_* command: this node is ours, while the supercall
+ * command space has to stay compatible with what KernelSU and ksud already use. */
+static int sus_path_store_list(const char *val, const struct kernel_param *kp)
+{
+    struct sus_path_entry *e, *tmp;
+    LIST_HEAD(doomed);
+    char cmd[SUS_PATH_LEN + 16];
+    const char *want = NULL;
+    int i, removed = 0;
+
+    strscpy(cmd, val, sizeof(cmd));
+    /* A shell `echo` leaves a newline behind; trim it (and trailing spaces). */
+    for (i = (int)strlen(cmd) - 1; i >= 0 && (cmd[i] == '\n' || cmd[i] == '\r' || cmd[i] == ' '); i--)
+        cmd[i] = '\0';
+
+    if (!strcmp(cmd, "clear")) {
+        spin_lock(&sus_path_lock);
+        list_splice_init(&sus_path_list, &doomed);
+        sus_path_count = 0;
+        spin_unlock(&sus_path_lock);
+        atomic_set(&sus_path_n_pending, 0);
+    } else if (!strncmp(cmd, "del ", 4)) {
+        char *w = cmd + 4;
+
+        while (*w == ' ')
+            w++;
+        /* Same normalisation sus_path_entry_set_path() applies when storing. */
+        for (i = (int)strlen(w); i > 1 && w[i - 1] == '/'; i--)
+            w[i - 1] = '\0';
+        want = w;
+        if (!*want)
+            return -EINVAL;
+
+        spin_lock(&sus_path_lock);
+        list_for_each_entry_safe(e, tmp, &sus_path_list, list) {
+            if (strcmp(e->path, want))
+                continue;
+            list_del(&e->list);
+            list_add(&e->list, &doomed);
+            sus_path_count--;
+            removed++;
+        }
+        spin_unlock(&sus_path_lock);
+    } else {
+        return -EINVAL;
+    }
+
+    /* Outside the lock: restore_mode() writes inode->i_mode and iput() can sleep and
+     * evict.  No hook can be looking at these entries any more - the matchers only
+     * hold the spinlock while they walk the list, and these are off it now. */
+    list_for_each_entry_safe(e, tmp, &doomed, list) {
+        list_del(&e->list);
+        if (!e->inode)
+            atomic_dec(&sus_path_n_pending);
+        sus_path_restore_mode(e);
+        if (e->inode)
+            iput(e->inode);
+        kfree(e);
+    }
+    SUSFS_LOGI("sus_path: hide_list written, %d rule(s) removed, %d left\n",
+            removed, sus_path_count);
+    return 0;
+}
+
 static int sus_path_show_list(char *buf, const struct kernel_param *kp)
 {
     struct sus_path_entry *e;
+    bool trunc = false;
     int n = 0;
 
-    n += scnprintf(buf + n, PAGE_SIZE - n,
+    n = sus_path_list_puts(buf, n, &trunc,
                    "hide_from_apps=%d  enoent: getattr=%d perm=%d nameop=%d meta=%d\n",
                    hide_from_apps, atomic_read(&n_enoent_getattr),
                    atomic_read(&n_enoent_perm), atomic_read(&n_enoent_nameop),
                    atomic_read(&n_enoent_meta));
-    n += scnprintf(buf + n, PAGE_SIZE - n,
+    n = sus_path_list_puts(buf, n, &trunc,
                    "dirent: rewrite-fail=%d  all-hidden=%d  pending=%d  calls(l64=%d compat=%d)\n",
                    atomic_read(&n_dirent_rewrite_fail),
                    atomic_read(&n_dirent_all_hidden),
@@ -1551,14 +1665,14 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
                    atomic_read(&n_dirent_calls[SUS_DIRENT_L64]),
                    atomic_read(&n_dirent_calls[SUS_DIRENT_COMPAT]));
     if (n_lsm_ext_fail)
-        n += scnprintf(buf + n, PAGE_SIZE - n,
+        n = sus_path_list_puts(buf, n, &trunc,
                        "lsm: %d secondary hook(s) FAILED (first: %s) - that operation is not covered\n",
                        n_lsm_ext_fail, first_lsm_ext_fail);
     /* Everything the pending machinery did, so that "still pending" can be read
      * for what it is: passes/ticks == 0 means the retry never ran at all, walks
      * > 0 with pending > 0 means the walk kept failing (last-rc says how), and
      * lost > 0 would mean a walk succeeded with no rule left to publish it. */
-    n += scnprintf(buf + n, PAGE_SIZE - n,
+    n = sus_path_list_puts(buf, n, &trunc,
                    "pend: passes=%d ticks=%d walks=%d lost=%d last-rc=%d caller-cred=%d\n",
                    atomic_read(&sus_path_pend_passes),
                    atomic_read(&sus_path_pend_ticks),
@@ -1568,25 +1682,35 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
                    (int)(sus_path_pending_cred != NULL));
 
     spin_lock(&sus_path_lock);
-    list_for_each_entry(e, &sus_path_list, list)
-        n += scnprintf(buf + n, PAGE_SIZE - n,
+    list_for_each_entry(e, &sus_path_list, list) {
+        if (n > (int)PAGE_SIZE - SUS_PATH_LIST_SLACK) {
+            trunc = true;
+            break;
+        }
+        n = sus_path_list_puts(buf, n, &trunc,
                        "dev=%llu ino=%llu name=%s%s\n",
                        e->dev, e->ino, e->name,
                        e->inode ? "" : " (pending: no inode yet)");
+    }
     spin_unlock(&sus_path_lock);
 
     if (!sus_path_count)
-        n += scnprintf(buf + n, PAGE_SIZE - n, "(no paths registered)\n");
+        n = sus_path_list_puts(buf, n, &trunc, "(no paths registered)\n");
+    if (trunc)
+        n = sus_path_list_puts(buf, n, &trunc,
+                       "(truncated: the table holds more rules than one page; the rules are intact)\n");
     return n;
 }
 
 static const struct kernel_param_ops sus_path_list_ops = {
     .get = sus_path_show_list,
+    .set = sus_path_store_list,
 };
-/* 0400, not 0444: this listing names every hidden path.  It must not be
- * readable by an app - that would hand the detector the exact answer it is
- * looking for.  (A raw inode pointer used to be printed here too; removed.) */
-module_param_cb(hide_list, &sus_path_list_ops, NULL, 0400);
+/* 0600, not 0444: this listing names every hidden path, so an app must not be able
+ * to read it - that would hand the detector the exact answer it looks for.  The
+ * write bit is what makes a mistaken rule removable (see sus_path_store_list).
+ * (A raw inode pointer used to be printed here too; removed.) */
+module_param_cb(hide_list, &sus_path_list_ops, NULL, 0600);
 
 /* Add a path to the hidden set from kernel code, bypassing the supercall.
  * Used by susfs_init() to self-hide the /proc control nodes.
@@ -1611,7 +1735,17 @@ static int sus_path_add_hidden_ex(const char *path, bool self_protect)
 		return -ENOENT;
 	}
 
-	e = kmalloc(sizeof(*e), GFP_KERNEL);
+	/* kzalloc, NOT kmalloc: the entry has two fields these add paths never set -
+	 * `self_protect` (a gate: a garbage non-zero value turns an ordinary app-only rule
+	 * into "hidden from every non-root caller") and `orig_mode` (written back into
+	 * inode->i_mode by sus_path_restore_mode() at unload).  With kmalloc both held
+	 * whatever the slab last contained, and the common case made it certain:
+	 * sus_path_relax_mode() returns early - recording nothing - when the target is
+	 * already 0777, so unloading wrote uninitialized heap bytes into a real inode mode.
+	 * Zero is the right initial value for both: false is the ordinary gate, and
+	 * orig_mode == 0 means "this rule did not touch the mode", which is exactly what
+	 * restore_mode() tests for. */
+	e = kzalloc(sizeof(*e), GFP_KERNEL);
 	if (!e) {
 		path_put(&p);
 		return -ENOMEM;
@@ -1931,7 +2065,17 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
         goto out;
     }
 
-    e = kmalloc(sizeof(*e), GFP_KERNEL);
+    /* kzalloc, NOT kmalloc: the entry has two fields these add paths never set -
+     * `self_protect` (a gate: a garbage non-zero value turns an ordinary app-only rule
+     * into "hidden from every non-root caller") and `orig_mode` (written back into
+     * inode->i_mode by sus_path_restore_mode() at unload).  With kmalloc both held
+     * whatever the slab last contained, and the common case made it certain:
+     * sus_path_relax_mode() returns early - recording nothing - when the target is
+     * already 0777, so unloading wrote uninitialized heap bytes into a real inode mode.
+     * Zero is the right initial value for both: false is the ordinary gate, and
+     * orig_mode == 0 means "this rule did not touch the mode", which is exactly what
+     * restore_mode() tests for. */
+    e = kzalloc(sizeof(*e), GFP_KERNEL);
     if (!e) {
         if (inode)
             path_put(&path);

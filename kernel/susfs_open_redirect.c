@@ -563,7 +563,8 @@ static int or_maps_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	char old[48], new[48];
 	int old_len, new_len;
 
-	if (!m || !m->buf || !m->count || !vma || !vma->vm_file)
+	if (!susfs_ptr_plausible(m) || !susfs_ptr_plausible(vma) ||
+	    !m->buf || !m->count || !vma->vm_file)
 		return 0;
 	if (!or_reverse_visible())
 		return 0;
@@ -1189,6 +1190,11 @@ static ssize_t or_proc_write(struct file *file, const char __user *buf,
 	int argc, err;
 	long scheme;
 
+	/* Same gate as or_proc_open() - see the note there: an fd opened before the
+	 * opener dropped privileges must not become a way in. */
+	if (current_uid().val != 0)
+		return -ENOENT;
+
 	if (len >= sizeof(cmd))
 		len = sizeof(cmd) - 1;
 	if (copy_from_user(cmd, buf, len))
@@ -1223,8 +1229,10 @@ static ssize_t or_proc_write(struct file *file, const char __user *buf,
 
 	mutex_unlock(&or_lock);
 
-	if (err)
+	if (err) {
 		pr_warn("open_redirect proc write '%s' -> err %d\n", argv[0], err);
+		return err;	/* surface the failure; success keeps returning len */
+	}
 	return len;
 }
 

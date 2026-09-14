@@ -407,7 +407,8 @@ static int kstat_map_vma_ret(struct kretprobe_instance *ri, struct pt_regs *regs
 
 	if (susfs_kstat_table_empty())
 		return 0;
-	if (!m || !m->buf || !m->count || !vma || !vma->vm_file)
+	if (!susfs_ptr_plausible(m) || !susfs_ptr_plausible(vma) ||
+	    !m->buf || !m->count || !vma->vm_file)
 		return 0;
 	inode = file_inode(vma->vm_file);
 	if (!inode)
@@ -1303,6 +1304,12 @@ static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
 	char *argv[16];
 	int argc, err;
 
+	/* Same gate as kstat_proc_open(): the node must not exist for anyone else.
+	 * open() alone is not enough - an fd opened by root and handed on would keep
+	 * working, which is why the sibling files check both. */
+	if (current_uid().val != 0)
+		return -ENOENT;
+
 	if (len >= sizeof(cmd))
 		len = sizeof(cmd) - 1;
 	if (copy_from_user(cmd, buf, len))
@@ -1337,7 +1344,12 @@ static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
 	if (!err)
 		kstat_maps_arm();
 
-	if (err)
+	if (err) {
 		pr_warn("kstat proc write '%s' -> err %d\n", argv[0], err);
+		/* Reported to the writer: a command that did not take effect must not look
+		 * like a successful full write.  Success still returns len, so callers that
+		 * expect a complete write keep working. */
+		return err;
+	}
 	return len;
 }

@@ -3,6 +3,23 @@
 #define __SUSFS_H
 
 #include <linux/string.h>
+#include <linux/err.h>	/* IS_ERR */
+#include <linux/mm.h>	/* PAGE_SIZE */
+
+/* A kernel pointer taken out of a kprobe register, checked before it is
+ * dereferenced.
+ *
+ * single_open()s fake inode is (void *)1, and a kretprobe on a function the kernel
+ * calls with such a sentinel hands that value over as "the argument": this module
+ * once panicked on exactly that (the sus_map vma probe, fault address 0xa1, fixed
+ * with a "< PAGE_SIZE" test that only that one probe had).  Every kernel object
+ * lives above the first page, so that one test covers the sentinel as well as a
+ * garbage register, and IS_ERR() covers the error-pointer convention.  User
+ * pointers must NOT go through it - they are legitimately small. */
+static inline bool susfs_ptr_plausible(const void *p)
+{
+	return (unsigned long)p >= PAGE_SIZE && !IS_ERR(p);
+}
 
 /* Bind a fixed-size ABI pathname field to a C string safely.
  *

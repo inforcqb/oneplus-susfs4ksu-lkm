@@ -241,6 +241,13 @@ static u32 scan_dir(long fd, int compat, const char *needle, u32 *entries)
 		while (off < n) {
 			u32 reclen, nameoff;
 
+			/* Bound BEFORE reading the field: reclen is what the bound check
+			 * below uses, so reading it first can run past the buffer (and a
+			 * garbage length would then classify a hidden entry as visible - a
+			 * false negative in the tool that is supposed to be the evidence). */
+			if (off + (compat ? 10 : 18) > n)
+				break;
+
 			if (compat) {
 				reclen = (unsigned char)dirbuf[off + 8] |
 					 ((u32)(unsigned char)dirbuf[off + 9] << 8);
