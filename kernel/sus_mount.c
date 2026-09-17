@@ -464,6 +464,7 @@ static int sus_mount_shown_id(struct mount *mnt)
 #define SUS_MOUNT_IDENT_MAX 32
 /* Defined with the scan helpers further down; the identity test needs it here. */
 static bool sus_mount_is_adb_devname(const char *devname);
+static bool sus_mount_is_adb_mountpoint(const char *path);
 
 struct sus_mount_ident {
     dev_t s_dev;
@@ -781,6 +782,115 @@ static struct kretprobe kr_clone_ns = {
 };
 static bool kr_clone_ns_ok;
 
+/* ---- mounts that appear AFTER the enable ----
+ *
+ * The marking scan runs once, on the current namespace, and only sees what exists at
+ * that moment: a filesystem mounted later - the ordinary case for a module image
+ * installed while the phone is up - carried no marked id and no recorded identity, so
+ * nothing hid it, in ANY namespace (measured before this hook existed: the line was
+ * visible to a non-su reader in both the init namespace and a freshly cloned one).
+ *
+ * Registration at mount time fixes that, and the place to do it is the one function
+ * every mount path goes through: fs/namespace.c calls attach_recursive_mnt() from
+ * exactly two places - graft_tree() (which serves mount(2)/fsmount and bind mounts
+ * via do_loopback) and do_move_mount() (a move) - so one kretprobe covers all of them.
+ *
+ * What is recorded, and why not an id:
+ *   - the IDENTITY (superblock device + root inode), which is what the hide hooks
+ *     compare, needs no allocation and is namespace independent, so the mount is
+ *     hidden in every namespace including ones cloned later;
+ *   - allocating a KSU-range id instead would need ida_alloc_range(GFP_KERNEL), and a
+ *     kprobe handler runs with preemption disabled - it must not sleep.  A GFP_NOWAIT
+ *     allocation plus a pooled batch would work, but it buys nothing here: identity is
+ *     what the hide path checks anyway.
+ *   - the shown id (the entry the app is allowed to see in fdinfo/statx) is learned at
+ *     the RETURN, because that is when mnt_parent/mnt_mountpoint exist - the same
+ *     reason the namespace-copy hook above learns there.
+ *
+ * The acceptance rule is the scan's (a /data/adb devname, or a mountpoint under
+ * /data/adb), so this cannot widen what gets hidden - and a bind of an already
+ * recorded filesystem needs no record here at all: identity matches it already. */
+#define SUS_MOUNT_NEWMNT_PATH_MAX 256
+
+static atomic_t n_newmnt_seen = ATOMIC_INIT(0);
+static atomic_t n_newmnt_recorded = ATOMIC_INIT(0);
+static atomic_t n_newmnt_pathfail = ATOMIC_INIT(0);
+
+struct sus_mount_newmnt_state {
+    struct mount *m;
+};
+
+static int sus_mount_newmnt_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct sus_mount_newmnt_state *st = (struct sus_mount_newmnt_state *)ri->data;
+
+    st->m = (struct mount *)regs->regs[0];	/* source_mnt */
+    return 0;
+}
+
+/* The scan's rule, verbatim: a devname anchored at /data/adb, or a mountpoint under
+ * /data/adb.  @buf is the caller's, small on purpose - this runs from a kretprobe
+ * handler, where a PATH_MAX stack buffer would be a stack overflow waiting to happen,
+ * and the mountpoints this rule accepts are short (/data/adb/modules/<name>/mnt). */
+static bool sus_mount_should_record(struct mount *r, char *buf, int buflen, char **why)
+{
+    struct path p;
+    char *dp;
+
+    if (sus_mount_is_adb_devname(r->mnt_devname)) {
+        *why = "devname";
+        return true;
+    }
+    if (!pfn_d_path)
+        return false;
+    p.mnt = &r->mnt;
+    p.dentry = r->mnt.mnt_root;
+    dp = sus_mount_d_path(&p, buf, buflen);
+    if (IS_ERR_OR_NULL(dp)) {
+        atomic_inc(&n_newmnt_pathfail);
+        return false;
+    }
+    if (sus_mount_is_adb_mountpoint(dp)) {
+        *why = dp;
+        return true;
+    }
+    return false;
+}
+
+static int sus_mount_newmnt_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct sus_mount_newmnt_state *st = (struct sus_mount_newmnt_state *)ri->data;
+    struct mount *r = st->m;
+    char buf[SUS_MOUNT_NEWMNT_PATH_MAX];
+    char *why = NULL;
+
+    if (!susfs_ptr_plausible(r) || (long)regs_return_value(regs) != 0)
+        return 0;			/* the attach failed: nothing was mounted */
+    atomic_inc(&n_newmnt_seen);
+    /* A successful attach leaves the mount with a parent; without one there is no
+     * mountpoint path to test and no parent chain for the shown id. */
+    if (!r->mnt_parent || r->mnt_parent == r)
+        return 0;
+    if (!sus_mount_should_record(r, buf, sizeof(buf), &why))
+        return 0;
+
+    sus_mount_ident_add(r);
+    sus_mount_note_id(r);
+    atomic_inc(&n_newmnt_recorded);
+    SUSFS_LOGI("sus_mount: learned mount at %s (mnt_id %d, devname %s)\n",
+            why, r->mnt_id, r->mnt_devname ? r->mnt_devname : "none");
+    return 0;
+}
+
+static struct kretprobe kr_newmnt = {
+    .kp.symbol_name = "attach_recursive_mnt",
+    .entry_handler = sus_mount_newmnt_entry,
+    .handler = sus_mount_newmnt_ret,
+    .data_size = sizeof(struct sus_mount_newmnt_state),
+    .maxactive = 16,
+};
+static bool kr_newmnt_ok;
+
 /* ---- /proc/<pid>/fdinfo/N ----
  *
  * fs/proc/fd.c:seq_show() formats pos/flags/mnt_id/ino into the seq_file buffer
@@ -1078,6 +1188,7 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      "idmap: recycled_dropped=%d dropped_dev=%d\n"
                      "sb: down=%d (probe=%d)\n"
                      "clone: walks=%d learned=%d (probe=%d)\n"
+                     "newmount: seen=%d recorded=%d pathfail=%d (probe=%d)\n"
                      "fdinfo: entry=%d hits=%d rewrites=%d nolabel=%d\n"
                      "statx: entry=%d ret=%d hits=%d rewrites=%d nobuf=%d err=%d copyfail=%d nomap=%d "
                      "(sys=%d do=%d)\n",
@@ -1092,6 +1203,8 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      atomic_read(&n_sb_down), (int)kp_sb_down_ok,
                      atomic_read(&n_clone_walks), atomic_read(&n_clone_learned),
                      (int)kr_clone_ns_ok,
+                     atomic_read(&n_newmnt_seen), atomic_read(&n_newmnt_recorded),
+                     atomic_read(&n_newmnt_pathfail), (int)kr_newmnt_ok,
                      atomic_read(&n_fdinfo_entry), atomic_read(&n_fdinfo_hits),
                      atomic_read(&n_fdinfo_rewrites),
                      atomic_read(&n_fdinfo_nolabel),
@@ -1508,6 +1621,10 @@ static void sus_mount_unregister(void)
         unregister_kretprobe(&kr_clone_ns);
         kr_clone_ns_ok = false;
     }
+    if (kr_newmnt_ok) {
+        unregister_kretprobe(&kr_newmnt);
+        kr_newmnt_ok = false;
+    }
     mount_registered = false;
 }
 
@@ -1598,6 +1715,16 @@ static int sus_mount_register(void)
                 rc);
     else
         kr_clone_ns_ok = true;
+    /* And the mount-time registration, which is what covers a filesystem mounted while
+     * the module is already up (see the note above kr_newmnt).  Also optional in the
+     * sense that hiding keeps working for everything the scan saw - but without it a
+     * mount that appears later is not hidden anywhere, so a failure is reported. */
+    rc = register_kretprobe(&kr_newmnt);
+    if (rc)
+        pr_warn("sus_mount: register_kretprobe(attach_recursive_mnt) failed %d - a mount created after the enable is NOT hidden (not marked, no identity recorded)\n",
+                rc);
+    else
+        kr_newmnt_ok = true;
     mount_registered = true;
     return 0;
 }
