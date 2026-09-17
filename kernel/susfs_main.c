@@ -60,6 +60,7 @@ static const char *const susfs_self_hide_paths[] = {
      * EACCES first) and root-only through its own uid checks, which makes this rule
      * the thing that gives everyone else ENOENT. */
     SUSFS_HIDE_MODULES_NODE,
+    SUSFS_HIDE_MOUNTS_NODE,
     /* The module's own sysfs directory is NOT here any more: it belongs to the
      * hide_module feature (susfs_hide_syms.c), which adds and drops that rule at
      * runtime.  It used to sit in this list, which tied it to expose_proc by

@@ -463,8 +463,7 @@ static int sus_mount_shown_id(struct mount *mnt)
 #define SUS_MOUNT_DEVNAME_MAX 64
 #define SUS_MOUNT_IDENT_MAX 32
 /* Defined with the scan helpers further down; the identity test needs it here. */
-static bool sus_mount_is_adb_devname(const char *devname);
-static bool sus_mount_is_adb_mountpoint(const char *path);
+static bool sus_mount_path_is_ours(const char *s);
 
 struct sus_mount_ident {
     dev_t s_dev;
@@ -641,7 +640,7 @@ static bool sus_mount_is_ours(struct mount *r)
 {
     if ((unsigned int)r->mnt_id >= SUS_MOUNT_KSU_ID_MIN)
         return true;
-    if (sus_mount_is_adb_devname(r->mnt_devname))
+    if (sus_mount_path_is_ours(r->mnt_devname))
         return true;
     return sus_mount_ident_match(r);
 }
@@ -837,7 +836,7 @@ static bool sus_mount_should_record(struct mount *r, char *buf, int buflen, char
     struct path p;
     char *dp;
 
-    if (sus_mount_is_adb_devname(r->mnt_devname)) {
+    if (sus_mount_path_is_ours(r->mnt_devname)) {
         *why = "devname";
         return true;
     }
@@ -850,7 +849,7 @@ static bool sus_mount_should_record(struct mount *r, char *buf, int buflen, char
         atomic_inc(&n_newmnt_pathfail);
         return false;
     }
-    if (sus_mount_is_adb_mountpoint(dp)) {
+    if (sus_mount_path_is_ours(dp)) {
         *why = dp;
         return true;
     }
@@ -1189,6 +1188,7 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      "sb: down=%d (probe=%d)\n"
                      "clone: walks=%d learned=%d (probe=%d)\n"
                      "newmount: seen=%d recorded=%d pathfail=%d (probe=%d)\n"
+                     "keep: prefixes=%d rescans=%d\n"
                      "fdinfo: entry=%d hits=%d rewrites=%d nolabel=%d\n"
                      "statx: entry=%d ret=%d hits=%d rewrites=%d nobuf=%d err=%d copyfail=%d nomap=%d "
                      "(sys=%d do=%d)\n",
@@ -1205,6 +1205,7 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      (int)kr_clone_ns_ok,
                      atomic_read(&n_newmnt_seen), atomic_read(&n_newmnt_recorded),
                      atomic_read(&n_newmnt_pathfail), (int)kr_newmnt_ok,
+                     n_mount_keep, atomic_read(&n_keep_rescans),
                      atomic_read(&n_fdinfo_entry), atomic_read(&n_fdinfo_hits),
                      atomic_read(&n_fdinfo_rewrites),
                      atomic_read(&n_fdinfo_nolabel),
@@ -1277,28 +1278,60 @@ static struct kprobe kp_vfsmnt = {
     .pre_handler = sus_mount_show_pre,
 };
 
-static bool sus_mount_is_adb_devname(const char *devname)
-{
-    if (!devname)
-        return false;
-    /* Anchored, not a substring search: an app can create a directory whose name
-     * contains "/data/adb/", and a devname such as "/mnt/media_rw/x/data/adb/y" is
-     * not a KernelSU mount.  Matching those hid unrelated mounts (and handed them a
-     * KSU-range id) - an over-hide, which is the loud direction for a detector. */
-    return strncmp(devname, "/data/adb/", 10) == 0;
-}
+/* ---- which mounts count as "ours" ----
+ *
+ * One test, used by both the enable-time scan and the mount-time hook so the two
+ * cannot drift: a mount is ours when its source string (mnt_devname) or its
+ * mountpoint path starts with one of the PREFIXES below.
+ *
+ * The list used to be a hardcoded "/data/adb/", which is where KernelSU keeps its
+ * module images - correct for that case, and useless for anything else.  A container
+ * (proot/chroot) mounts tmpfs/proc/sysfs/devpts at, say, /data/local/tmp/ubuntu2/dev,
+ * and those were never hidden because no prefix matched.  The list is now runtime
+ * configurable:
+ *
+ *   echo "add /data/local/tmp/ubuntu2" > /proc/susfs_hide_mounts   (or the parameter
+ *   echo "set /data/adb/ /data/local/tmp/ubuntu2" > ...             of the same name)
+ *
+ * Anchored (strncmp against each prefix), never a substring search: a devname such as
+ * "/mnt/media_rw/x/data/adb/y" or an app-chosen directory name is not a KernelSU
+ * mount, and matching those hid unrelated mounts (measured: a mount whose source was
+ * "x/data/adb/y" disappeared for non-su readers).
+ *
+ * Changing the list rescans the current namespace, so a path that is ALREADY mounted
+ * is picked up without re-enabling the feature; mounts that appear later are caught by
+ * the attach_recursive_mnt hook above.  Entries recorded before a change stay recorded
+ * (their identity is dropped when their filesystem is torn down, or on unload) - the
+ * list decides what is accepted from now on, not what is already known. */
+#define SUS_MOUNT_KEEP_MAX 8
+#define SUS_MOUNT_KEEP_LEN 128
 
-static bool sus_mount_is_adb_mountpoint(const char *path)
+static char mount_keep[SUS_MOUNT_KEEP_MAX][SUS_MOUNT_KEEP_LEN];
+static int n_mount_keep;
+static DEFINE_SPINLOCK(mount_keep_lock);
+static const char *const mount_keep_default = "/data/adb/";
+
+/* Interrupt/kprobe safe: read-only, no allocation. */
+static bool sus_mount_path_is_ours(const char *s)
 {
-    if (!path)
+    unsigned long flags;
+    bool hit = false;
+    int i;
+
+    if (!s)
         return false;
-    /* Every KernelSU mount lives under /data/adb (its module store), so the
-     * mountpoint test is the same one the devname test uses.  It used to be
-     * narrowed to modules/ksu/magisk, which missed the mounts whose source is a
-     * block device AND whose mountpoint is not one of those three - a tmpfs or an
-     * image mounted at /data/adb/<name> was simply not recognised, and stayed
-     * visible in every namespace (measured: /data/adb/mnt_leak, id 24832). */
-    return strncmp(path, "/data/adb/", 10) == 0;
+
+    spin_lock_irqsave(&mount_keep_lock, flags);
+    for (i = 0; i < n_mount_keep; i++) {
+        size_t len = strlen(mount_keep[i]);
+
+        if (len && !strncmp(s, mount_keep[i], len)) {
+            hit = true;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&mount_keep_lock, flags);
+    return hit;
 }
 
 /* Retro-fit upstream's "KSU mounts carry an id >= DEFAULT_KSU_MNT_ID" onto the
@@ -1343,6 +1376,254 @@ static bool sus_mount_is_adb_mountpoint(const char *path)
  * afterwards (allocated and freed through the same ida, so the pairing the kernel
  * expects stays intact). */
 #define SUS_MOUNT_ID_BATCH 8
+
+/* ---- control surface: which mounts are ours ---- */
+
+static int sus_mount_mark_ksu_mounts(void);	/* changing the list rescans */
+
+#define SUS_MOUNT_KEEP_CMDLINE (SUS_MOUNT_KEEP_MAX * (SUS_MOUNT_KEEP_LEN + 2) + 32)
+static atomic_t n_keep_rescans = ATOMIC_INIT(0);
+
+static int sus_mount_keep_parse(const char *val, char dst[][SUS_MOUNT_KEEP_LEN], int max)
+{
+	char buf[SUS_MOUNT_KEEP_CMDLINE];
+	const char *p;
+	int n = 0;
+
+	strscpy(buf, val, sizeof(buf));
+	p = buf;
+	while (*p) {
+		char *tok;
+		int len;
+
+		while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n' || *p == '\r')
+			p++;
+		if (!*p)
+			break;
+		tok = (char *)p;
+		while (*p && *p != ' ' && *p != ',' && *p != '\t' && *p != '\n' && *p != '\r')
+			p++;
+		len = (int)(p - tok);
+		if (len <= 0)
+			continue;
+		if (len >= SUS_MOUNT_KEEP_LEN)
+			return -ENAMETOOLONG;
+		if (n >= max)
+			return -ENOSPC;
+		memcpy(dst[n], tok, len);
+		dst[n][len] = '\0';
+		n++;
+	}
+	return n;
+}
+
+static void sus_mount_keep_commit(char dst[][SUS_MOUNT_KEEP_LEN], int n)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&mount_keep_lock, flags);
+	memset(mount_keep, 0, sizeof(mount_keep));
+	memcpy(mount_keep, dst, (size_t)n * SUS_MOUNT_KEEP_LEN);
+	n_mount_keep = n;
+	spin_unlock_irqrestore(&mount_keep_lock, flags);
+}
+
+static void sus_mount_keep_rescan(void)
+{
+	int rc;
+
+	if (!mount_registered)
+		return;		/* nothing is armed yet; the scan at enable will do it */
+	rc = sus_mount_mark_ksu_mounts();
+	atomic_inc(&n_keep_rescans);
+	SUSFS_LOGI("sus_mount: rescanned after a list change: %d mount(s) marked (rc=%d)\n",
+			rc, rc < 0 ? rc : 0);
+}
+
+/* Commands, same shape as the hide_modules node:
+ *   add <prefix> | del <prefix> | set <prefix>... | reset | clear
+ * `reset` restores the built-in default (/data/adb/); `clear` leaves no prefix at
+ * all, which stops NEW mounts from being accepted while the KSU mounts stay hidden by
+ * their ids.  @bare_list is for the insmod form of the parameter only. */
+static int sus_mount_keep_command(const char *val, bool bare_list)
+{
+	char cmd[SUS_MOUNT_KEEP_CMDLINE];
+	char staged[SUS_MOUNT_KEEP_MAX][SUS_MOUNT_KEEP_LEN];
+	const char *arg;
+	int i, n;
+
+	strscpy(cmd, val, sizeof(cmd));
+	for (i = (int)strlen(cmd) - 1; i >= 0 && (cmd[i] == '\n' || cmd[i] == '\r' || cmd[i] == ' '); i--)
+		cmd[i] = '\0';
+
+	if (!strcmp(cmd, "reset")) {
+		strscpy(staged[0], mount_keep_default, SUS_MOUNT_KEEP_LEN);
+		sus_mount_keep_commit(staged, 1);
+		sus_mount_keep_rescan();
+		SUSFS_LOGI("sus_mount: prefix list reset to the default\n");
+		return 0;
+	}
+	if (!strcmp(cmd, "clear")) {
+		sus_mount_keep_commit(staged, 0);
+		SUSFS_LOGI("sus_mount: prefix list cleared (no new mount is accepted by path)\n");
+		return 0;
+	}
+	if (!strncmp(cmd, "set ", 4)) {
+		n = sus_mount_keep_parse(cmd + 4, staged, SUS_MOUNT_KEEP_MAX);
+		if (n < 0)
+			return n;
+		sus_mount_keep_commit(staged, n);
+		sus_mount_keep_rescan();
+		SUSFS_LOGI("sus_mount: prefix list set to %d entr(ies)\n", n);
+		return 0;
+	}
+	if (!strncmp(cmd, "add ", 4) || !strncmp(cmd, "del ", 4)) {
+		bool adding = (cmd[0] == 'a');
+
+		arg = cmd + 4;
+		while (*arg == ' ')
+			arg++;
+		if (!*arg || strlen(arg) >= SUS_MOUNT_KEEP_LEN)
+			return -EINVAL;
+
+		spin_lock(&mount_keep_lock);
+		n = n_mount_keep;
+		if (n > SUS_MOUNT_KEEP_MAX)
+			n = SUS_MOUNT_KEEP_MAX;
+		memcpy(staged, mount_keep, (size_t)n * SUS_MOUNT_KEEP_LEN);
+		spin_unlock(&mount_keep_lock);
+
+		{
+			bool found = false;
+
+			for (i = 0; i < n; i++) {
+				if (strcmp(staged[i], arg))
+					continue;
+				found = true;
+				if (adding)
+					return 0;
+				memmove(&staged[i], &staged[i + 1],
+					(size_t)(n - i - 1) * SUS_MOUNT_KEEP_LEN);
+				n--;
+				break;
+			}
+			if (adding) {
+				if (found)
+					return 0;
+				if (n >= SUS_MOUNT_KEEP_MAX)
+					return -ENOSPC;
+				strscpy(staged[n], arg, SUS_MOUNT_KEEP_LEN);
+				n++;
+			} else if (!found) {
+				return -ENOENT;
+			}
+		}
+		sus_mount_keep_commit(staged, n);
+		sus_mount_keep_rescan();
+		SUSFS_LOGI("sus_mount: %s %s -> %d prefix(es)\n", adding ? "add" : "del", arg, n);
+		return 0;
+	}
+
+	if (!bare_list)
+		return -EINVAL;
+	n = sus_mount_keep_parse(cmd, staged, SUS_MOUNT_KEEP_MAX);
+	if (n < 0)
+		return n;
+	sus_mount_keep_commit(staged, n);
+	sus_mount_keep_rescan();
+	SUSFS_LOGI("sus_mount: prefix list set to %d entr(ies)\n", n);
+	return 0;
+}
+
+static int sus_mount_keep_format(char *buf, size_t size)
+{
+	int n = 0;
+	int i;
+
+	n += scnprintf(buf + n, size - n,
+		"mount prefixes: %d/%d, rescans=%d, recorded=%d, hidden_by_identity=%d, learned_ids=%d\n",
+		n_mount_keep, SUS_MOUNT_KEEP_MAX, atomic_read(&n_keep_rescans),
+		atomic_read(&n_newmnt_recorded), atomic_read(&n_ident_hits),
+		atomic_read(&n_ident_learned));
+	n += scnprintf(buf + n, size - n, "prefixes:");
+	for (i = 0; i < n_mount_keep && n < (int)size - 64; i++)
+		n += scnprintf(buf + n, size - n, " %s", mount_keep[i]);
+	if (!n_mount_keep)
+		n += scnprintf(buf + n, size - n, " (none - only KSU-range ids are hidden)");
+	n += scnprintf(buf + n, size - n, "\n");
+	return n;
+}
+
+static int sus_mount_keep_param_set(const char *val, const struct kernel_param *kp)
+{
+	return sus_mount_keep_command(val, true);
+}
+
+static int sus_mount_keep_param_get(char *buf, const struct kernel_param *kp)
+{
+	return sus_mount_keep_format(buf, PAGE_SIZE);
+}
+
+static const struct kernel_param_ops sus_mount_keep_ops = {
+	.get = sus_mount_keep_param_get,
+	.set = sus_mount_keep_param_set,
+};
+/* 0600: root only; the whole directory is inside the one hide_modules hides. */
+module_param_cb(hide_mounts, &sus_mount_keep_ops, NULL, 0600);
+
+static int sus_mount_keep_proc_show(struct seq_file *m, void *v)
+{
+	char buf[512];
+
+	sus_mount_keep_format(buf, sizeof(buf));
+	seq_puts(m, buf);
+	return 0;
+}
+
+static int sus_mount_keep_proc_open(struct inode *inode, struct file *file)
+{
+	/* 0777 node + this check, like every other control node: a restrictive mode would
+	 * answer EACCES (advertising that the node exists) before sus_path could answer
+	 * ENOENT. */
+	if (current_uid().val != 0)
+		return -ENOENT;
+	return single_open(file, sus_mount_keep_proc_show, NULL);
+}
+
+static ssize_t sus_mount_keep_proc_write(struct file *file, const char __user *buf,
+					 size_t len, loff_t *off)
+{
+	char cmd[SUS_MOUNT_KEEP_CMDLINE];
+	int rc;
+
+	/* Same reason as the open check: an fd opened before the process dropped
+	 * privileges must not become a way in. */
+	if (current_uid().val != 0)
+		return -ENOENT;
+	if (len == 0)
+		return 0;
+	if (len >= sizeof(cmd))
+		return -EINVAL;
+	if (copy_from_user(cmd, buf, len))
+		return -EFAULT;
+	cmd[len] = '\0';
+
+	/* Commands only: a typo must not silently replace the list. */
+	rc = sus_mount_keep_command(cmd, false);
+	if (rc)
+		return rc;
+	return len;
+}
+
+static const struct proc_ops sus_mount_keep_proc_ops = {
+	.proc_open = sus_mount_keep_proc_open,
+	.proc_read = seq_read,
+	.proc_write = sus_mount_keep_proc_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+static struct proc_dir_entry *sus_mount_keep_entry;
 
 static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long min)
 {
@@ -1419,7 +1700,7 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
             continue;
         }
 
-        if (sus_mount_is_adb_devname(r->mnt_devname)) {
+        if (sus_mount_path_is_ours(r->mnt_devname)) {
             n_devname++;
             shown = r->mnt_devname;
         } else {
@@ -1441,7 +1722,7 @@ static int sus_mount_scan_ns(struct mnt_namespace *ns, char *buf, unsigned long 
                 continue;
             }
             n_dpath_ok++;
-            if (!sus_mount_is_adb_mountpoint(dp))
+            if (!sus_mount_path_is_ours(dp))
                 continue;
             shown = dp;
         }
@@ -1587,7 +1868,29 @@ int susfs_sus_mount_init(void)
      * have to carry KSU ids before it is switched on (and the next enable
      * rescans anyway, which picks up mounts created since load). */
     SUSFS_LOGI("sus_mount: disabled by default (enable via CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS)\n");
+
+    /* Which mounts count as ours, before anything looks at them: the built-in default
+     * is KernelSU's module store.  The list is runtime configurable (hide_mounts /
+     * /proc/susfs_hide_mounts) - a container at /data/local/tmp/ubuntu2 needs its own
+     * prefix to be hidden at all. */
+    {
+        char staged[SUS_MOUNT_KEEP_MAX][SUS_MOUNT_KEEP_LEN] = { { 0 } };
+
+        strscpy(staged[0], mount_keep_default, SUS_MOUNT_KEEP_LEN);
+        sus_mount_keep_commit(staged, 1);
+    }
+
     (void)sus_mount_mark_ksu_mounts();
+
+    if (susfs_control_node_allowed()) {
+        sus_mount_keep_entry = proc_create("susfs_hide_mounts", 0777, NULL,
+                           &sus_mount_keep_proc_ops);
+        if (!sus_mount_keep_entry)
+            pr_warn("sus_mount: proc_create(susfs_hide_mounts) failed - runtime prefix control unavailable, use the hide_mounts parameter\n");
+    } else {
+        SUSFS_LOGI("sus_mount: /proc/susfs_hide_mounts not created (expose_proc=%d lsm=%d)\n",
+                (int)susfs_expose_proc, (int)sus_path_lsm_active());
+    }
     return 0;
 }
 
@@ -1632,6 +1935,10 @@ void susfs_sus_mount_exit(void)
 {
     unsigned long flags;
 
+    if (sus_mount_keep_entry) {
+        proc_remove(sus_mount_keep_entry);
+        sus_mount_keep_entry = NULL;
+    }
     sus_mount_unregister();
     /* Marked mnt_ids are deliberately NOT restored: upstream assigns an id once
      * per mount and never rewrites it, so a marked id stays for the mount's

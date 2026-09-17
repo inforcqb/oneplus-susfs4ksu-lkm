@@ -61,6 +61,11 @@ int sus_path_del_path(const char *path);
  * registered in sus_path's self-protected set. */
 #define SUSFS_HIDE_MODULES_NODE "/proc/susfs_hide_modules"
 bool susfs_hide_modules_active(void);
+
+/* The sus_mount control node: it decides WHICH mounts count as ours (the on/off
+ * switch stays the hide_sus_mnts_for_non_su_procs supercall).  Root-only commands,
+ * ENOENT for everyone else through sus_path - the same contract as the other nodes. */
+#define SUSFS_HIDE_MOUNTS_NODE "/proc/susfs_hide_mounts"
 bool susfs_hide_modules_node_ready(void);
 
 /* Whether the /proc/susfs_* control nodes are created at all.  Defaults to TRUE:
