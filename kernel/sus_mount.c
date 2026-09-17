@@ -139,6 +139,14 @@ static DEFINE_SPINLOCK(mount_keep_lock);
 static const char *const mount_keep_default = "/data/adb/";
 static atomic_t n_keep_rescans = ATOMIC_INIT(0);
 
+/* How many of the three mount-table hooks (show_vfsstat / show_mountinfo /
+ * show_vfsmnt) are actually armed.  Declared up here because mount_stat() reports
+ * it and mount_stat() sits above the probes in this file.  3 is the healthy value;
+ * 1 or 2 means the feature hides fewer files than it says, which is exactly the
+ * kind of "enabled but smaller" state that must be visible rather than inferred -
+ * see sus_mount_register(). */
+static int n_show_probes;
+
 #define DEFAULT_KSU_MNT_ID 2000000000ULL
 
 /* P3: min_mnt_id is a raw ulong tunable and 0/1 would make EVERY mount line
@@ -1200,6 +1208,7 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
 {
     return scnprintf(buf, PAGE_SIZE,
                      "idmap=%d/%d  ident=%d/%d  hide=%d su_domain=%d\n"
+                     "show_probes=%d/3 (show_vfsstat/show_mountinfo/show_vfsmnt)\n"
                      "ident: hits=%d learned_ids=%d full=%d dropped_dev=%d\n"
                      "idmap: recycled_dropped=%d dropped_dev=%d\n"
                      "sb: down=%d (probe=%d)\n"
@@ -1212,6 +1221,7 @@ static int sus_mount_stat_show(char *buf, const struct kernel_param *kp)
                      sus_mount_idmap_live(), n_idmap,
                      sus_mount_ident_live(), READ_ONCE(n_ident), mount_registered,
                      (int)sus_mount_is_su_domain(),
+                     n_show_probes,
                      atomic_read(&n_ident_hits), atomic_read(&n_ident_learned),
                      atomic_read(&n_ident_full),
                      atomic_read(&n_ident_dropped_dev),
@@ -1294,6 +1304,18 @@ static struct kprobe kp_vfsmnt = {
     .symbol_name = "show_vfsmnt",
     .pre_handler = sus_mount_show_pre,
 };
+
+/* The three of them as one list, plus what is armed.  Registration and teardown both
+ * go through this: with independent registration (see sus_mount_register()) an
+ * unregister of a probe that never armed is not a no-op, so teardown must ask. */
+#define SUS_MOUNT_SHOW_N 3
+static struct kprobe *const sus_mount_show_probes[SUS_MOUNT_SHOW_N] = {
+    &kp_vfsstat, &kp_mountinfo, &kp_vfsmnt,
+};
+static const char *const sus_mount_show_names[SUS_MOUNT_SHOW_N] = {
+    "show_vfsstat", "show_mountinfo", "show_vfsmnt",
+};
+static bool sus_mount_show_armed[SUS_MOUNT_SHOW_N];
 
 /* ---- which mounts count as "ours" ----
  *
@@ -1906,11 +1928,19 @@ int susfs_sus_mount_init(void)
  * after "disabled". */
 static void sus_mount_unregister(void)
 {
+    int i;
+
     if (!mount_registered)
         return;
-    unregister_kprobe(&kp_mountinfo);
-    unregister_kprobe(&kp_vfsstat);
-    unregister_kprobe(&kp_vfsmnt);
+    /* Per probe: with independent registration the list can be partial, and
+     * unregister_kprobe() on a probe that never armed walks lists it is not on. */
+    for (i = 0; i < SUS_MOUNT_SHOW_N; i++) {
+        if (!sus_mount_show_armed[i])
+            continue;
+        unregister_kprobe(sus_mount_show_probes[i]);
+        sus_mount_show_armed[i] = false;
+    }
+    n_show_probes = 0;
     if (kr_fdinfo_ok) {
         unregister_kretprobe(&kr_fdinfo);
         kr_fdinfo_ok = false;
@@ -1971,23 +2001,41 @@ void susfs_sus_mount_exit(void)
 
 static int sus_mount_register(void)
 {
-    int rc;
+    int rc, i;
 
     if (mount_registered)
         return 0;
-    rc = register_kprobe(&kp_vfsstat);
-    if (rc)
-        return rc;
-    rc = register_kprobe(&kp_mountinfo);
-    if (rc) {
-        unregister_kprobe(&kp_vfsstat);
-        return rc;
+
+    /* The three mount-table hooks, registered INDEPENDENTLY.
+     *
+     * They used to be fatal on the first failure, and silent about which one it was:
+     * -EINVAL from register_kprobe() (its answer when the address is not probeable -
+     * a notrace/blacklisted region, for instance) came back to userspace as a bare
+     * -EINVAL, with nothing in the log and no way to tell show_vfsstat from
+     * show_mountinfo.  Measured on a vendor 5.15 kernel: enabling the feature failed
+     * that way while every mount table stayed unhidden, and only reading the source
+     * said which probe had failed.
+     *
+     * Each hook covers a different file - show_vfsstat serves /proc/<pid>/mountstats,
+     * show_mountinfo serves mountinfo, show_vfsmnt serves /proc/mounts and
+     * /proc/<pid>/mounts - so one that cannot be armed must NOT take the other two
+     * down with it.  Every failure is named, and the number that did arm is on
+     * mount_stat as `show_probes=<n>/3`, which is what makes a partial hide visible
+     * instead of silently smaller.  Only "none of the three" is fatal: that is
+     * "enabled but nothing hidden" again, and it is reported to the caller. */
+    for (i = 0; i < SUS_MOUNT_SHOW_N; i++) {
+        rc = register_kprobe(sus_mount_show_probes[i]);
+        if (rc) {
+            pr_warn("sus_mount: register_kprobe(%s) failed %d - that file keeps showing our mounts\n",
+                    sus_mount_show_names[i], rc);
+            continue;
+        }
+        sus_mount_show_armed[i] = true;
+        n_show_probes++;
     }
-    rc = register_kprobe(&kp_vfsmnt);
-    if (rc) {
-        unregister_kprobe(&kp_mountinfo);
-        unregister_kprobe(&kp_vfsstat);
-        return rc;
+    if (!n_show_probes) {
+        pr_err("sus_mount: none of show_vfsstat/show_mountinfo/show_vfsmnt could be hooked - not reporting the feature as enabled\n");
+        return -EINVAL;
     }
     /* The two id rewrites are optional on their own: without them the mount
      * lines are still hidden, so a missing symbol must not take the rest down -
