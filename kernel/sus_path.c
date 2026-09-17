@@ -941,8 +941,36 @@ static bool sus_path_inode_hidden(struct inode *inode)
                 hidden = true;
                 break;
             }
-        } else if (e->ino && e->dev == dev && e->ino == (u64)inode->i_ino) {
+            continue;
+        }
+        if (!e->ino || e->ino != (u64)inode->i_ino)
+            continue;
+        if (e->dev == dev) {
+            /* Same (dev, ino), different object.  Impossible on a healthy kernel;
+             * see n_ino_only. */
             same_identity = true;
+            continue;
+        }
+        /* A SECOND INSTANCE of the same filesystem: measured, a container's /proc has
+         * the very same i_ino (4026535268 for /proc/susfs_kstat) with its own s_dev
+         * (1048754 against the main /proc's 20), and a rule keyed on the main
+         * instance's inode pointer and dev did not match it - the node stayed readable
+         * through the container's /proc while its NAME was still filtered from that
+         * listing (the dirent layer matches by (ino, name) and ignores dev).  A name
+         * hidden in the listing but openable is the loudest inconsistency of all.
+         *
+         * Only for self_protect rules, and only across the SAME filesystem type: those
+         * are this module's own control nodes, and procfs takes its inode numbers from
+         * a global allocator (proc_alloc_inum), so the same (fs type, i_ino) IS the
+         * same node in another instance.  Ordinary rules keep matching by pointer
+         * alone - for a normal filesystem two mounts of the same type really can hold
+         * different files with the same inode number, and hiding one would hide the
+         * other. */
+        if (e->self_protect && e->inode &&
+            e->inode->i_sb->s_type == inode->i_sb->s_type &&
+            sus_path_entry_gate_inode(e, inode)) {
+            hidden = true;
+            break;
         }
     }
     spin_unlock(&sus_path_lock);
