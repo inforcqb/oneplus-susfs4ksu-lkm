@@ -905,10 +905,24 @@ static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path)
  * limitation, not a gap this port opened, and a name-only fallback would hide
  * same-named entries elsewhere in the same superblock, so none is added.
  */
+/* "The rule is registered but the hooks never fire" has two very different causes
+ * and a plain counter cannot tell them apart:
+ *   - the hook was not called for that inode at all, or
+ *   - the hook was called and the `e->inode == inode` compare failed.
+ * This counts the second one: an inode the hooks were ASKED about whose (dev, i_ino)
+ * matches a rule exactly while the pointer does not.  It should stay at zero - an
+ * inode is keyed by (superblock, i_ino) in the inode hash, and a rule holds the very
+ * inode it resolved - so a non-zero value means the table holds one object while the
+ * reader walks another, and the pointer compare is what fails.  Recorded inside the
+ * walk this function already does, so it costs one u64 compare per rule on a path
+ * that was walking the list anyway. */
+static atomic_t n_ino_only = ATOMIC_INIT(0);
+
 static bool sus_path_inode_hidden(struct inode *inode)
 {
     struct sus_path_entry *e;
-    bool hidden = false;
+    bool hidden = false, same_identity = false;
+    u64 dev;
 
     if (!inode || !READ_ONCE(sus_path_count))
         return false;
@@ -918,14 +932,23 @@ static bool sus_path_inode_hidden(struct inode *inode)
     if (sus_path_is_resolver())
         return false;
 
+    dev = (u64)inode->i_sb->s_dev;
+
     spin_lock(&sus_path_lock);
     list_for_each_entry(e, &sus_path_list, list) {
-        if (e->inode == inode && sus_path_entry_gate_inode(e, inode)) {
-            hidden = true;
-            break;
+        if (e->inode == inode) {
+            if (sus_path_entry_gate_inode(e, inode)) {
+                hidden = true;
+                break;
+            }
+        } else if (e->ino && e->dev == dev && e->ino == (u64)inode->i_ino) {
+            same_identity = true;
         }
     }
     spin_unlock(&sus_path_lock);
+
+    if (same_identity && !hidden)
+        atomic_inc(&n_ino_only);
 
     return hidden;
 }
@@ -1040,6 +1063,7 @@ static int sus_path_inode_link(struct dentry *old_dentry, struct inode *dir,
  * says "the name is not usable", the second "the object cannot be probed or
  * changed", and they fail for different reasons (see the block above). */
 static atomic_t n_enoent_meta = ATOMIC_INIT(0);
+
 
 static int sus_path_meta_hit(void)
 {
@@ -1706,6 +1730,12 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
         n = sus_path_list_puts(buf, n, &trunc,
                        "lsm: %d secondary hook(s) FAILED (first: %s) - that operation is not covered\n",
                        n_lsm_ext_fail, first_lsm_ext_fail);
+    /* Should never be non-zero: see the comment on n_ino_only.  Printed only when it
+     * happens, so a healthy listing stays short. */
+    if (atomic_read(&n_ino_only))
+        n = sus_path_list_puts(buf, n, &trunc,
+                       "!! %d inode(s) hit a rule's exact (dev,ino) with a DIFFERENT inode pointer - the pointer compare in sus_path_inode_hidden() is failing\n",
+                       atomic_read(&n_ino_only));
     /* Everything the pending machinery did, so that "still pending" can be read
      * for what it is: passes/ticks == 0 means the retry never ran at all, walks
      * > 0 with pending > 0 means the walk kept failing (last-rc says how), and
@@ -1749,6 +1779,88 @@ static const struct kernel_param_ops sus_path_list_ops = {
  * write bit is what makes a mistaken rule removable (see sus_path_store_list).
  * (A raw inode pointer used to be printed here too; removed.) */
 module_param_cb(hide_list, &sus_path_list_ops, NULL, 0600);
+
+/* ---- diagnostic: why does a registered rule not match? ----
+ *
+ *   echo /proc/susfs_kstat > .../parameters/sus_path_probe
+ *   cat  .../parameters/sus_path_probe
+ *
+ * Resolves the path the same way sus_path_add_hidden_ex() does and reports the
+ * identity a reader would see, next to the rule that was supposed to match it.  It
+ * answers the one question the counters cannot answer by themselves - "the rule is
+ * listed, the hooks do fire for other rules, and this path is still visible" -
+ * which otherwise needs a kernel debugger.  Process context only (kern_path
+ * sleeps).  0600 for the same reason hide_list is: it names hidden paths.
+ */
+static char sus_path_probe_report[640];
+
+static int sus_path_probe_set(const char *val, const struct kernel_param *kp)
+{
+    struct sus_path_entry *e;
+    struct path p;
+    struct inode *inode;
+    char path[SUS_PATH_LEN];
+    int i, rc, n, room;
+
+    strscpy(path, val, sizeof(path));
+    /* A shell `echo` leaves a newline behind; trim it (and trailing spaces). */
+    for (i = (int)strlen(path) - 1; i >= 0 && (path[i] == '\n' || path[i] == '\r' || path[i] == ' '); i--)
+        path[i] = '\0';
+    if (!path[0])
+        return -EINVAL;
+
+    rc = kern_path(path, LOOKUP_FOLLOW, &p);
+    if (rc) {
+        scnprintf(sus_path_probe_report, sizeof(sus_path_probe_report),
+              "path=%s: kern_path failed rc=%d\n", path, rc);
+        return 0;
+    }
+    inode = d_inode(p.dentry);
+    if (!inode) {
+        path_put(&p);
+        scnprintf(sus_path_probe_report, sizeof(sus_path_probe_report),
+              "path=%s: no inode (negative dentry)\n", path);
+        return 0;
+    }
+
+    n = scnprintf(sus_path_probe_report, sizeof(sus_path_probe_report),
+              "path=%s\n  resolved: inode=%px dev=%llu ino=%llu uid=%u in_hidden_set=%d\n",
+              path, inode, (unsigned long long)inode->i_sb->s_dev,
+              (unsigned long long)inode->i_ino, current_uid().val,
+              (int)sus_path_inode_hidden(inode));
+
+    spin_lock(&sus_path_lock);
+    list_for_each_entry(e, &sus_path_list, list) {
+        if (e->dev != (u64)inode->i_sb->s_dev || e->ino != (u64)inode->i_ino)
+            continue;
+        room = (int)sizeof(sus_path_probe_report) - n;
+        if (room < 200)
+            break;
+        i = scnprintf(sus_path_probe_report + n, room,
+                  "  rule: inode=%px name=%s self_protect=%d ptr_equal=%d gate_inode=%d gate_any=%d\n",
+                  e->inode, e->name, (int)e->self_protect,
+                  (int)(e->inode == inode), (int)sus_path_entry_gate_inode(e, inode),
+                  (int)sus_path_entry_gate_any(e));
+        if (i >= room)
+            break;
+        n += i;
+    }
+    spin_unlock(&sus_path_lock);
+    path_put(&p);
+    return 0;
+}
+
+static int sus_path_probe_get(char *buf, const struct kernel_param *kp)
+{
+    return scnprintf(buf, PAGE_SIZE, "%s",
+             sus_path_probe_report[0] ? sus_path_probe_report : "(no path probed yet)\n");
+}
+
+static const struct kernel_param_ops sus_path_probe_ops = {
+    .get = sus_path_probe_get,
+    .set = sus_path_probe_set,
+};
+module_param_cb(sus_path_probe, &sus_path_probe_ops, NULL, 0600);
 
 /* Add a path to the hidden set from kernel code, bypassing the supercall.
  * Used by susfs_init() to self-hide the /proc control nodes.

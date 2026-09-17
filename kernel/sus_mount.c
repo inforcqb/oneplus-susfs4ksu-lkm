@@ -116,11 +116,28 @@
 #include <linux/dcache.h>   /* d_path() - called through a resolved symbol */
 #include <linux/limits.h>   /* PATH_MAX, INT_MAX (via vdso/limits.h) */
 #include <linux/security.h> /* security_secctx_to_secid() */
+#include <linux/proc_fs.h>  /* proc_create() for /proc/susfs_hide_mounts */
 #include "mount.h"      /* fs/mount.h: struct mount + struct mnt_namespace + real_mount() */
 #include "symbol_resolver.h"
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* module-wide declarations */
+
+/* ---- the "which mounts are ours" prefix list: state ----
+ *
+ * The state lives up here, not next to the control surface further down, because
+ * mount_stat() - which sits between the two - reports the list length and the
+ * rescan count.  Declaring it below its first use is a compile error, not a
+ * style issue. */
+#define SUS_MOUNT_KEEP_MAX 8
+#define SUS_MOUNT_KEEP_LEN 128
+#define SUS_MOUNT_KEEP_CMDLINE (SUS_MOUNT_KEEP_MAX * (SUS_MOUNT_KEEP_LEN + 2) + 32)
+
+static char mount_keep[SUS_MOUNT_KEEP_MAX][SUS_MOUNT_KEEP_LEN];
+static int n_mount_keep;
+static DEFINE_SPINLOCK(mount_keep_lock);
+static const char *const mount_keep_default = "/data/adb/";
+static atomic_t n_keep_rescans = ATOMIC_INIT(0);
 
 #define DEFAULT_KSU_MNT_ID 2000000000ULL
 
@@ -1303,13 +1320,6 @@ static struct kprobe kp_vfsmnt = {
  * the attach_recursive_mnt hook above.  Entries recorded before a change stay recorded
  * (their identity is dropped when their filesystem is torn down, or on unload) - the
  * list decides what is accepted from now on, not what is already known. */
-#define SUS_MOUNT_KEEP_MAX 8
-#define SUS_MOUNT_KEEP_LEN 128
-
-static char mount_keep[SUS_MOUNT_KEEP_MAX][SUS_MOUNT_KEEP_LEN];
-static int n_mount_keep;
-static DEFINE_SPINLOCK(mount_keep_lock);
-static const char *const mount_keep_default = "/data/adb/";
 
 /* Interrupt/kprobe safe: read-only, no allocation. */
 static bool sus_mount_path_is_ours(const char *s)
@@ -1380,9 +1390,6 @@ static bool sus_mount_path_is_ours(const char *s)
 /* ---- control surface: which mounts are ours ---- */
 
 static int sus_mount_mark_ksu_mounts(void);	/* changing the list rescans */
-
-#define SUS_MOUNT_KEEP_CMDLINE (SUS_MOUNT_KEEP_MAX * (SUS_MOUNT_KEEP_LEN + 2) + 32)
-static atomic_t n_keep_rescans = ATOMIC_INIT(0);
 
 static int sus_mount_keep_parse(const char *val, char dst[][SUS_MOUNT_KEEP_LEN], int max)
 {
