@@ -1862,9 +1862,10 @@ static int sus_path_format_list(char *buf, size_t size)
             break;
         }
         n = sus_path_list_puts(buf, n, &trunc,
-                       "dev=%llu ino=%llu name=%s%s\n",
-                       e->dev, e->ino, e->name,
-                       e->inode ? "" : " (pending: no inode yet)");
+                       "path=%s  dev=%llu ino=%llu name=%s%s%s\n",
+                       e->path[0] ? e->path : "(?)", e->dev, e->ino, e->name,
+                       e->self_protect ? "  [ours: clear/del refuse it]" : "",
+                       e->inode ? "" : "  (pending: no inode yet)");
     }
     spin_unlock(&sus_path_lock);
 
