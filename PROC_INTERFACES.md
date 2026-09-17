@@ -192,7 +192,10 @@ echo 'clear'                                > /proc/susfs_hide_mounts   # 空前
 | `fail_layer` | 0644 | 诊断：强制指定层初始化失败，用来验证"加载失败不留残留"的回滚路径 |
 | `sus_path_probe` | 0600 | 诊断：`echo <路径> > sus_path_probe` 解析该路径，读回它看到的 inode 指针/`(dev,ino)`/是否在隐藏集合内，以及**每条同 (dev,ino) 规则**自己的 inode 指针、`ptr_equal`、两个 gate 的答案。用于回答"规则登记了、别的规则钩子也在工作、但这个路径仍然可见"——否则只能上内核调试器 |
 
-**关于第二份 procfs**：容器（proot/chroot）会挂自己的 `/proc`，它和主 `/proc` 的 `s_dev` 不同（实测 `1048754` vs `20`）但 **inode 号相同**（procfs 的 inode 号来自全局分配器）。`self_protect` 规则（本模块自己的节点）因此按"**同一文件系统类型 + 同一 inode 号**"额外匹配，容器里的那份节点同样给出 ENOENT；普通规则仍只按 inode 指针匹配（普通文件系统里两个同类型挂载确实可能有两个同号 inode）。
+**关于第二份 procfs 与"重载后的陈旧 inode"**：`self_protect` 规则（本模块自己的节点）按**身份**匹配——**同一文件系统类型 + 同一 inode 号**，而不是按 inode 指针。两个实测场景让指针成为错误的键：
+
+- 容器（proot/chroot）会挂自己的 `/proc`，它与主 `/proc` 的 `s_dev` 不同（实测 `1048754` vs `20`）但 **inode 号相同**（procfs 的 inode 号来自全局分配器 `proc_alloc_inum`）。不按身份匹配时，节点在容器里 `stat`/`cat` 可见、而列表里名字已被过滤——"列表里没有却打得开"。实测修复后容器里 uid 2000 得到 ENOENT。
+- **快速 `rmmod` + `insmod`**（`ihold()` 只保证 inode 不被释放，**不保证它还挂在 inode hash 上**）：规则可能持有一个读者再也见不到的对象，而同一 `(dev, ino)` 已由新对象承担。实测过一次：`sus_path_probe` 显示 `ptr_equal=0`、`hide_list` 的 `n_ino_only` 变成 1，此时节点对 uid 2000 重新可见（`ls -la /proc/susfs_hide_modules` 直接列出文件）。这是 `rmmod`/`insmod` 窗口里的竞态，不是每次都能复现（3 秒间隔或再重载一次即恢复正常），所以规则改为按身份匹配；普通规则仍只按指针匹配（普通文件系统里两个同类型挂载确实可能有两个同号 inode）。
 
 ## 另见
 
