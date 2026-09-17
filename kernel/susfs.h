@@ -68,6 +68,14 @@ bool susfs_hide_modules_active(void);
 #define SUSFS_HIDE_MOUNTS_NODE "/proc/susfs_hide_mounts"
 bool susfs_hide_modules_node_ready(void);
 
+/* sus_path's own control node.  `cat` is the rule listing - the same view the hide_list
+ * parameter prints - and writing takes the commands (add/del/clear).  It exists because
+ * the listing used to be reachable only through a sysfs parameter while every other
+ * control surface of this module has a /proc front end, and a rule table an operator
+ * cannot see is how "the rule is registered but nothing is hidden" stays invisible.
+ * Root-only, and registered in the self-protected set: everyone else gets ENOENT. */
+#define SUSFS_PATH_NODE "/proc/susfs_path"
+
 /* Whether the /proc/susfs_* control nodes are created at all.  Defaults to TRUE:
  * the nodes are the module's own interface, and sus_path hides them from every
  * non-root caller (ENOENT, not EACCES).  They are only created when the LSM

@@ -60,6 +60,8 @@
 #include <linux/limits.h>
 #include <linux/cred.h>
 #include <linux/atomic.h>
+#include <linux/proc_fs.h>	/* proc_create() for /proc/susfs_path */
+#include <linux/seq_file.h>	/* single_open()/seq_write() for the same node */
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
@@ -1694,11 +1696,43 @@ int sus_path_del_path(const char *path)
  *
  * Deliberately NOT a new CMD_SUSFS_* command: this node is ours, while the supercall
  * command space has to stay compatible with what KernelSU and ksud already use. */
-static int sus_path_store_list(const char *val, const struct kernel_param *kp)
+/* One command layer for both front ends - /proc/susfs_path and the hide_list parameter -
+ * so the two cannot drift apart the way two copies of a parser always do.
+ *
+ *   add <path>    register an ordinary rule (resolved now; the caller learns the errno)
+ *   del <path>    drop it, restoring whatever sus_path_relax_mode() relaxed
+ *   clear         drop every ORDINARY rule
+ *
+ * `clear` and `del` refuse to touch this module's own control nodes (the self_protect
+ * rules).  Those rules are what makes a non-root caller see ENOENT instead of the control
+ * surface at all, and "delete the protection of the module's own /proc nodes" is never
+ * what an operator means by clearing a path list - the documented way to expose the
+ * nodes is expose_proc=0, which removes them outright.
+ *
+ * Returns 0 or a negative errno; @removed_out (optional) gets the number of rules dropped.
+ */
+static bool sus_path_path_is_ours(const char *path)
+{
+    struct sus_path_entry *e;
+    bool ours = false;
+
+    spin_lock(&sus_path_lock);
+    list_for_each_entry(e, &sus_path_list, list) {
+        if (e->self_protect && !strcmp(e->path, path)) {
+            ours = true;
+            break;
+        }
+    }
+    spin_unlock(&sus_path_lock);
+    return ours;
+}
+
+static int sus_path_command(const char *val, int *removed_out)
 {
     struct sus_path_entry *e, *tmp;
     LIST_HEAD(doomed);
     char cmd[SUS_PATH_LEN + 16];
+    const char *arg;
     int i, removed = 0;
 
     strscpy(cmd, val, sizeof(cmd));
@@ -1708,21 +1742,43 @@ static int sus_path_store_list(const char *val, const struct kernel_param *kp)
 
     if (!strcmp(cmd, "clear")) {
         spin_lock(&sus_path_lock);
-        list_splice_init(&sus_path_list, &doomed);
-        sus_path_count = 0;
+        list_for_each_entry_safe(e, tmp, &sus_path_list, list) {
+            if (e->self_protect)
+                continue;	/* ours: see the note above */
+            list_del(&e->list);
+            list_add(&e->list, &doomed);
+            sus_path_count--;
+            removed++;
+        }
         spin_unlock(&sus_path_lock);
-        atomic_set(&sus_path_n_pending, 0);
-    } else if (!strncmp(cmd, "del ", 4)) {
-        char *w = cmd + 4;
+    } else if (!strncmp(cmd, "add ", 4) || !strncmp(cmd, "del ", 4)) {
+        bool adding = (cmd[0] == 'a');
 
-        while (*w == ' ')
-            w++;
-        if (!*w)
+        arg = cmd + 4;
+        while (*arg == ' ')
+            arg++;
+        if (!*arg)
             return -EINVAL;
-        removed = sus_path_del_path(w);
-        SUSFS_LOGI("sus_path: hide_list del, %d rule(s) removed, %d left\n",
-                removed, sus_path_count);
-        return 0;
+        /* Normalise exactly like sus_path_del_path() does, or `del /proc/susfs_kstat/`
+         * would slip past the guard below and remove the module's own protection. */
+        {
+            size_t alen = strlen(arg);
+
+            while (alen > 1 && arg[alen - 1] == '/')
+                ((char *)arg)[--alen] = '\0';
+        }
+        if (!adding && sus_path_path_is_ours(arg))
+            return -EPERM;
+        if (adding) {
+            int rc = sus_path_add_hidden(arg);
+
+            if (rc)
+                return rc;
+        } else {
+            removed = sus_path_del_path(arg);
+        }
+        SUSFS_LOGI("sus_path: %s %s, %d rule(s) removed, %d left\n",
+                adding ? "add" : "del", arg, removed, sus_path_count);
     } else {
         return -EINVAL;
     }
@@ -1739,12 +1795,22 @@ static int sus_path_store_list(const char *val, const struct kernel_param *kp)
             iput(e->inode);
         kfree(e);
     }
-    SUSFS_LOGI("sus_path: hide_list written, %d rule(s) removed, %d left\n",
+    SUSFS_LOGI("sus_path: command written, %d rule(s) removed, %d left\n",
             removed, sus_path_count);
+    if (removed_out)
+        *removed_out = removed;
     return 0;
 }
 
-static int sus_path_show_list(char *buf, const struct kernel_param *kp)
+static int sus_path_store_list(const char *val, const struct kernel_param *kp)
+{
+    return sus_path_command(val, NULL);
+}
+
+/* The listing, into a caller-supplied buffer.  Shared by /proc/susfs_path and the
+ * hide_list parameter so the two views cannot say different things.  Returns the number
+ * of bytes written, clamped to the buffer. */
+static int sus_path_format_list(char *buf, size_t size)
 {
     struct sus_path_entry *e;
     bool trunc = false;
@@ -1807,8 +1873,83 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
     if (trunc)
         n = sus_path_list_puts(buf, n, &trunc,
                        "(truncated: the table holds more rules than one page; the rules are intact)\n");
-    return n;
+    return n < (int)size ? n : (int)size - 1;
 }
+
+static int sus_path_show_list(char *buf, const struct kernel_param *kp)
+{
+    return sus_path_format_list(buf, PAGE_SIZE);
+}
+
+/* ---- /proc/susfs_path: the same table, with the listing as the default view ----
+ *
+ *   cat /proc/susfs_path                  the listing above
+ *   echo "add /data/adb/xxx" > ...        register an ordinary rule
+ *   echo "del /data/adb/xxx" > ...        drop it
+ *   echo clear               > ...        drop every ordinary rule
+ *
+ * The node exists so the rule table has a front end like every other control surface of
+ * this module; before it, the listing was reachable only through the hide_list
+ * parameter.  Same contract as the other nodes: mode 0777 so DAC does not answer EACCES
+ * first, root-only through the uid check in open() AND write(), and registered in the
+ * self-protected set so everyone else gets ENOENT. */
+static struct proc_dir_entry *sus_path_node_entry;
+
+static int sus_path_proc_show(struct seq_file *m, void *v)
+{
+    char *buf = kvmalloc(PAGE_SIZE, GFP_KERNEL);
+    int n;
+
+    if (!buf)
+        return -ENOMEM;
+    n = sus_path_format_list(buf, PAGE_SIZE);
+    if (n > 0)
+        seq_write(m, buf, (size_t)n);
+    kvfree(buf);
+    return 0;
+}
+
+static int sus_path_proc_open(struct inode *inode, struct file *file)
+{
+    /* 0777 node + this check, like every other control node: a restrictive mode would
+     * answer EACCES (advertising that the node exists) before sus_path could answer
+     * ENOENT. */
+    if (current_uid().val != 0)
+        return -ENOENT;
+    return single_open(file, sus_path_proc_show, NULL);
+}
+
+static ssize_t sus_path_proc_write(struct file *file, const char __user *buf,
+                                   size_t len, loff_t *off)
+{
+    char cmd[SUS_PATH_LEN + 16];
+    int rc;
+
+    /* Same reason as the open check: an fd opened before the process dropped
+     * privileges must not become a way in. */
+    if (current_uid().val != 0)
+        return -ENOENT;
+    if (len == 0)
+        return 0;
+    if (len >= sizeof(cmd))
+        return -EINVAL;
+    if (copy_from_user(cmd, buf, len))
+        return -EFAULT;
+    cmd[len] = '\0';
+
+    rc = sus_path_command(cmd, NULL);
+    if (rc)
+        return rc;
+    return len;	/* success reports the count, like every other node */
+}
+
+static const struct proc_ops sus_path_proc_ops = {
+    .proc_open = sus_path_proc_open,
+    .proc_read = seq_read,
+    .proc_write = sus_path_proc_write,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
 
 static const struct kernel_param_ops sus_path_list_ops = {
     .get = sus_path_show_list,
@@ -2108,6 +2249,20 @@ int sus_path_init(void)
      * kretprobes that fed them.  Their history is in TECHNICAL_NOTES.md, including
      * the FPAC panic that one of them caused - kept there rather than as dead code
      * here, because a hook that cannot fire reads as coverage. */
+
+    /* The control node goes up LAST, and only when the layer that hides it is really
+     * installed (susfs_control_node_allowed()): a 0777 world-writable node without the
+     * thing that answers ENOENT for it must not exist.  It has to be created before
+     * susfs_self_hide_nodes() runs, which is why it is here and not in susfs_main.c -
+     * that list is registered after every layer's own init, so paths resolve. */
+    if (susfs_control_node_allowed()) {
+        sus_path_node_entry = proc_create("susfs_path", 0777, NULL, &sus_path_proc_ops);
+        if (!sus_path_node_entry)
+            pr_warn("sus_path: proc_create(susfs_path) failed - the listing stays reachable through the hide_list parameter\n");
+    } else {
+        SUSFS_LOGI("sus_path: /proc/susfs_path not created (expose_proc=%d lsm=%d)\n",
+                (int)susfs_expose_proc, (int)sus_path_lsm_active());
+    }
     return 0;
 }
 
@@ -2115,6 +2270,15 @@ void sus_path_exit(void)
 {
     struct sus_path_entry *e, *tmp;
     LIST_HEAD(doomed);
+
+    /* Our own node goes down first, while the LSM layer that hides it is still armed:
+     * the reverse order would expose a 0777 control surface for the duration of the
+     * unload (the same reason the layer table removes the other nodes before sus_path
+     * goes down). */
+    if (sus_path_node_entry) {
+        proc_remove(sus_path_node_entry);
+        sus_path_node_entry = NULL;
+    }
 
     /* Unregister the hooks FIRST: after this nothing can match, so the entries
      * (and their inode references) can be torn down safely.  The dirent kretprobes

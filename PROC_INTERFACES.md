@@ -30,6 +30,7 @@ cat /proc/susfs_hide_modules            # -> No such file or directory
 | [`/proc/susfs_avc_spoof`](#procsusfs_avc_spoof) | 隐藏 SELinux AVC 审计日志 | `0` / `1` |
 | [`/proc/susfs_hide_modules`](#procsusfs_hide_modules) | 按名字把**其它内核模块**从 `/proc/modules` 去掉 | `add <名字>` / `del <名字>` / `set <名字>…` / `clear` |
 | [`/proc/susfs_hide_mounts`](#procsusfs_hide_mounts) | 哪些挂载算"我们的"（决定隐藏的挂载集合） | `add <前缀>` / `del <前缀>` / `set <前缀>…` / `reset` / `clear` |
+| [`/proc/susfs_path`](#procsusfs_path) | sus_path 规则表——**`cat` 就是清单** | `add <路径>` / `del <路径>` / `clear` |
 
 节点只在 sus_path 的 LSM 层装上时才创建（`expose_proc=1` 且 LSM 生效），所以"0777 的世界可写节点 + 没有保护"这个组合不可能出现；`expose_proc=0` 则完全不创建。
 
@@ -173,6 +174,38 @@ echo 'clear'                                > /proc/susfs_hide_mounts   # 空前
 实测（OnePlus SM8550；prefix 加上 `/data/local/tmp/` 后启用；读者＝真实 adb shell，uid 2000、`u:r:shell:s0`）：`/proc/self/mountinfo`、`/proc/mounts`、`/proc/self/mountstats` 里 `ubuntu2` 的行数**各从 4 变 0**，su 侧仍是 4（只对非 su 隐藏）。
 
 挂载层挂了三 kprobe（`show_vfsstat` / `show_mountinfo` / `show_vfsmnt`），各自独立注册，`mount_stat` 的 `show_probes=<n>/3` 显示实际挂上了几条——`3/3` 才是一切正常；只有三条全挂不上才算启用失败。
+
+---
+
+## /proc/susfs_path
+
+sus_path 的规则表。**读就是清单**（与 sysfs 参数 `hide_list` 完全同一个视图，同一份格式化代码），写是命令：
+
+```sh
+# root：读清单
+cat /proc/susfs_path
+# hide_from_apps=1  enoent: getattr=5 perm=0 nameop=0 meta=0
+# dirent: rewrite-fail=0  all-hidden=0  pending=0  calls(l64=2 compat=0)
+# identity: 3 hit(s) where the inode pointer did not match and (dev,ino) or (fs type,ino) answered instead
+# dev=20 ino=4026535275 name=susfs_kstat
+# ...
+
+# 命令
+echo "add /data/adb/xxx" > /proc/susfs_path     # 普通规则（等价于 ksu_susfs add_sus_path）
+echo "del /data/adb/xxx" > /proc/susfs_path     # 撤销，并恢复被放宽的权限
+echo clear               > /proc/susfs_path     # 清掉所有**普通**规则
+```
+
+| 行为 | 说明 |
+|---|---|
+| 非 root 读到什么 | `No such file or directory`——它和其他控制节点一样登记在自隐藏集合里，属 `self_protect`（对所有非 root 调用者隐藏） |
+| `clear` / `del` 不碰本模块自己的节点 | `self_protect` 规则（`/proc/susfs_*`、`/sys/module/<名字>`）**删不掉**，会返回 `-EPERM`。它们正是让非 root 调用者看到 ENOENT 而不是控制面的东西；要暴露节点请用 `expose_proc=0`。`del` 的路径按 `sus_path_del_path()` 的规则归一化（尾部 `/` 忽略），所以 `del /proc/susfs_kstat/` 同样被拒 |
+| `add` 的失败 | 路径解析不了就是 `-ENOENT`（普通规则必须当下可解析；需要"等它出现"用超调用的 `add_sus_path_loop`）。已存在的规则返回 0（幂等） |
+| 返回值 | 写成功返回写入字节数，失败返回负 errno（与其它节点一致） |
+| 上限 | 同一张表，`hide_list` 的视图超过一页会截断并标注 `(truncated)` |
+
+这条节点存在的理由：规则清单原先只能从 sysfs 参数读到，而"规则登记了但什么都没隐藏"与"表里根本没有这条规则"从外面看是一样的——
+现在 `cat` 就是那张表，而且它和所有其它节点一样由 sus_path 自己隐藏。
 
 ---
 

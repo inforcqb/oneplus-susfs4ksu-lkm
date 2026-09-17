@@ -61,6 +61,10 @@ static const char *const susfs_self_hide_paths[] = {
      * the thing that gives everyone else ENOENT. */
     SUSFS_HIDE_MODULES_NODE,
     SUSFS_HIDE_MOUNTS_NODE,
+    /* sus_path's own interface (the rule listing).  It goes through the same table it
+     * prints, which is the point: the module exercises its own hiding path on its own
+     * diagnostics, so a broken rule table is visible in the very view that reports it. */
+    SUSFS_PATH_NODE,
     /* The module's own sysfs directory is NOT here any more: it belongs to the
      * hide_module feature (susfs_hide_syms.c), which adds and drops that rule at
      * runtime.  It used to sit in this list, which tied it to expose_proc by
