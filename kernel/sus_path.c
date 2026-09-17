@@ -905,23 +905,37 @@ static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path)
  * limitation, not a gap this port opened, and a name-only fallback would hide
  * same-named entries elsewhere in the same superblock, so none is added.
  */
-/* "The rule is registered but the hooks never fire" has two very different causes
- * and a plain counter cannot tell them apart:
- *   - the hook was not called for that inode at all, or
- *   - the hook was called and the `e->inode == inode` compare failed.
- * This counts the second one: an inode the hooks were ASKED about whose (dev, i_ino)
- * matches a rule exactly while the pointer does not.  It should stay at zero - an
- * inode is keyed by (superblock, i_ino) in the inode hash, and a rule holds the very
- * inode it resolved - so a non-zero value means the table holds one object while the
- * reader walks another, and the pointer compare is what fails.  Recorded inside the
- * walk this function already does, so it costs one u64 compare per rule on a path
- * that was walking the list anyway. */
-static atomic_t n_ino_only = ATOMIC_INIT(0);
+/* The key is IDENTITY, not the object: the inode pointer is only a cache in front of it.
+ *
+ * A pointer hit cannot be wrong - it is the very inode the rule resolved - so it answers
+ * immediately.  Everything else is decided by (dev, i_ino), which is the same key the
+ * mount layer uses for its identity records (s_dev + root inode number).  Counting the
+ * slow-path hits is what tells an operator whether the cache is doing its job and, when
+ * it is not, that the rule's object is not the object readers get.
+ *
+ * Why the object alone is not enough (both measured on hardware):
+ *   - after a quick rmmod + insmod a rule can hold an inode that no reader ever sees
+ *     again, while a NEW object carries the same (dev, i_ino).  Seen as ptr_equal=0 in
+ *     sus_path_probe with this module's control nodes readable by uid 2000 again;
+ *   - ihold() keeps an inode alive but NOT hashed, and an inode whose filesystem removed
+ *     it can be unhashed while its number is handed out again.
+ *
+ * (dev, i_ino) is sound because a rule holds its inode from registration until del /
+ * clear / unload: while that inode is the hashed one, its number cannot be reused.
+ *
+ * One tier more, for this module's own control nodes only: another INSTANCE of the same
+ * filesystem keeps the inode number but has its own s_dev (measured, a container's
+ * /proc: the same 4026535268 with dev 1048754 against the main /proc's 20).  For those
+ * nodes the identity is (filesystem type, i_ino) - procfs numbers come from a global
+ * allocator (proc_alloc_inum), so that pair can only be this module's node while the
+ * module is loaded.  Ordinary rules do not get that tier: across two mounts of one type
+ * the same number really can stand for two different files. */
+static atomic_t n_identity_hits = ATOMIC_INIT(0);
 
 static bool sus_path_inode_hidden(struct inode *inode)
 {
     struct sus_path_entry *e;
-    bool hidden = false, same_identity = false;
+    bool hidden = false, by_identity = false;
     u64 dev;
 
     if (!inode || !READ_ONCE(sus_path_count))
@@ -936,6 +950,7 @@ static bool sus_path_inode_hidden(struct inode *inode)
 
     spin_lock(&sus_path_lock);
     list_for_each_entry(e, &sus_path_list, list) {
+        /* Fast path: the exact object the rule resolved. */
         if (e->inode == inode) {
             if (sus_path_entry_gate_inode(e, inode)) {
                 hidden = true;
@@ -943,49 +958,33 @@ static bool sus_path_inode_hidden(struct inode *inode)
             }
             continue;
         }
+        /* Pending rules have no identity yet (ino == 0) and are the LSM layer's blind
+         * spot by construction: nothing exists at their path to be accessed. */
         if (!e->ino || e->ino != (u64)inode->i_ino)
             continue;
-        /* Same (dev, ino), different object.  This is not treated as impossible any
-         * more: MEASURED after a quick unload/reload, where the rule ends up holding
-         * an object no reader ever sees again (see n_ino_only).  Counted either way,
-         * and answered by the identity match below. */
-        if (e->dev == dev)
-            same_identity = true;
-        /* One of this module's own control nodes: match by IDENTITY - same filesystem
-         * type, same inode number - instead of by the inode pointer.  The pointer is
-         * the wrong key in two measured cases:
-         *
-         *   - a SECOND instance of the filesystem.  A container's /proc has the very
-         *     same i_ino (4026535268 for /proc/susfs_kstat) with its own s_dev (1048754
-         *     against the main /proc's 20), and a rule keyed on the main instance's
-         *     inode did not match it: the node stayed openable through the container's
-         *     /proc while its NAME was still filtered from that listing (the dirent
-         *     layer matches by (ino, name) and ignores dev).  A name hidden in a
-         *     listing but openable is the loudest inconsistency of all.
-         *   - an unload/reload.  ihold() keeps an inode alive but NOT hashed: after a
-         *     quick rmmod + insmod the rule can hold an object that no reader sees
-         *     again, while a new object carries the same (dev, ino).  Observed as
-         *     `ptr_equal=0` in sus_path_probe, with the control nodes readable by uid
-         *     2000 again until the module was reloaded once more.
-         *
-         * procfs takes its inode numbers from a global allocator (proc_alloc_inum), so
-         * for these nodes (fs type, i_ino) IS the identity - and such an i_ino can only
-         * belong to this module's own node while the module is loaded.
-         *
-         * Ordinary rules keep matching by pointer alone: for a normal filesystem two
-         * mounts of one type really can hold different files with the same inode
-         * number, and hiding one would hide the other. */
+        if (e->dev == dev) {
+            /* Authoritative identity. */
+            by_identity = true;
+            if (sus_path_entry_gate_inode(e, inode)) {
+                hidden = true;
+                break;
+            }
+            continue;
+        }
+        /* Another instance of the same filesystem: control nodes only, see above. */
         if (e->self_protect && e->inode &&
-            e->inode->i_sb->s_type == inode->i_sb->s_type &&
-            sus_path_entry_gate_inode(e, inode)) {
-            hidden = true;
-            break;
+            e->inode->i_sb->s_type == inode->i_sb->s_type) {
+            by_identity = true;
+            if (sus_path_entry_gate_inode(e, inode)) {
+                hidden = true;
+                break;
+            }
         }
     }
     spin_unlock(&sus_path_lock);
 
-    if (same_identity && !hidden)
-        atomic_inc(&n_ino_only);
+    if (by_identity)
+        atomic_inc(&n_identity_hits);
 
     return hidden;
 }
@@ -1767,12 +1766,16 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
         n = sus_path_list_puts(buf, n, &trunc,
                        "lsm: %d secondary hook(s) FAILED (first: %s) - that operation is not covered\n",
                        n_lsm_ext_fail, first_lsm_ext_fail);
-    /* Should never be non-zero: see the comment on n_ino_only.  Printed only when it
-     * happens, so a healthy listing stays short. */
-    if (atomic_read(&n_ino_only))
+    /* The pointer is only the cache in front of the identity key, so this is a normal,
+     * expected number rather than an alarm - it says how often a lookup had to fall
+     * through to (dev, ino) because the rule's object was not the one being accessed.
+     * Printed only when it is non-zero, so a listing that only uses the fast path stays
+     * short.  A steadily growing value is the interesting case: see the comment on
+     * n_identity_hits. */
+    if (atomic_read(&n_identity_hits))
         n = sus_path_list_puts(buf, n, &trunc,
-                       "!! %d inode(s) hit a rule's exact (dev,ino) with a DIFFERENT inode pointer - the pointer compare in sus_path_inode_hidden() is failing\n",
-                       atomic_read(&n_ino_only));
+                       "identity: %d hit(s) where the inode pointer did not match and (dev,ino) or (fs type,ino) answered instead\n",
+                       atomic_read(&n_identity_hits));
     /* Everything the pending machinery did, so that "still pending" can be read
      * for what it is: passes/ticks == 0 means the retry never ran at all, walks
      * > 0 with pending > 0 means the walk kept failing (last-rc says how), and

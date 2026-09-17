@@ -192,10 +192,20 @@ echo 'clear'                                > /proc/susfs_hide_mounts   # 空前
 | `fail_layer` | 0644 | 诊断：强制指定层初始化失败，用来验证"加载失败不留残留"的回滚路径 |
 | `sus_path_probe` | 0600 | 诊断：`echo <路径> > sus_path_probe` 解析该路径，读回它看到的 inode 指针/`(dev,ino)`/是否在隐藏集合内，以及**每条同 (dev,ino) 规则**自己的 inode 指针、`ptr_equal`、两个 gate 的答案。用于回答"规则登记了、别的规则钩子也在工作、但这个路径仍然可见"——否则只能上内核调试器 |
 
-**关于第二份 procfs 与"重载后的陈旧 inode"**：`self_protect` 规则（本模块自己的节点）按**身份**匹配——**同一文件系统类型 + 同一 inode 号**，而不是按 inode 指针。两个实测场景让指针成为错误的键：
+**匹配键是身份，不是对象**（`sus_path_inode_hidden()`）：inode 指针只是缓存，权威判定是 `(dev, i_ino)`，与挂载层身份表同一套键（`s_dev` + 根 inode 号）。三级：
 
-- 容器（proot/chroot）会挂自己的 `/proc`，它与主 `/proc` 的 `s_dev` 不同（实测 `1048754` vs `20`）但 **inode 号相同**（procfs 的 inode 号来自全局分配器 `proc_alloc_inum`）。不按身份匹配时，节点在容器里 `stat`/`cat` 可见、而列表里名字已被过滤——"列表里没有却打得开"。实测修复后容器里 uid 2000 得到 ENOENT。
-- **快速 `rmmod` + `insmod`**（`ihold()` 只保证 inode 不被释放，**不保证它还挂在 inode hash 上**）：规则可能持有一个读者再也见不到的对象，而同一 `(dev, ino)` 已由新对象承担。实测过一次：`sus_path_probe` 显示 `ptr_equal=0`、`hide_list` 的 `n_ino_only` 变成 1，此时节点对 uid 2000 重新可见（`ls -la /proc/susfs_hide_modules` 直接列出文件）。这是 `rmmod`/`insmod` 窗口里的竞态，不是每次都能复现（3 秒间隔或再重载一次即恢复正常），所以规则改为按身份匹配；普通规则仍只按指针匹配（普通文件系统里两个同类型挂载确实可能有两个同号 inode）。
+| 级 | 条件 | 说明 |
+|---|---|---|
+| 快路径 | `e->inode == inode` | 命中的就是规则当初解析的那个对象，不可能错 |
+| 身份（权威） | `e->dev == i_sb->s_dev && e->ino == inode->i_ino` | 指针落空时的判定；适用于所有规则 |
+| 跨实例（仅 `self_protect`） | 同文件系统类型 + 同 `i_ino` | 同一文件系统的**另一份实例** inode 号相同、`s_dev` 不同（实测容器 `/proc`：同 `4026535268`，dev `1048754` vs 主 `/proc` 的 `20`）；procfs 的 inode 号来自全局分配器，所以这个组合在模块加载期间只可能是本模块的节点。普通规则不给这一级：同类型的两份挂载里同一个 inode 号确实可能代表两个不同文件 |
+
+为什么指针不能单独作为键（两个实测场景）：
+
+- 容器（proot/chroot）挂自己的 `/proc`：不按身份匹配时，节点在容器里 `stat`/`cat` 可见、而列表里名字已被过滤——"列表里没有却打得开"。实测修复后容器里 uid 2000 得到 ENOENT。
+- **快速 `rmmod` + `insmod`**（`ihold()` 只保证 inode 不被释放，**不保证它还挂在 inode hash 上**）：规则可能持有一个读者再也见不到的对象，而同一 `(dev, ino)` 已由新对象承担。实测过一次：`sus_path_probe` 显示 `ptr_equal=0`、`hide_list` 的 `identity` 计数增加，此时节点对 uid 2000 重新可见（`ls -la /proc/susfs_hide_modules` 直接列出文件）。这是 `rmmod`/`insmod` 窗口里的竞态，不是每次都能复现（3 秒间隔或再重载一次即恢复正常）。
+
+`hide_list` 里的 `identity: N hit(s)` 就是**指针未命中、由身份判定回答**的次数——它不是告警（身份是权威键），而是"规则持有的对象已不是读者拿到的那一个"的观测面；稳定增长才值得看。
 
 ## 另见
 
