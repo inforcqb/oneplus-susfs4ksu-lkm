@@ -29,6 +29,7 @@ cat /proc/susfs_hide_modules            # -> No such file or directory
 | [`/proc/susfs_enable_log`](#procsusfs_enable_log) | 运行期日志开关 | `0` / `1` |
 | [`/proc/susfs_avc_spoof`](#procsusfs_avc_spoof) | 隐藏 SELinux AVC 审计日志 | `0` / `1` |
 | [`/proc/susfs_hide_modules`](#procsusfs_hide_modules) | 按名字把**其它内核模块**从 `/proc/modules` 去掉 | `add <名字>` / `del <名字>` / `set <名字>…` / `clear` |
+| [`/proc/susfs_hide_mounts`](#procsusfs_hide_mounts) | 哪些挂载算"我们的"（决定隐藏的挂载集合） | `add <前缀>` / `del <前缀>` / `set <前缀>…` / `reset` / `clear` |
 
 节点只在 sus_path 的 LSM 层装上时才创建（`expose_proc=1` 且 LSM 生效），所以"0777 的世界可写节点 + 没有保护"这个组合不可能出现；`expose_proc=0` 则完全不创建。
 
@@ -143,6 +144,38 @@ echo "add frida" > /sys/module/susfs_guard_lkm/parameters/hide_modules
 
 ---
 
+## /proc/susfs_hide_mounts
+
+决定**哪些挂载算"我们的"**，也就是挂载隐藏（`ksu_susfs hide_sus_mnts_for_non_su_procs 1`）实际会隐藏哪些行。默认前缀只有一个 `/data/adb/`（KernelSU 的模块镜像位置）；容器这类场景要自己加：
+
+```sh
+# root：读回
+cat /proc/susfs_hide_mounts
+# mount prefixes: 2/8, rescans=1, recorded=0, hidden_by_identity=0, learned_ids=0
+# prefixes: /data/adb/ /data/local/tmp/
+
+# 写命令
+echo 'add /data/local/tmp/'                 > /proc/susfs_hide_mounts
+echo 'del /data/local/tmp/'                 > /proc/susfs_hide_mounts
+echo 'set /data/adb/ /data/local/tmp/'      > /proc/susfs_hide_mounts
+echo 'reset'                                > /proc/susfs_hide_mounts   # 回到默认
+echo 'clear'                                > /proc/susfs_hide_mounts   # 空前缀表
+```
+
+| 行为 | 说明 |
+|---|---|
+| 非 root 读到什么 | `No such file or directory`——它和别的 `/proc` 控制节点一样登记在自隐藏集合里，且属 `self_protect`（对**所有**非 root 调用者隐藏，不只是 app） |
+| 前缀怎么比 | **锚定** `strncmp`，不是子串搜索。`/mnt/media_rw/x/data/adb/y` 不算我们的 |
+| 改列表之后 | 立刻重扫当前命名空间（`rescans` +1），已经在挂的路径不用重新启用；之后新建的挂载由 `attach_recursive_mnt` 的 kretprobe 现挂现记 |
+| 上限 | 8 条前缀，每条 128 字节；`add` 重复项返回 0（幂等），`del` 不存在的项返回 `-ENOENT`，表满返回 `-ENOSPC` |
+| 同名 sysfs 参数 | `hide_mounts`（0600），同样命令，另外接受裸列表用于 `insmod ... hide_mounts=/a/,/b/` |
+
+实测（OnePlus SM8550；prefix 加上 `/data/local/tmp/` 后启用；读者＝真实 adb shell，uid 2000、`u:r:shell:s0`）：`/proc/self/mountinfo`、`/proc/mounts`、`/proc/self/mountstats` 里 `ubuntu2` 的行数**各从 4 变 0**，su 侧仍是 4（只对非 su 隐藏）。
+
+挂载层挂了三 kprobe（`show_vfsstat` / `show_mountinfo` / `show_vfsmnt`），各自独立注册，`mount_stat` 的 `show_probes=<n>/3` 显示实际挂上了几条——`3/3` 才是一切正常；只有三条全挂不上才算启用失败。
+
+---
+
 ## 相关：sysfs 参数（同一类接口）
 
 `/sys/module/susfs_guard_lkm/parameters/` 下的参数也是控制面，而且整个目录被 sus_path 自隐藏覆盖（非 root 看不到）。常用的几个：
@@ -157,6 +190,9 @@ echo "add frida" > /sys/module/susfs_guard_lkm/parameters/hide_modules
 | `su_ctx` / `min_mnt_id` / `map_ino` | 0644 | 加载期参数（su 的 SELinux 上下文、KSU 编号段下限、初始映射规则） |
 | `walk_dbg` / `mount_dbg` / `hide_name` / `hide_from_apps` / `no_extra` | 0644 | 诊断与隔离开关 |
 | `fail_layer` | 0644 | 诊断：强制指定层初始化失败，用来验证"加载失败不留残留"的回滚路径 |
+| `sus_path_probe` | 0600 | 诊断：`echo <路径> > sus_path_probe` 解析该路径，读回它看到的 inode 指针/`(dev,ino)`/是否在隐藏集合内，以及**每条同 (dev,ino) 规则**自己的 inode 指针、`ptr_equal`、两个 gate 的答案。用于回答"规则登记了、别的规则钩子也在工作、但这个路径仍然可见"——否则只能上内核调试器 |
+
+**关于第二份 procfs**：容器（proot/chroot）会挂自己的 `/proc`，它和主 `/proc` 的 `s_dev` 不同（实测 `1048754` vs `20`）但 **inode 号相同**（procfs 的 inode 号来自全局分配器）。`self_protect` 规则（本模块自己的节点）因此按"**同一文件系统类型 + 同一 inode 号**"额外匹配，容器里的那份节点同样给出 ENOENT；普通规则仍只按 inode 指针匹配（普通文件系统里两个同类型挂载确实可能有两个同号 inode）。
 
 ## 另见
 

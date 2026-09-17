@@ -37,6 +37,23 @@ ksud insmod /data/local/tmp/susfs_guard_lkm.ko
 rmmod susfs_guard_lkm
 ```
 
+**必须用 `ksud insmod`，不能用裸 `insmod`。** 实测（OnePlus SM8550 / 5.15 vendor 内核）：
+
+```
+# insmod /data/adb/loader/susfs_guard_lkm.ko
+insmod: failed to load ...: No such file or directory
+dmesg:
+  susfs_guard_lkm: module uses symbol (kern_path) from namespace
+      VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver, but does not import it.
+  susfs_guard_lkm: Unknown symbol kern_path (err -22)
+  susfs_guard_lkm: Unknown symbol kallsyms_lookup_name (err -2)
+  ... ihold / override_creds / revert_creds / strnlen_user / task_work_add ...
+```
+
+这里的 `-ENOENT` 是内核模块加载器给出的（`Unknown symbol` 的最后一个 errno），**不是文件不存在**——
+同样的文件用 `ksud insmod` 一次就装上。上面那些符号在 GKI 构建树里是导出的、在这台 vendor 内核上不是，
+KernelSU 的加载器会按它自己的方式把它装进去。所以看到这种报错不要去找文件路径的问题。
+
 ### 怎么判断它是否已经加载（**不要用 `lsmod`**）
 
 模块会把自己的那一行从 `/proc/modules` 里去掉，而且**对所有调用者都一样，root 也不例外**——上游 builtin 内根本没有"模块条目"这回事，只对非 root 隐藏的话，root 的 `lsmod` 仍会留下 builtin 不存在的痕迹。因此：
@@ -103,6 +120,47 @@ camera 10440704 35 explorer, Live 0x0000000000000000 (OE)
 
 要连这一列一起抹掉，需要在 `m_show` 的**返回**处改写那一行（本模块在别处已有这类改写工具），代价是新加一个 kretprobe 与缓冲改写；当前版本不做，按"只有被依赖的模块才会漏"记在这里。
 已知边界：给一个**尚未加载**的模块名时，`/proc/modules` 的行照样会被过滤，但 `/sys/module/<名字>` 此刻还不存在，那条 sus_path 规则加不上——节点里会记 `failed=` 并写出原因，模块加载后重新 `add` 一次即可（或用 `add_sus_path_loop /sys/module/<名字>` 让路径层等它出现）。
+
+## hide_mounts：哪些挂载算"我们的"
+
+上游 builtin SUSFS 识别自己的挂载靠的是 **KSU 范围内的 mnt_id**（`mnt_id >= 2000000000`）：KernelSU 在创建挂载时就分配了这种 id，所以 builtin 只要比一个数就能认出来。LKM 加载时这些挂载早就存在了，于是我们**在加载时扫描命名空间、给匹配的挂载补分配这种 id**（`ida_alloc_min(&mnt_id_ida, ...)`，与内核 `mnt_free_id()` 配对，不是自己编一个数字）。
+
+"匹配"的判据是一份**前缀列表**，默认只有一个：`/data/adb/`（KernelSU 的模块镜像就在那里）。运行期可改，这正是为了容器：
+
+```sh
+# 容器（proot/chroot）在 /data/local/tmp/ubuntu2/ 下挂了 tmpfs/proc/sysfs/devpts
+echo 'add /data/local/tmp/'  > /proc/susfs_hide_mounts
+echo 'set /data/adb/ /data/local/tmp/' > /proc/susfs_hide_mounts   # 或整表替换
+echo 'del /data/local/tmp/'  > /proc/susfs_hide_mounts
+echo reset                   > /proc/susfs_hide_mounts             # 回到默认 /data/adb/
+# insmod 时也可以：susfs_guard_lkm.ko hide_mounts=/data/adb/,/data/local/tmp/
+```
+
+改动列表会**立即重扫当前命名空间**（`mount prefixes: 2/8, rescans=1`），已经在挂的路径不用重新启用；此后新建的挂载由 `attach_recursive_mnt` 的 kretprobe 现挂现记。前缀是**锚定比较**（`strncmp`），不是子串搜索——`/mnt/media_rw/x/data/adb/y` 这种源串不算我们的（实测过，按子串匹配会误伤无关挂载）。
+
+隐藏本身仍按上游的开关，默认**关**：
+
+```sh
+ksu_susfs hide_sus_mnts_for_non_su_procs 1
+```
+
+实测（OnePlus SM8550，prefix 加上 `/data/local/tmp/` 后启用，读者＝真实 adb shell，uid 2000、`u:r:shell:s0`）：
+
+| 文件 | 启用前 | 启用后 |
+|---|---|---|
+| `/proc/self/mountinfo` 里 `ubuntu2` 的行数 | 4 | **0** |
+| `/proc/mounts` | 4 | **0** |
+| `/proc/self/mountstats` | 4 | **0** |
+| su 侧（对照，只对非 su 隐藏） | 4 | 4 |
+
+`mount_stat` 里能读到这件事的状态：
+
+```
+idmap=15/15  ident=5/5  hide=1 su_domain=1
+show_probes=3/3 (show_vfsstat/show_mountinfo/show_vfsmnt)
+```
+
+三条 `show_*` 探针各管一个文件（`show_vfsstat`→mountstats、`show_mountinfo`→mountinfo、`show_vfsmnt`→/proc/mounts），现在**各自独立注册**：某一条挂不上不会带走另外两条，log 里会点名是哪一条、`show_probes` 会显示实际挂上了几条（`3/3` 才是一切正常）。只有三条全挂不上才算启用失败并回 `-EINVAL`。
 
 ## 使用前必读：隐藏 ≠ 访问控制
 
