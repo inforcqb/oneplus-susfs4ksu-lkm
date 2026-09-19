@@ -27,8 +27,9 @@
 #include <linux/module.h>
 #include <linux/kprobes.h>
 #include <linux/fs.h>
-#include <linux/mm.h>		/* struct mm_struct, mm->mmap */
+#include <linux/mm.h>		/* struct mm_struct; sus_map_find_vma() walks its vmas */
 #include <linux/mm_types.h>
+#include <linux/version.h>	/* LINUX_VERSION_CODE: mm->mmap vs mm->mm_mt (6.1) */
 #include <linux/namei.h>
 #include <linux/dcache.h>
 #include <linux/uaccess.h>
@@ -384,6 +385,44 @@ static bool sus_map_walk_answer(struct kprobe *kp, struct pt_regs *regs,
     return true;
 }
 
+/* The VMA container changed in 6.1 and both spellings must answer the same question:
+ * "the first vma whose end is past @start, walking in address order" - i.e. the vma that
+ * contains @start, or the next one after a gap.  The caller compares its result against
+ * vm_start exactly as before.
+ *
+ *   <= 6.0  struct mm_struct.mmap is the head of a doubly linked list, vma->vm_next
+ *           walks it (v6.0 mm_types.h:488 `struct vm_area_struct *mmap;`).
+ *   >= 6.1  that list was replaced by a maple tree: mm_struct.mm_mt (v6.1
+ *           mm_types.h:514), walked with the vma iterator helpers VMA_ITERATOR() /
+ *           for_each_vma() (v6.1 mm_types.h:810, mm.h:689).  This is why
+ *           "no member named 'mmap' in 'struct mm_struct'" and "no member named
+ *           'vm_next' in 'struct vm_area_struct'" appeared on android14-6.1 and
+ *           android15-6.6.
+ *
+ * Both forms are header-only (macros and static inlines), so neither needs a kernel
+ * symbol.  mmap_lock is held for read by every caller, as the walk itself requires. */
+static struct vm_area_struct *sus_map_find_vma(struct mm_struct *mm, unsigned long start)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	struct vm_area_struct *vma;
+	VMA_ITERATOR(vmi, mm, 0);
+
+	for_each_vma(vmi, vma) {
+		if (start < vma->vm_end)
+			return vma;
+	}
+	return NULL;
+#else
+	struct vm_area_struct *vma;
+
+	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+		if (start < vma->vm_end)
+			break;
+	}
+	return vma;
+#endif
+}
+
 /* walk_dbg >= 2: dump the resolution of the first few walks that got past the ops
  * test, so "no vma for (mm, start)" can be told apart from "the vma is not the
  * one we expected" without guessing. */
@@ -394,16 +433,18 @@ static void sus_map_walk_dbg_log(const char *what, struct mm_struct *mm,
         return;
     if (atomic_dec_if_positive(&n_walk_dbg_left) < 0)
         return;
+    /* The list head this used to print is `mm->mmap`; sus_map_find_vma(mm, 0) is that
+     * same vma (the first one, since vm_end is never 0) in either container. */
     SUSFS_LOGI("sus_map: %s mm=%px start=%lx mmap=%px vma=%px %lx-%lx file=%px\n",
-            what, mm, start, mm ? mm->mmap : NULL, vma,
+            what, mm, start, mm ? sus_map_find_vma(mm, 0) : NULL, vma,
             vma ? vma->vm_start : 0UL, vma ? vma->vm_end : 0UL,
             (vma && vma->vm_file) ? vma->vm_file : NULL);
 }
 
 /* walk_page_range(mm, start, end, ops, private): the vma has to be resolved from
  * (mm, start), which is what the walk itself would have done - mmap_lock is held
- * for read by every caller of these three ops, so the list this walks cannot be
- * changed underneath it. */
+ * for read by every caller of these three ops, so the container this walks (the vma
+ * list before 6.1, the vma maple tree from 6.1) cannot change underneath it. */
 static int sus_map_skip_walk_pre(struct kprobe *kp, struct pt_regs *regs)
 {
     const void *ops = (const void *)regs->regs[3];
@@ -426,10 +467,7 @@ static int sus_map_skip_walk_pre(struct kprobe *kp, struct pt_regs *regs)
     if (!mm)
         return 0;
 
-    for (vma = mm->mmap; vma; vma = vma->vm_next) {
-        if (start < vma->vm_end)
-            break;
-    }
+    vma = sus_map_find_vma(mm, start);
     if (!vma || start < vma->vm_start) {
         /* start is in a gap: nothing to hide */
         atomic_inc(&n_walk_scan_fail);

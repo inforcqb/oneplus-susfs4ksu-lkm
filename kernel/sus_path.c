@@ -62,6 +62,7 @@
 #include <linux/atomic.h>
 #include <linux/proc_fs.h>	/* proc_create() for /proc/susfs_path */
 #include <linux/seq_file.h>	/* single_open()/seq_write() for the same node */
+#include <linux/version.h>	/* LINUX_VERSION_CODE: the setxattr hook's first argument */
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
@@ -778,14 +779,54 @@ static struct ksu_lsm_hook sus_path_link_hook = KSU_LSM_HOOK_INIT(
  *
  * inode_setattr is the one that also closes the error-code leak: without it an app
  * got EPERM or EACCES from the owner check, which says the file exists. */
+/* ---- the setxattr/removexattr FIRST argument, per kernel version ----
+ *
+ * These two hooks are the only ones in this file whose first parameter is not a
+ * dentry/inode/path: it is the id-mapping the syscall came in through, and its type has
+ * moved twice.  Upstream (include/linux/lsm_hook_defs.h at each tag):
+ *
+ *   v5.11  LSM_HOOK(int, 0, inode_setxattr, struct dentry *dentry, ...)
+ *          -> no first argument at all
+ *   v5.12  LSM_HOOK(int, 0, inode_setxattr, struct user_namespace *mnt_userns, ...
+ *          -> added together with idmapped mounts
+ *   v6.3   LSM_HOOK(int, 0, inode_setxattr, struct mnt_idmap *idmap, ...
+ *          -> `struct mnt_idmap` replaced `struct user_namespace *mnt_userns` as the
+ *             idmap carrier ("fs: add mnt_idmap"); 6.2 still has mnt_userns, and no
+ *             6.1/5.15 Android tree has the new type either.
+ *
+ * The trees this module is built against agree with those tags - android12-5.10
+ * declares no first argument, android13-5.15/android14-6.1 declare
+ * `struct user_namespace *mnt_userns`, android15-6.6 declares `struct mnt_idmap *idmap`
+ * (the "Show authoritative LSM hook signatures" step prints them per variant).  The
+ * static_asserts below are what makes this gate self-checking: a wrong branch here is a
+ * build failure against that tree, never a silently mis-typed hook (a mismatched
+ * signature is a kCFI panic at load time, not a warning).
+ *
+ * Three spellings are needed because the macro has to work in a parameter list (with a
+ * name), in a function-pointer type (no name) and as the leading call argument - and in
+ * the pre-5.12 case all three must vanish completely. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+#define SUS_XATTR_MNT_ID_DECL	struct mnt_idmap *idmap,
+#define SUS_XATTR_MNT_ID_TYPE	struct mnt_idmap *,
+#define SUS_XATTR_MNT_ID_ARG	idmap,
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+#define SUS_XATTR_MNT_ID_DECL	struct user_namespace *mnt_userns,
+#define SUS_XATTR_MNT_ID_TYPE	struct user_namespace *,
+#define SUS_XATTR_MNT_ID_ARG	mnt_userns,
+#else	/* before idmapped mounts the hook never received an id mapping */
+#define SUS_XATTR_MNT_ID_DECL
+#define SUS_XATTR_MNT_ID_TYPE
+#define SUS_XATTR_MNT_ID_ARG
+#endif
+
 static int sus_path_sb_statfs(struct dentry *dentry);
 static int sus_path_inode_setattr(struct dentry *dentry, struct iattr *attr);
 static int sus_path_inode_getxattr(struct dentry *dentry, const char *name);
 static int sus_path_inode_listxattr(struct dentry *dentry);
-static int sus_path_inode_setxattr(struct user_namespace *mnt_userns,
+static int sus_path_inode_setxattr(SUS_XATTR_MNT_ID_DECL
 				   struct dentry *dentry, const char *name,
 				   const void *value, size_t size, int flags);
-static int sus_path_inode_removexattr(struct user_namespace *mnt_userns,
+static int sus_path_inode_removexattr(SUS_XATTR_MNT_ID_DECL
 				      struct dentry *dentry, const char *name);
 static int sus_path_path_notify(const struct path *path, u64 mask,
 				unsigned int obj_type);
@@ -1153,31 +1194,31 @@ static int sus_path_inode_listxattr(struct dentry *dentry)
     return orig(dentry);
 }
 
-static int sus_path_inode_setxattr(struct user_namespace *mnt_userns,
+static int sus_path_inode_setxattr(SUS_XATTR_MNT_ID_DECL
 				   struct dentry *dentry, const char *name,
 				   const void *value, size_t size, int flags)
 {
-    int (*orig)(struct user_namespace *, struct dentry *, const char *,
+    int (*orig)(SUS_XATTR_MNT_ID_TYPE struct dentry *, const char *,
                 const void *, size_t, int) = (void *)sus_path_setxattr_hook.original;
 
     if (sus_path_dentry_hidden(dentry))
         return sus_path_meta_hit();
     if (!orig)
         return -EACCES;
-    return orig(mnt_userns, dentry, name, value, size, flags);
+    return orig(SUS_XATTR_MNT_ID_ARG dentry, name, value, size, flags);
 }
 
-static int sus_path_inode_removexattr(struct user_namespace *mnt_userns,
+static int sus_path_inode_removexattr(SUS_XATTR_MNT_ID_DECL
 				      struct dentry *dentry, const char *name)
 {
-    int (*orig)(struct user_namespace *, struct dentry *, const char *) =
+    int (*orig)(SUS_XATTR_MNT_ID_TYPE struct dentry *, const char *) =
         (void *)sus_path_removexattr_hook.original;
 
     if (sus_path_dentry_hidden(dentry))
         return sus_path_meta_hit();
     if (!orig)
         return -EACCES;
-    return orig(mnt_userns, dentry, name);
+    return orig(SUS_XATTR_MNT_ID_ARG dentry, name);
 }
 
 static int sus_path_path_notify(const struct path *path, u64 mask, unsigned int obj_type)

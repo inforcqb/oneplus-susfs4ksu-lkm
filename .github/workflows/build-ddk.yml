@@ -107,6 +107,29 @@ jobs:
           echo "=== struct security_hook_list fields (the lsm field changed over releases) ==="
           sed -n '/^struct security_hook_list {/,/} __randomize_layout/p' "$H/include/linux/lsm_hooks.h"
 
+      - name: Show per-version spellings of the non-LSM APIs the module uses
+        run: |
+          set -e
+          V="${{ matrix.variant }}"
+          T=""
+          for d in "${KERNEL_SRC:-}" "${KDIR:-}" "/opt/ddk/src/$V" "/opt/ddk/kdir/$V" /opt/ddk/src/* /opt/ddk/kdir/*; do
+            if [ -n "$d" ] && [ -f "$d/include/linux/lsm_hooks.h" ]; then T="$d"; break; fi
+          done
+          echo "=== kernel tree: $T ==="
+          echo "--- LINUX_VERSION_CODE (from the tree's own utsrelease.h) ---"
+          cat "$T/include/generated/utsrelease.h" 2>/dev/null || true
+          echo "--- inode timestamps (i_ctime became __i_ctime + inode_get_ctime() in 6.6) ---"
+          grep -nE 'i_atime;|i_mtime;|_i_ctime;|inode_get_ctime|inode_set_ctime' "$T/include/linux/fs.h" | head -8 || true
+          echo "--- the mm's vma container (mm->mmap list before 6.1, mm->mm_mt from 6.1) ---"
+          grep -nE 'struct vm_area_struct \*mmap;|struct maple_tree mm_mt;' "$T/include/linux/mm_types.h" || true
+          grep -nE '^#define VMA_ITERATOR|^#define for_each_vma' "$T/include/linux/mm_types.h" "$T/include/linux/mm.h" || true
+          echo "--- kallsyms_on_each_symbol (its callback lost the struct module * in 6.5) ---"
+          grep -nA3 'kallsyms_on_each_symbol' "$T/include/linux/kallsyms.h" | head -12 || true
+          echo "--- task_work_add notify modes ---"
+          grep -nE 'TWA_RESUME|task_work_add' "$T/include/linux/task_work.h" || true
+          echo "--- kvmalloc()/kvfree() ---"
+          grep -nE 'void \*kvmalloc\(|void kvfree\(' "$T/include/linux/mm.h" "$T/include/linux/slab.h" || true
+
       - name: Build susfs_guard_lkm.ko (DDK way)
         run: |
           set -e
@@ -116,7 +139,12 @@ jobs:
           # and `modules` was "command not found", masked by the pipe into tail).  It only
           # worked because the image exports ARCH/LLVM - i.e. the build silently depended
           # on the image.
-          make -C "$KDIR" M="$PWD/kernel" ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules -j"$(nproc)"
+          #
+          # -k (keep going) because one broken object used to hide every later one: with
+          # plain `make`, the first failure in a parallel wave ends the build, so a variant
+          # reported its errors one CI round at a time.  -k still exits nonzero when
+          # anything failed - it only changes how much of the failure is reported.
+          make -k -C "$KDIR" M="$PWD/kernel" ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules -j"$(nproc)"
           ls -la kernel/susfs_guard_lkm.ko
           file kernel/susfs_guard_lkm.ko
 

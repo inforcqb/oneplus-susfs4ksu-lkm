@@ -108,6 +108,7 @@
 #include <linux/rcupdate.h>
 #include <linux/spinlock.h>
 #include <linux/slab.h>
+#include <linux/mm.h>		/* kvmalloc()/kvfree() for the keep-list staging buffers */
 #include <linux/string.h>
 #include <linux/list.h>
 #include <linux/idr.h>      /* struct ida + ida_alloc_range()/ida_free() prototypes */
@@ -1473,15 +1474,33 @@ static void sus_mount_keep_rescan(void)
  *   add <prefix> | del <prefix> | set <prefix>... | reset | clear
  * `reset` restores the built-in default (/data/adb/); `clear` leaves no prefix at
  * all, which stops NEW mounts from being accepted while the KSU mounts stay hidden by
- * their ids.  @bare_list is for the insmod form of the parameter only. */
+ * their ids.  @bare_list is for the insmod form of the parameter only.
+ *
+ * The two staging buffers (1072 + 1024 bytes) used to be locals, which made this
+ * function's frame 2192 bytes and 6.6 rejects that outright:
+ *   "error: stack frame size (2192) exceeds limit (2048) in 'sus_mount_keep_command'
+ *    [-Werror,-Wframe-larger-than]"
+ * (-Wframe-larger-than is an error in the 6.6 GKI build.)  They are allocated instead:
+ * every caller here is a proc/sysfs write handler or module_param setter, i.e. process
+ * context that may sleep, so GFP_KERNEL is safe.  The command semantics are unchanged -
+ * the only structural difference is that the early returns now go through @out. */
 static int sus_mount_keep_command(const char *val, bool bare_list)
 {
-	char cmd[SUS_MOUNT_KEEP_CMDLINE];
-	char staged[SUS_MOUNT_KEEP_MAX][SUS_MOUNT_KEEP_LEN];
+	char *cmd;
+	char (*staged)[SUS_MOUNT_KEEP_LEN];
 	const char *arg;
 	int i, n;
+	int rc = 0;
 
-	strscpy(cmd, val, sizeof(cmd));
+	cmd = kvmalloc(SUS_MOUNT_KEEP_CMDLINE, GFP_KERNEL);
+	staged = kvmalloc_array(SUS_MOUNT_KEEP_MAX, SUS_MOUNT_KEEP_LEN, GFP_KERNEL);
+	if (!cmd || !staged) {
+		kvfree(cmd);
+		kvfree(staged);
+		return -ENOMEM;
+	}
+
+	strscpy(cmd, val, SUS_MOUNT_KEEP_CMDLINE);
 	for (i = (int)strlen(cmd) - 1; i >= 0 && (cmd[i] == '\n' || cmd[i] == '\r' || cmd[i] == ' '); i--)
 		cmd[i] = '\0';
 
@@ -1490,21 +1509,23 @@ static int sus_mount_keep_command(const char *val, bool bare_list)
 		sus_mount_keep_commit(staged, 1);
 		sus_mount_keep_rescan();
 		SUSFS_LOGI("sus_mount: prefix list reset to the default\n");
-		return 0;
+		goto out;
 	}
 	if (!strcmp(cmd, "clear")) {
 		sus_mount_keep_commit(staged, 0);
 		SUSFS_LOGI("sus_mount: prefix list cleared (no new mount is accepted by path)\n");
-		return 0;
+		goto out;
 	}
 	if (!strncmp(cmd, "set ", 4)) {
 		n = sus_mount_keep_parse(cmd + 4, staged, SUS_MOUNT_KEEP_MAX);
-		if (n < 0)
-			return n;
+		if (n < 0) {
+			rc = n;
+			goto out;
+		}
 		sus_mount_keep_commit(staged, n);
 		sus_mount_keep_rescan();
 		SUSFS_LOGI("sus_mount: prefix list set to %d entr(ies)\n", n);
-		return 0;
+		goto out;
 	}
 	if (!strncmp(cmd, "add ", 4) || !strncmp(cmd, "del ", 4)) {
 		bool adding = (cmd[0] == 'a');
@@ -1512,8 +1533,10 @@ static int sus_mount_keep_command(const char *val, bool bare_list)
 		arg = cmd + 4;
 		while (*arg == ' ')
 			arg++;
-		if (!*arg || strlen(arg) >= SUS_MOUNT_KEEP_LEN)
-			return -EINVAL;
+		if (!*arg || strlen(arg) >= SUS_MOUNT_KEEP_LEN) {
+			rc = -EINVAL;
+			goto out;
+		}
 
 		spin_lock(&mount_keep_lock);
 		n = n_mount_keep;
@@ -1530,7 +1553,7 @@ static int sus_mount_keep_command(const char *val, bool bare_list)
 					continue;
 				found = true;
 				if (adding)
-					return 0;
+					goto out;
 				memmove(&staged[i], &staged[i + 1],
 					(size_t)(n - i - 1) * SUS_MOUNT_KEEP_LEN);
 				n--;
@@ -1538,30 +1561,41 @@ static int sus_mount_keep_command(const char *val, bool bare_list)
 			}
 			if (adding) {
 				if (found)
-					return 0;
-				if (n >= SUS_MOUNT_KEEP_MAX)
-					return -ENOSPC;
+					goto out;
+				if (n >= SUS_MOUNT_KEEP_MAX) {
+					rc = -ENOSPC;
+					goto out;
+				}
 				strscpy(staged[n], arg, SUS_MOUNT_KEEP_LEN);
 				n++;
 			} else if (!found) {
-				return -ENOENT;
+				rc = -ENOENT;
+				goto out;
 			}
 		}
 		sus_mount_keep_commit(staged, n);
 		sus_mount_keep_rescan();
 		SUSFS_LOGI("sus_mount: %s %s -> %d prefix(es)\n", adding ? "add" : "del", arg, n);
-		return 0;
+		goto out;
 	}
 
-	if (!bare_list)
-		return -EINVAL;
+	if (!bare_list) {
+		rc = -EINVAL;
+		goto out;
+	}
 	n = sus_mount_keep_parse(cmd, staged, SUS_MOUNT_KEEP_MAX);
-	if (n < 0)
-		return n;
+	if (n < 0) {
+		rc = n;
+		goto out;
+	}
 	sus_mount_keep_commit(staged, n);
 	sus_mount_keep_rescan();
 	SUSFS_LOGI("sus_mount: prefix list set to %d entr(ies)\n", n);
-	return 0;
+
+out:
+	kvfree(staged);
+	kvfree(cmd);
+	return rc;
 }
 
 static int sus_mount_keep_format(char *buf, size_t size)

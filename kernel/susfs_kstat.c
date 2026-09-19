@@ -50,6 +50,7 @@
 #include <linux/kdev_t.h>
 #include <linux/string.h>
 #include <linux/cred.h>
+#include <linux/version.h>	/* LINUX_VERSION_CODE: the inode ctime accessor */
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc */
@@ -895,6 +896,14 @@ static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *pat
 	struct path p;
 	struct inode *inode;
 	int err;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+	/* 6.6 renamed the inode field to __i_ctime and marked it private ("use
+	 * inode_*_ctime accessors!"), so reading it stopped compiling:
+	 * "no member named 'i_ctime' in 'struct inode'".  inode_get_ctime() returns the
+	 * very same struct timespec64 by value.  i_atime/i_mtime were NOT renamed in
+	 * 6.6, so those two keep being read directly. */
+	struct timespec64 ctime;
+#endif
 
 	err = kern_path(path, 0, &p);
 	if (err)
@@ -904,6 +913,10 @@ static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *pat
 		path_put(&p);
 		return -ENOENT;
 	}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+	ctime = inode_get_ctime(inode);
+#endif
 
 	e->target_ino = inode->i_ino;
 	e->target_dev = new_encode_dev(inode->i_sb->s_dev);
@@ -915,8 +928,13 @@ static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *pat
 	e->spoofed_atime_tv_nsec = inode->i_atime.tv_nsec;
 	e->spoofed_mtime_tv_sec = inode->i_mtime.tv_sec;
 	e->spoofed_mtime_tv_nsec = inode->i_mtime.tv_nsec;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+	e->spoofed_ctime_tv_sec = ctime.tv_sec;
+	e->spoofed_ctime_tv_nsec = ctime.tv_nsec;
+#else
 	e->spoofed_ctime_tv_sec = inode->i_ctime.tv_sec;
 	e->spoofed_ctime_tv_nsec = inode->i_ctime.tv_nsec;
+#endif
 	e->spoofed_blocks = inode->i_blocks;
 	e->spoofed_blksize = 1 << inode->i_blkbits;
 
