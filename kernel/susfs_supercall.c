@@ -101,6 +101,20 @@ static const struct feature_entry enabled_features[] = {
 	{ "SUSFS_GUARD_LKM_HIDE_MODULES\n",	susfs_hide_modules_active },
 };
 
+/* The -ENOMEM answer for CMD_SUSFS_SHOW_ENABLED_FEATURES is the whole ABI struct - the
+ * 8192-byte feature string plus err - and it is copied to userspace in one piece.
+ *
+ * It used to be a local, and that is what broke the 6.1/6.6 builds:
+ *   "error: stack frame size (8320) exceeds limit (2048) in 'susfs_tw_func'
+ *    [-Werror,-Wframe-larger-than]"
+ * (-Wframe-larger-than is an error in those GKI builds.)  susfs_tw_func() is the only
+ * caller and its switch inlines this path, so the 8 KiB landed in the dispatcher's own
+ * frame - and the dispatcher is reached from task_work, on a kernel stack that must not
+ * carry 8 KiB of spare.  The struct is a static instead: its content is the same for
+ * every caller (payload zeroed by BSS, err = -ENOMEM), and err is written with one
+ * constant, so sharing it is harmless. */
+static struct st_susfs_enabled_features susfs_enabled_features_nomem;
+
 static void susfs_show_enabled_features(void __user **arg)
 {
 	struct st_susfs_enabled_features *info;
@@ -114,10 +128,9 @@ static void susfs_show_enabled_features(void __user **arg)
 		 * is a zeroed struct, so userspace cannot tell "no memory" from "the
 		 * kernel said nothing".  Report it in the only field the ABI reserves
 		 * for it; task_work context, so the copy is allowed to sleep. */
-		struct st_susfs_enabled_features fallback = {0};
-
-		fallback.err = -ENOMEM;
-		if (copy_to_user((void __user *)*arg, &fallback, sizeof(fallback)))
+		susfs_enabled_features_nomem.err = -ENOMEM;
+		if (copy_to_user((void __user *)*arg, &susfs_enabled_features_nomem,
+				 sizeof(susfs_enabled_features_nomem)))
 			pr_warn("susfs show_enabled_features copy_to_user failed\n");
 		pr_warn_ratelimited("susfs: show_enabled_features kzalloc failed, reported -ENOMEM\n");
 		return;
