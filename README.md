@@ -12,36 +12,14 @@ SUSFS 的**可加载内核模块（LKM）移植版**：让锁定 bootloader、�
 
 ## 功能
 
-- **kprobe / kretprobe**：挂非导出内核符号的入口与出口（`/proc/mounts`、`/proc/<pid>/mountinfo`、`getdents64`、`statx` 等）。
-- **`patch_memory`**：改写只读内核内存与 fixmap（文本补丁原语）。
-- **`lsm_hook`**：LSM 挂载本身，两条路：
-  - `sus_path` 的 13 个 hook 走**头插** —— 把自己的 `struct security_hook_list` 节点插到 `security_hook_heads`
-    对应链表的**头部**（在 SELinux 之前），返回 0 让内核链继续调用 SELinux。因此不需要解析、也不需要回调
-    SELinux 的原函数，也就不依赖各版本 CFI 方案下那个槽位里放的是什么（5.10/5.15 的 `.cfi_jt` 蹦床、6.1+ 的 kCFI hash）；
-    插入的 hook 只可能增加拒绝，不会吞掉其它 LSM 的结论。
-  - 其余 hook 走"替换槽位 + 保存原函数回调"（`hook->insert` 未置位时）。
-  - 两条路都用 `__nocfi` 包住本模块发起的间接调用。
-- **`symbol_resolver`**：运行期按名字解析内核符号（kallsyms 遍历 + kprobe 自举），所以模块可以直接引用未导出符号。
-- **`sus_path`**：按路径隐藏（inode 层 + dirent 层 + name 操作），支持 `add` / `del` / `clear`；身份键为 `(dev, ino)`，
-  inode 指针只作快路径缓存；注册时把目标 inode 放宽到 0777，删除时恢复。
-- **`hide_modules`**：按名字把其它内核模块从 `/proc/modules`、`/sys/module/<名字>`、`/proc/kallsyms` 去掉。
-- **`hide_mounts`**：可配置的挂载前缀表（决定哪些挂载算"我们的"），配合 `hide_sus_mnts_for_non_su_procs` 对非 su 进程隐藏。
-- **`sus_mount`**：`statx` / `fdinfo` 的 `mnt_id` 改写、挂载表过滤、跨命名空间同步。
-- **`sus_map`**：映射层（`maps` / `smaps` / `pagemap`）。
-- **`sus_kstat`**、**`open_redirect`**、**`spoof_cmdline`**、**`avc_spoof`**、**`uname`**：对应上游各特性。
-- **控制面**：`/proc/susfs_*` 节点 + 同名 sysfs 参数 + KernelSU 超调用；节点由模块自隐藏，非 root 一律 `ENOENT`。
-- **六份 GKI 产物**：`android12-5.10` / `android13-5.10` / `android13-5.15` / `android14-5.15` / `android14-6.1` /
-  `android15-6.6`，每棵树的 hook 原型与 API 差异按版本门控。
-- **自带用户态加载器** `susfs_insmod`：不需要 KernelSU，也不需要内核补丁。
+`lsm_hook`：LSM 挂载本身，两条路：
 
-两个必须知道的取舍：
-
-- **隐藏 ≠ 访问控制。** 本模块让路径名不可见（`ENOENT`），但不拦不经过路径名的通道：已经打开的 fd、注册规则之前
-  持有的引用、注册前的硬链接/bind mount、以及按 `(dev, ino)` 工作的接口（`map_files`、`maps` 的 inode 面）。
-  **不要用它保护真正敏感的数据。** 门控是 `uid >= 10000 且不是文件属主`：root、system(1000)、shell(2000) 本来就能看到
-  全部隐藏路径，这是上游语义，不是漏洞。
-- **隐藏路径的"存在性"仍可被测出。** 我们的拒绝发生在 DAC/SELinux 之前，返回耗时接近"路径存在"那一类；这个差值
-  主要来自内核本身（正 dentry 比负 dentry 贵），但它仍给出 1 bit："这个我猜得到名字的路径存在、只是被拒了"。
+- `sus_path` 的 13 个 hook 走**头插** —— 把自己的 `struct security_hook_list` 节点插到 `security_hook_heads`
+  对应链表的**头部**（在 SELinux 之前），返回 0 让内核链继续调用 SELinux。因此不需要解析、也不需要回调
+  SELinux 的原函数，也就不依赖各版本 CFI 方案下那个槽位里放的是什么（5.10/5.15 的 `.cfi_jt` 蹦床、6.1+ 的 kCFI hash）；
+  插入的 hook 只可能增加拒绝，不会吞掉其它 LSM 的结论。
+- 其余 hook 走"替换槽位 + 保存原函数回调"（`hook->insert` 未置位时）。
+- 两条路都用 `__nocfi` 包住本模块发起的间接调用。
 
 ## 加载
 
@@ -53,7 +31,7 @@ SUSFS 的**可加载内核模块（LKM）移植版**：让锁定 bootloader、�
 ksud insmod /data/adb/loader/susfs_guard_lkm.ko
 ```
 
-**非 KernelSU 设备**：用 release 附带的加载器 `susfs_insmod`（不需要 KernelSU，也不需要内核补丁）：
+**非 KernelSU 设备**：用 release 附带的加载器 `susfs_insmod`：
 
 ```sh
 susfs_insmod /data/adb/loader/susfs_guard_lkm.ko
