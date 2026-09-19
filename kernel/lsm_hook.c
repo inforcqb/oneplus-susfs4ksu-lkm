@@ -23,7 +23,6 @@
  */
 #include <linux/compiler.h>
 #include <linux/errno.h>
-#include <linux/kallsyms.h>
 #include <linux/kernel.h>
 #include <linux/lsm_hooks.h>
 #include <linux/mutex.h>
@@ -381,11 +380,15 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
     }
 
     if (scalls_count == 0) {
+        /* sym_size is deliberately just sizeof() and not kallsyms_lookup_size_offset(),
+         * for the same reason the <6.12 branch below gives: that symbol is UNEXPORTED in
+         * every GKI tree this module targets, so importing it would make the module
+         * unloadable by a plain `insmod` (unknown symbol) - and it is the fifth name the
+         * "Verify sections" CI step now refuses in the .ko's undefined list.  It is also
+         * the same number: static_calls_table IS one struct lsm_static_calls_table, and
+         * the fallback when the lookup failed was already this struct size. */
         unsigned long sym_size = sizeof(struct lsm_static_calls_table);
         u32 lsm_active_cnt = 5;
-        if (!kallsyms_lookup_size_offset(scalls_addr, &sym_size, NULL)) {
-            pr_err("failed to get size\n");
-        }
         unsigned long addr = find_kernel_symbol_exact("lsm_active_cnt");
         if (!addr) {
             pr_err("failed to get lsm_active_cnt\n");

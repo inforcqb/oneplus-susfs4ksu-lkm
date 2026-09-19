@@ -200,6 +200,23 @@ jobs:
             exit 1
           }
 
+          echo "--- no kallsyms_* link-time dependency (regression gate) ---"
+          # These five are resolved at RUNTIME by name (kprobe bootstrap, see
+          # kernel/symbol_resolver.c) and must never appear in this artifact's undefined
+          # list.  Measured reason: on a 6.1 device whose KernelSU is a module, all five are
+          # provided by kernelsu.ko, so an import makes this module refuse to load on a
+          # device without KernelSU - the exact opposite of why it ships its own loader
+          # (tools/susfs_insmod.c).  Asserted on the ARTIFACT rather than trusted from the
+          # source, because that is where a regressed import would actually appear.
+          nm -u "$f" | wc -l | sed 's/^/  undefined symbols total: /'
+          ks=$(nm -u "$f" | grep -cE '(^| )(kallsyms_lookup_name|kallsyms_lookup|kallsyms_lookup_size_offset|kallsyms_on_each_symbol|kallsyms_on_each_match_symbol)$' || true)
+          echo "  undefined kallsyms-ish symbols: $ks (must be 0)"
+          if [ "$ks" != "0" ]; then
+            echo "::error::$f imports $ks kallsyms_* symbol(s): they must be bootstrapped at runtime, not linked against"
+            nm -u "$f" | grep -E '(^| )(kallsyms_lookup_name|kallsyms_lookup|kallsyms_lookup_size_offset|kallsyms_on_each_symbol|kallsyms_on_each_match_symbol)$' || true
+            exit 1
+          fi
+
       - name: Upload .ko
         uses: actions/upload-artifact@v4
         with:
