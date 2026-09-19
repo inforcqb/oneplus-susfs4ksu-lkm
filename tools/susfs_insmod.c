@@ -1078,7 +1078,7 @@ void insmod_main(long argc, char **argv)
 		o_flush();
 	}
 
-	/* ---- init_module(2) ---- */
+	/* init_module(2) ---- */
 	o_put(P "init_module(");
 	o_dec((u64)size);
 	o_put(" bytes, ");
@@ -1088,8 +1088,12 @@ void insmod_main(long argc, char **argv)
 	o_put("\")\n");
 	o_flush();
 
+	/* param_values is NEVER NULL, not even with no parameters: load_module() calls
+	 * strndup_user(uargs, ...) unconditionally (5.15 kernel/module.c:4046), and
+	 * strndup_user(NULL) is -EFAULT.  ksud passes a CStr for the same reason.  The
+	 * buffer below is static and always NUL-terminated, so "" is a valid argument. */
 	ret = sys6(SYS_init_module, (sysarg)img, (sysarg)size,
-		   plen ? (sysarg)params : 0, 0, 0, 0);
+		   (sysarg)params, 0, 0, 0);
 
 	if (ret < 0) {
 		u64 vlen = 0;
@@ -1175,7 +1179,7 @@ void insmod_main(long argc, char **argv)
 
 		retried = 1;
 		ret = sys6(SYS_init_module, (sysarg)img, (sysarg)size,
-			   plen ? (sysarg)params : 0, 0, 0, 0);
+			   (sysarg)params, 0, 0, 0);
 		if (ret < 0) {
 			sysarg e2 = -ret;
 
