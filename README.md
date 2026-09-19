@@ -193,7 +193,7 @@ show_probes=3/3 (show_vfsstat/show_mountinfo/show_vfsmnt)
 
 `sus_path` 隐藏一个路径时，会**把这个 inode 的权限位放宽到 0777**。这不是疏忽，是必须的：
 
-`inode_permission()` 先做 DAC 再进 LSM 链，所以一个 0600 的目标在 DAC 层就被回 `EACCES`——"这文件存在，只是你没权限"——LSM 层根本没有机会把它变成 `ENOENT`。实测过：`ls -l` 得到 `No such file or directory`（`inode_getattr` 生效），而 `cat` 得到 `Permission denied`，且 perm 计数保持 0。所以只能让 DAC 放行，把唯一的判断留给 LSM 层。
+`inode_permission()` 先做 DAC 再进 LSM 链，所以一个 0600 的目标在 DAC 层就被回 `EACCES`——"这文件存在，只是你没权限"——LSM 层根本没有机会把它变成 `ENOENT`。这就是为什么注册一条规则会把目标放宽到 0777：让 DAC 放行，把唯一的判断留给 LSM 层。
 
 由此带来几个**必须知道**的后果：
 
