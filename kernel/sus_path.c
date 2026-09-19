@@ -464,7 +464,7 @@ static bool sus_path_is_hidden(u64 ino, const char *name)
  * The LKM has no zygote hook, so the equivalent is:
  *   - the rule is registered immediately with inode == NULL ("pending").  A
  *     pending rule has no inode, so NOTHING hides it yet: the dirent filter needs
- *     (ino, name) and the LSM slots need the inode.  What it does have is a place
+ *     (ino, name) and the LSM hooks need the inode.  What it does have is a place
  *     in the table, so the path is hidden from the moment this loop resolves it;
  *   - sus_path_resolve_pending() retries the lookup in sleepable context: from
  *     sus_path_supercall() (every add is a retry opportunity, which is what the
@@ -2214,7 +2214,7 @@ int sus_path_init(void)
         for (i = 0; i < (int)ARRAY_SIZE(extra); i++) {
             rc = ksu_register_lsm_hook(extra[i]);
             if (rc) {
-                /* Not fatal - the core two slots are up, so a hidden path is still
+                /* Not fatal - the core two hooks are up, so a hidden path is still
                  * hidden - but it means one class of operation is NOT covered
                  * (deleting it, or probing it through statfs/xattr/inotify), so it
                  * is counted and named in hide_list rather than only logged. */
@@ -2282,7 +2282,8 @@ void sus_path_exit(void)
 
     /* Unregister the hooks FIRST: after this nothing can match, so the entries
      * (and their inode references) can be torn down safely.  The dirent kretprobes
-     * are the only hooks armed after init; everything else here is an LSM slot. */
+     * are the only hooks armed after init; everything else here is an LSM hook list
+     * node of ours, inserted at the head of its list. */
     sus_path_dirent_unregister();
 
     /* The retry timer must be off, and no resolution pass may be in flight while
@@ -2363,7 +2364,7 @@ void sus_path_exit(void)
  *
  * A pending rule is not dead weight: it holds its place in the table, so the path is
  * hidden from the moment the background walk resolves its inode.  What the pending
- * state delays is every layer - the LSM slots (by inode) and the dirent filter
+ * state delays is every layer - the LSM hooks (by inode) and the dirent filter
  * ((ino, name)) - because none of them can match an inode that does not exist yet. */
 void sus_path_supercall(unsigned int cmd, void __user **arg)
 {
