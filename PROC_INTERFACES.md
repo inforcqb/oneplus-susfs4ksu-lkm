@@ -243,7 +243,60 @@ echo clear               > /proc/susfs_path     # 清掉所有**普通**规则
 
 **残留风险（已知边界）**：第 2 级对**所有**规则生效，所以如果某条规则持有的 inode 真的被解除 hash、而它的号又被同一超级块里的另一个文件拿走，那条规则会连带隐藏那个文件（过度隐藏，不是泄漏）。这要求"规则的对象被孤立"这一事件发生在**普通规则**上——目前只在 procfs 控制节点上实测到过（它们的 `proc_dir_entry` 会被移除），没有在普通文件上复现过；观测面就是 `identity` 计数与 `sus_path_probe` 的 `ptr_equal`。要彻底消除这一项，只能让规则在对象被孤立时主动重新解析路径（代价是引入一个后台重解析机制）。
 
+## 加载与"是否已加载"的判断
+
+`.ko` 要选与设备内核对应的那一份（例如 5.15 设备用 `susfs_guard_lkm-android13-5.15.ko`）。KernelSU 设备用
+`ksud insmod <file>`；**非 KernelSU 设备**用 release 附带的加载器 `susfs_insmod <file>`（不需要 KernelSU，也不需要内核补丁）。
+卸载都是 `rmmod susfs_guard_lkm`。
+
+**不要用 `lsmod` 判断是否已加载。** 模块会把自己的那一行从 `/proc/modules` 里去掉，而且**对所有调用者都一样，root 也不例外**
+—— 上游 builtin 内根本没有"模块条目"这回事，只对非 root 隐藏的话，root 的 `lsmod` 仍会留下 builtin 不存在的痕迹。因此：
+
+```sh
+lsmod | grep susfs                            # 永远是 0 行，不代表没加载
+ls -d /sys/module/susfs_guard_lkm             # ← 这个才代表已加载（root 可见）
+ls /sys/module/susfs_guard_lkm/parameters/    # 参数节点在，也说明已加载
+```
+
+重复加载会因为模块已在内存里而失败（`init_module failed: File exists (os error 17)`，即 `-EEXIST`）；想重载先 `rmmod`。
+
+**不能直接用裸 `insmod`。** 本模块引用的符号里有两类在内核的模块加载器那里过不去：
+
+- **命名空间导入**：`kern_path` / `ihold` / `override_creds` / `revert_creds` 在 GKI 构建里是
+  `EXPORT_SYMBOL_NS(…, ANDROID_GKI_VFS_EXPORT_ONLY)`，而各树的 `Makefile` 会在编译前把这个名字改写成那个长串。
+  不导入**改写后的串**就会被拒绝：
+  `module uses symbol (kern_path) from namespace VFS_internal_… , but does not import it` → `Unknown symbol … (err -22)`。
+  源码里已加 `MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver)`，CI 还会断言它进了产物的 `.modinfo`。
+- **导出表里根本没有的符号**（`kallsyms_lookup_name` / `kallsyms_lookup` / `kallsyms_lookup_size_offset` /
+  `saved_boot_config` / `task_work_add` / `init_mm` / `__set_fixmap` / `copy_to_kernel_nofault` /
+  `dcache_clean_inval_poc`，以及随内核版本变化的 `strnlen_user` / `security_secctx_to_secid`）：直接 ELF 引用**永远**解析不了 ——
+  除非像 `susfs_insmod`（和 KernelSU 的 `ksud`）那样，在用户态把每个未定义符号就地改写成
+  **`SHN_ABS` + `/proc/kallsyms` 里的运行时地址**再调 `init_module(2)`。内核的 `simplify_symbols()` 只对 `SHN_UNDEF` 做解析，
+  `SHN_ABS` 直接跳过 ⇒ `Unknown symbol`、命名空间检查、CRC 校验全都不适用。这条路不需要内核补丁，只要 root + 可读
+  `/proc/kallsyms`；非 root（或 `kptr_restrict=2` 且改不动 sysctl）时它会看到全零地址并**拒绝加载**。
+
+裸 `insmod` 报的 `insmod: failed to load …: No such file or directory` 里那个 `-ENOENT` 来自内核模块加载器（最后一个
+`Unknown symbol` 的 errno），**不是文件不存在**，看到它不要去找路径问题。vermagic 不是障碍：DDK 构建出来的 `5.15.202-…`
+与设备上的 `5.15.180-…` 会被接受，因为本模块的 `__versions` 段存在（大小为 0），`same_magic()` 只比较第一个空格之后的尾巴；
+加载器仍保留"内核真的抱怨 vermagic 时，从 `/dev/kmsg` 读出期望值、就地改写 `.modinfo` 后重试一次"的兜底。
+
+**模块没加载时，`ksu_susfs add_*` 会报"不支持"而不是"没加载"**：
+
+```
+[-] CMD: '0x555c0', SUSFS operation not supported, please enable it in kernel
+```
+
+原因：内核若没有接管 reboot supercall，`reboot(2)` 直接返回 `-EINVAL`，而工具只看 `payload.err` —— 它自己预置的
+`126`（`ERR_CMD_NOT_SUPPORTED`）原封不动，于是"没人应答"被显示成"内核不支持"。判断办法同上（先确认
+`/sys/module/susfs_guard_lkm`），必要时看 dmesg 里有没有 `susfs_guard_lkm: loaded.` 这一行。
+
+`add_open_redirect` 需要**三个**参数（工具自己的 usage 少印了第三个）：
+
+```sh
+ksu_susfs add_open_redirect <target> <redirected> <uid_scheme>   # uid_scheme: 0..4
+```
+
 ## 另见
 
-- 另一条通道（超调用，KernelSU 的 `ksu_susfs` 用它）见 [README](README.md) 的加载/判断小节。
-- 被隐藏路径为什么会被放宽到 0777、以及"隐藏 ≠ 访问控制"的完整说明：见 [README](README.md) 的"使用前必读"。
+- 隐藏路径为什么会被放宽到 0777、以及"隐藏 ≠ 访问控制"的完整说明：见 [README](README.md) 的"功能"一节。
+- 换设备/换内核变体后的自检脚本：见 [tools/verify-gki.sh](tools/verify-gki.sh)。
