@@ -184,6 +184,22 @@ jobs:
             echo "::warning::no symbol CRCs in this build tree: load-time version checks are inert (Module.symvers has no CRC entries)"
           fi
 
+          echo "--- symbol namespace imports ---"
+          # kern_path / ihold / override_creds / revert_creds are EXPORT_SYMBOL_NS(..,
+          # ANDROID_GKI_VFS_EXPORT_ONLY), which each tree's Makefile rewrites to the long
+          # namespace string before the compiler stringifies it.  A module that does not
+          # import the RESULTING string is refused by the kernel's loader with
+          #   "module uses symbol (kern_path) from namespace VFS_internal_... but does not
+          #    import it" -> "Unknown symbol kern_path (err -22)"
+          # so the import must actually be present in this artifact.  It is a build-system
+          # fact that is invisible in the source, which is why it is asserted here rather
+          # than trusted: an imported-but-unused namespace is harmless, a missing one is
+          # load-fatal.
+          readelf -p .modinfo "$f" 2>/dev/null | grep 'import_ns' || {
+            echo "::error::no import_ns entry in $f - kern_path/ihold/override_creds/revert_creds will be refused with -EINVAL on the variants that namespace them (see MODULE_IMPORT_NS in kernel/susfs_main.c)"
+            exit 1
+          }
+
       - name: Upload .ko
         uses: actions/upload-artifact@v4
         with:
