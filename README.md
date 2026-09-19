@@ -222,6 +222,22 @@ show_probes=3/3 (show_vfsstat/show_mountinfo/show_vfsmnt)
 
 也就是说这个信号**几乎全是内核固有的**（正 dentry 比负 dentry 贵），本模块只把差值改了 ±0.2 µs，`openat`/`statx` 甚至更快。它只给出 1 bit："这个我猜得到名字的路径存在、只是被拒了"，拿不到内容、也不能用来扫描。想关掉这个面，只能让查找阶段本身就失败（需要重做一层入口拦截）或把 dentry 摘出缓存——两者代价都更大，属设计取舍。
 
+## 换设备/换内核后的自检：`tools/verify-gki.sh`
+
+一份 `.ko` 换到别的 GKI 变体上是否真的能用，只有那台设备能回答。把脚本和对应变体的 `.ko`、加载器推到设备，然后一条命令：
+
+```sh
+adb push tools/verify-gki.sh susfs_guard_lkm-android14-6.1.ko susfs_insmod /data/local/tmp/
+adb shell "su -c 'cp /data/local/tmp/susfs_guard_lkm-android14-6.1.ko /data/adb/loader/susfs_guard_lkm.ko'"
+adb shell "su -c 'sh /data/local/tmp/verify-gki.sh'"
+```
+
+它会按顺序量：能否加载（6.1+ 上 hook 原型不匹配是 CFI panic，不是警告 —— 若手机在这里重启/黑屏，那本身就是结论，见脚本头部怎么取 pstore）、13 个 hook 是否都作为**链表首节点**插入并且每行 `before` 指向被顶掉的那个节点、非 root 探测时计数是否增长、被隐藏的东西是否仍对 2000/10000 返回 ENOENT（**若返回 EACCES 会单独判失败** —— 那意味着路径可见、只是被 DAC/SELinux 拒了）、普通规则是否仍只对 app 生效、三轮重载是否零告警、挂载层 `show_probes=3/3`。
+
+结果同时写进 `/data/local/tmp/verify-gki-<时间>.txt`，把**那个文件**发回来即可（脚本结束时会把内容重放到 stdout，用的是保存下来的原始 fd，不是 `cat` 到自己的日志里 —— 第一版就是那样把 `/data` 写到 94% 的）。
+
+选项：`--ko <路径>`、`--loader <路径>`、`--cycles <n>`、`--map-rule <真实 .so>`（给 sus_map 加一条规则以激活 6.1+ 的 maple-tree VMA 遍历计数）、`--no-restore`。注意：脚本会多次重载模块，所以**你自己的运行期配置（sus_path 规则、挂载前缀、开关）不会全部恢复**，只有挂载前缀与开关会复原，规则需要你重新加。
+
 ## 接口文档
 
 全部 `/proc` 控制节点（读回格式、写命令、错误契约、以及它们共同遵守的三条规则：0777 让 DAC 让路、open/write 都查 uid、由 sus_path 自隐藏给出 ENOENT）与相关 sysfs 参数，见 **[PROC_INTERFACES.md](PROC_INTERFACES.md)**。
