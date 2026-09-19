@@ -1304,7 +1304,7 @@ static long sus_path_filter(unsigned long buf, long count,
  *                      `asmlinkage long f(const struct pt_regs *regs)`: the user
  *                      arguments are NOT in this frame, x0 holds the caller's pt_regs
  *                      (SC_ARM64_REGS_TO_ARGS), and the buffer is that pt_regs' regs[1];
- *   SUS_DIRENT_DIRECT  __do_*/__se_* receive the declared C arguments like any ordinary
+ *   SUS_DIRENT_DIRECT  __do_* / __se_* receive the declared C arguments like any ordinary
  *                      kernel function, so argument 1 is the buffer.
  *
  * The regsp read is the live syscall pt_regs on the kernel stack, so it cannot be NULL
