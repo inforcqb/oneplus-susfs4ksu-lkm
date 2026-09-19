@@ -116,8 +116,13 @@ jobs:
             if [ -n "$d" ] && [ -f "$d/include/linux/lsm_hooks.h" ]; then T="$d"; break; fi
           done
           echo "=== kernel tree: $T ==="
-          echo "--- LINUX_VERSION_CODE (from the tree's own utsrelease.h) ---"
-          cat "$T/include/generated/utsrelease.h" 2>/dev/null || true
+          echo "--- the version this build's LINUX_VERSION_CODE gates are evaluated against ---"
+          # The kdir (objtree) is where a prepared tree keeps its generated headers; the
+          # src tree may not have them.  version.h is what LINUX_VERSION_CODE expands
+          # from, utsrelease.h is the human-readable release.
+          G="${KDIR:-$T}/include/generated"
+          cat "$G/uapi/linux/version.h" 2>/dev/null || true
+          cat "$G/utsrelease.h" 2>/dev/null || cat "$T/include/generated/utsrelease.h" 2>/dev/null || true
           echo "--- inode timestamps (i_ctime became __i_ctime + inode_get_ctime() in 6.6) ---"
           grep -nE 'i_atime;|i_mtime;|_i_ctime;|inode_get_ctime|inode_set_ctime' "$T/include/linux/fs.h" | head -8 || true
           echo "--- the mm's vma container (mm->mmap list before 6.1, mm->mm_mt from 6.1) ---"
