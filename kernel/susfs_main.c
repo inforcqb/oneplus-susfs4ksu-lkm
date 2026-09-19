@@ -250,4 +250,31 @@ static void __exit susfs_exit(void)
 module_init(susfs_init);
 module_exit(susfs_exit);
 MODULE_LICENSE("GPL");
+
+/* The VFS symbol namespace of this kernel's GKI builds.
+ *
+ * Four symbols this module imports - kern_path and ihold (fs/), override_creds and
+ * revert_creds (kernel/cred.c) - are exported as
+ * EXPORT_SYMBOL_NS(sym, ANDROID_GKI_VFS_EXPORT_ONLY), and the Android build maps that
+ * name to the long string below with a per-directory ccflag before the compiler
+ * stringifies it (fs/Makefile: subdir-ccflags-y += -DANDROID_GKI_VFS_EXPORT_ONLY=...,
+ * plus kernel/Makefile for cred.o on some releases).  A module that does not import the
+ * RESULTING string is refused by the kernel's module loader with
+ *   "module uses symbol (kern_path) from namespace VFS_internal_... but does not import
+ *    it"  ->  "Unknown symbol kern_path (err -22)"
+ * which is why plain insmod failed on the phone before this line existed.
+ *
+ * The long form must be written out literally: MODULE_IMPORT_NS(ns) stringifies its
+ * argument, so passing the macro name ANDROID_GKI_VFS_EXPORT_ONLY would import a
+ * namespace that no kernel ever creates.  (Measured on the built .ko: .modinfo carried
+ * no import_ns entry at all.)
+ *
+ * Note this is necessary but NOT sufficient for plain insmod: nine further symbols we
+ * reference are not in the kernel's export table in any of the six supported GKI
+ * variants (kallsyms_lookup_name and friends, saved_boot_config, task_work_add, init_mm,
+ * __set_fixmap, copy_to_kernel_nofault, dcache_clean_inval_poc), so loading without a
+ * helper still needs those to be resolved at runtime.  The userspace loader
+ * (tools/susfs_insmod.c) sidesteps the whole question by rewriting undefined symbols to
+ * absolute addresses, exactly as KernelSU's ksud does - see README. */
+MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
 MODULE_DESCRIPTION("SUSFS guard LKM (susfs_guard_lkm) v2.3.0-gki");
