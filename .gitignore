@@ -54,3 +54,6 @@ kernel/ih_hook_stub.S
 
 # namespace-probe helper used by t_clonens.sh
 nsprobe.sh
+
+# local scratch: downloaded CI artifacts, device scripts and CI logs used while verifying
+dist/
