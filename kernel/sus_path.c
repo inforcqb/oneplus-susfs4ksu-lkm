@@ -1295,21 +1295,62 @@ static atomic_t n_dirent_calls[SUS_DIRENT_N];
 static long sus_path_filter(unsigned long buf, long count,
                             const struct sus_dirent_layout *lay);
 
-/* One kretprobe per ABI.  The return handler has to know its layout, and
- * struct kretprobe_instance has no back-pointer to the probe on 5.15, so the
- * layout is baked in by the macro rather than looked up per instance. */
-#define SUS_PATH_DIRENT_PROBE(sym, layname)                                     \
-    static int kr_##layname##_entry(struct kretprobe_instance *ri,              \
-                                    struct pt_regs *regs)                       \
+/* Where the caller's arguments live depends on WHICH name got armed, so the two
+ * argument styles are the only difference between the probes below - the entry handler
+ * still just stashes the caller's buffer in ri->data, and everything else (the filter
+ * call, the layout, the n_dirent_calls accounting) is identical:
+ *
+ *   SUS_DIRENT_REGSP   the syscall-table wrapper (__arm64_sys_*, __arm64_compat_sys_*) is
+ *                      `asmlinkage long f(const struct pt_regs *regs)`: the user
+ *                      arguments are NOT in this frame, x0 holds the caller's pt_regs
+ *                      (SC_ARM64_REGS_TO_ARGS), and the buffer is that pt_regs' regs[1];
+ *   SUS_DIRENT_DIRECT  __do_*/__se_* receive the declared C arguments like any ordinary
+ *                      kernel function, so argument 1 is the buffer.
+ *
+ * The regsp read is the live syscall pt_regs on the kernel stack, so it cannot be NULL
+ * for a syscall-table call; the explicit check degrades a surprise to "this call is not
+ * filtered" (buf 0, which the return handler already skips) rather than oopsing in a
+ * kprobe. */
+enum sus_dirent_style {
+    SUS_DIRENT_REGSP = 0,
+    SUS_DIRENT_DIRECT,
+    SUS_DIRENT_STYLE_N,
+};
+
+static unsigned long sus_path_dirent_arg_buf(struct pt_regs *regs, int style)
+{
+    const struct pt_regs *cregs;
+
+    if (style != SUS_DIRENT_REGSP)
+        return regs_get_kernel_argument(regs, 1);
+
+    cregs = (const struct pt_regs *)regs_get_kernel_argument(regs, 0);
+    if (!cregs)
+        return 0;
+    return cregs->regs[1];
+}
+
+/* One kretprobe per (layout, argument style) - four in total, and .kp.symbol_name is
+ * deliberately left NULL: a kretprobe struct carries exactly one symbol name, so which
+ * candidate a struct goes in under is decided at registration time
+ * (sus_dirent_candidates[] below), not at compile time.
+ *
+ * The return handler has to know its layout, and struct kretprobe_instance has no
+ * back-pointer to the probe on 5.15, so the layout is baked in by the macro rather than
+ * looked up per instance; the style is baked in as well, so the entry handler needs no
+ * branch of its own. */
+#define SUS_PATH_DIRENT_PROBE(layname, stylename, styleid)                      \
+    static int kr_##layname##_##stylename##_entry(struct kretprobe_instance *ri, \
+                                                  struct pt_regs *regs)        \
     {                                                                          \
         struct sus_path_dirent_args *a = (struct sus_path_dirent_args *)ri->data; \
                                                                                \
-        a->buf = regs_get_kernel_argument(regs, 1);                            \
+        a->buf = sus_path_dirent_arg_buf(regs, styleid);                        \
         return 0;                                                              \
     }                                                                          \
                                                                                \
-    static int kr_##layname##_ret(struct kretprobe_instance *ri,               \
-                                  struct pt_regs *regs)                        \
+    static int kr_##layname##_##stylename##_ret(struct kretprobe_instance *ri,  \
+                                                struct pt_regs *regs)          \
     {                                                                          \
         const struct sus_path_dirent_args *a =                                 \
             (const struct sus_path_dirent_args *)ri->data;                     \
@@ -1326,52 +1367,150 @@ static long sus_path_filter(unsigned long buf, long count,
         return 0;                                                              \
     }                                                                          \
                                                                                \
-    static struct kretprobe krp_##layname = {                                  \
-        .kp.symbol_name = sym,                                                 \
-        .entry_handler = kr_##layname##_entry,                                 \
-        .handler = kr_##layname##_ret,                                         \
+    static struct kretprobe krp_##layname##_##stylename = {                    \
+        .entry_handler = kr_##layname##_##stylename##_entry,                   \
+        .handler = kr_##layname##_##stylename##_ret,                           \
         .data_size = sizeof(struct sus_path_dirent_args),                      \
         .maxactive = 64,                                                       \
     }
 
-SUS_PATH_DIRENT_PROBE("__do_sys_getdents64", l64);
-SUS_PATH_DIRENT_PROBE("__do_compat_sys_getdents", compat);
+SUS_PATH_DIRENT_PROBE(l64, regsp, SUS_DIRENT_REGSP);
+SUS_PATH_DIRENT_PROBE(l64, direct, SUS_DIRENT_DIRECT);
+SUS_PATH_DIRENT_PROBE(compat, regsp, SUS_DIRENT_REGSP);
+SUS_PATH_DIRENT_PROBE(compat, direct, SUS_DIRENT_DIRECT);
+
+/* WHICH NAME TO PROBE, and why it is a list rather than one string.
+ *
+ * arch/arm64/include/asm/syscall_wrapper.h (the same expansion in android12-5.10,
+ * android13-5.15 and android14-6.1) turns __SYSCALL_DEFINEx into three functions:
+ *
+ *   asmlinkage long __arm64_sys##name(const struct pt_regs *regs);  - GLOBAL: the
+ *       syscall table references it, so this symbol exists in every build;
+ *   static long __se_sys##name(...);                                - static, one caller;
+ *   static inline long __do_sys##name(...)                          - static inline, one
+ *       caller in the same TU, so clang is free to inline it away and leave NO symbol
+ *       behind at all.
+ *
+ * COMPAT_SYSCALL_DEFINEx has exactly the same shape under the compat spelling
+ * (__arm64_compat_sys_*, __se_compat_sys_*, __do_compat_sys_*).
+ *
+ * That is not theoretical.  MEASURED on the 6.1 device: registering
+ * "__do_sys_getdents64" and "__do_compat_sys_getdents" both came back -ENOENT
+ * (kallsyms_lookup_name() found no such symbol), which left the dirent layer unarmed
+ * there.  The reason the old name still works on the 5.15 device this module is tested
+ * on is that that kernel is a vendor build without LTO - and inlining needs no LTO: a
+ * single-caller `static inline` is inlined on its own.  gki_defconfig additionally
+ * carries CONFIG_LTO_CLANG_FULL=y on android12-5.10 and android13-5.15 (6.1/6.6 have no
+ * LTO setting at all), so __do_* is not a name to depend on in ANY stock GKI build of
+ * these releases.
+ *
+ * So the wrapper is tried FIRST: it is the only name guaranteed to exist, and arming it
+ * on 5.15 exercises the exact code path 6.1/6.6 will use (the regs-pointer argument
+ * style below), which is what makes the hardware check worth something for the releases
+ * that cannot be tested from here.  The direct-style names stay as fallbacks for a tree
+ * that kept one of them; __se_* is listed last because a name that only survives while
+ * its single caller was not inlined is the least likely of the three.
+ *
+ * The other obvious targets are static on every one of these releases - filldir/filldir64
+ * are `static bool` on 6.1/6.6 and `static int` on 5.10/5.15 (fs/readdir.c) - so they are
+ * not reachable by name either, and no probe is placed on them. */
+
+struct sus_dirent_candidate {
+    const char *name;
+    unsigned char style;        /* enum sus_dirent_style */
+};
+
+#define SUS_DIRENT_CAND_N 3
+
+static const struct sus_dirent_candidate
+sus_dirent_candidates[SUS_DIRENT_N][SUS_DIRENT_CAND_N] = {
+    [SUS_DIRENT_L64] = {
+        {"__arm64_sys_getdents64",      SUS_DIRENT_REGSP},
+        {"__do_sys_getdents64",         SUS_DIRENT_DIRECT},
+        {"__se_sys_getdents64",         SUS_DIRENT_DIRECT},
+    },
+    [SUS_DIRENT_COMPAT] = {
+        {"__arm64_compat_sys_getdents", SUS_DIRENT_REGSP},
+        {"__do_compat_sys_getdents",    SUS_DIRENT_DIRECT},
+        {"__se_compat_sys_getdents",    SUS_DIRENT_DIRECT},
+    },
+};
+
+/* Which struct each candidate registers through: one per (layout, argument style), so a
+ * candidate is never tried on a struct that is still carrying another name. */
+static struct kretprobe *const sus_dirent_probes[SUS_DIRENT_N][SUS_DIRENT_STYLE_N] = {
+    [SUS_DIRENT_L64]    = {&krp_l64_regsp,    &krp_l64_direct},
+    [SUS_DIRENT_COMPAT] = {&krp_compat_regsp, &krp_compat_direct},
+};
+
+static const char *const sus_dirent_abi_name[SUS_DIRENT_N] = {
+    [SUS_DIRENT_L64]    = "getdents64 (native 61 + AArch32 217)",
+    [SUS_DIRENT_COMPAT] = "getdents (AArch32 141)",
+};
 
 static bool dirent_probe_registered[SUS_DIRENT_N];
+/* The name that actually armed and the struct it armed through: the pair is what the
+ * unregister path needs, so exactly the probe that went in is the one that comes out. */
+static const char *dirent_probe_armed_name[SUS_DIRENT_N];
+static struct kretprobe *dirent_probe_armed_kp[SUS_DIRENT_N];
 
 static void sus_path_dirent_register(void)
 {
-    struct kretprobe *probes[SUS_DIRENT_N] = { &krp_l64, &krp_compat };
     int i, c = 0;
 
     for (i = 0; i < SUS_DIRENT_N; i++) {
-        int rc = register_kretprobe(probes[i]);
+        char tried[192];
+        size_t off = 0;
+        int j;
 
-        if (rc) {
-            /* This is the one thing the LSM slots cannot do, so say so: without it
-             * a hidden entry shows up in every listing. */
-            pr_warn("sus_path: kretprobe(%s) failed %d - that ABI's listings are not filtered\n",
-                    probes[i]->kp.symbol_name, rc);
-            continue;
+        tried[0] = '\0';
+        for (j = 0; j < SUS_DIRENT_CAND_N; j++) {
+            const struct sus_dirent_candidate *cd = &sus_dirent_candidates[i][j];
+            struct kretprobe *p = sus_dirent_probes[i][cd->style];
+            int rc;
+
+            /* addr stays NULL and only the name is set, so each attempt resolves its
+             * own name instead of inheriting a resolved address from an earlier one. */
+            p->kp.symbol_name = cd->name;
+            rc = register_kretprobe(p);
+            off += scnprintf(tried + off, sizeof(tried) - off,
+                             "%s%s rc=%d", off ? ", " : "", cd->name, rc);
+            if (!rc) {
+                dirent_probe_registered[i] = true;
+                dirent_probe_armed_name[i] = cd->name;
+                dirent_probe_armed_kp[i] = p;
+                c++;
+                break;
+            }
         }
-        dirent_probe_registered[i] = true;
-        c++;
+        if (!dirent_probe_registered[i])
+            /* This is the one thing the LSM slots cannot do, so say so: without it a
+             * hidden entry shows up in every listing.  Every candidate that was tried is
+             * named with its rc, so a future log says which names this kernel is
+             * missing instead of only that "it failed". */
+            pr_warn("sus_path: kretprobe for %s: every candidate failed (%s) - that ABI's listings are not filtered\n",
+                    sus_dirent_abi_name[i], tried);
     }
     if (c)
-        SUSFS_LOGI("sus_path: listing filter armed (%d/%d ABIs: getdents64 native+AArch32, getdents AArch32)\n",
-                c, (int)SUS_DIRENT_N);
+        SUSFS_LOGI("sus_path: listing filter armed (%d/%d ABIs: l64=%s compat=%s)\n",
+                   c, (int)SUS_DIRENT_N,
+                   dirent_probe_armed_name[SUS_DIRENT_L64] ?
+                       dirent_probe_armed_name[SUS_DIRENT_L64] : "none",
+                   dirent_probe_armed_name[SUS_DIRENT_COMPAT] ?
+                       dirent_probe_armed_name[SUS_DIRENT_COMPAT] : "none");
 }
 
 static void sus_path_dirent_unregister(void)
 {
-    struct kretprobe *probes[SUS_DIRENT_N] = { &krp_l64, &krp_compat };
     int i;
 
     for (i = 0; i < SUS_DIRENT_N; i++) {
         if (!dirent_probe_registered[i])
             continue;
-        unregister_kretprobe(probes[i]);
+        unregister_kretprobe(dirent_probe_armed_kp[i]);
         dirent_probe_registered[i] = false;
+        dirent_probe_armed_name[i] = NULL;
+        dirent_probe_armed_kp[i] = NULL;
     }
 }
 

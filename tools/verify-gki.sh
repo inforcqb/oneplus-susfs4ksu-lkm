@@ -11,6 +11,9 @@
 #     panic, not a warning - if the phone reboots here, that IS the result: see below)
 #   * did the 13 hooks land as the FIRST node of their lists, ahead of SELinux
 #   * do they actually run (counters move on a non-root probe)
+#   * is a registered entry absent from a LISTING as well, not just from stat() - the name
+#     layer is a separate kretprobe and it died silently on 6.1 while stat() kept answering
+#     ENOENT, so the two layers are checked separately
 #   * is everything they hide still hidden, and is an ordinary rule still app-only
 #   * does anything alarm across unload/reload cycles
 #   * the 6.1+ VMA walk (maple tree) counters, if a map rule is armed
@@ -204,6 +207,71 @@ if [ "$HAVE_SU" = "1" ]; then
     o=$(app "stat -c %n $TMPF")
     [ -n "$o" ] && ok "after del, uid 10000 sees it again" || bad "after del, uid 10000 still gets ENOENT"
     rm -f "$TMPF"
+
+    sec "5b. the dirent (name) layer: a registered entry is not in a listing either"
+    # The LSM slots answer stat()/open(); they cannot touch a listing, because the
+    # directory chain is built inside the filesystem and no per-entry callback is
+    # reachable from a module.  A listing therefore tests the OTHER layer - and that is
+    # the layer that died silently on 6.1, where its kretprobe symbol (__do_sys_getdents64)
+    # had been inlined away: every registered entry kept appearing in every listing while
+    # stat() still answered ENOENT.  That combination is exactly what this section catches.
+    #
+    # Judged on a NAMED entry, never on "the output was empty": the directory holds the
+    # registered entry AND an unregistered neighbour, and the neighbour has to still be
+    # listed.  It is read by an app uid, because an ordinary rule is app-only (uid >= 10000,
+    # section 5) - a shell uid sits below that gate ON PURPOSE and still sees ordinary rules,
+    # so it cannot be the reader for this half.
+    DD=/data/local/tmp/verify-gki-dirent
+    rm -rf "$DD"; mkdir -p "$DD" 2>/dev/null
+    : > "$DD/registered_entry"; : > "$DD/visible_neighbour"
+    chmod 755 "$DD"; chmod 644 "$DD/registered_entry" "$DD/visible_neighbour"
+    echo "add $DD/registered_entry" > /proc/susfs_path; info "add rc=$?"
+    sleep 1
+    d_root=$(ls "$DD" 2>&1)
+    d_app=$(app "ls $DD" 2>&1); d_rc=$?
+    info "root      ls: $(echo $d_root | tr '\n' ' ')"
+    info "uid 10000 ls (rc=$d_rc): $(echo $d_app | tr '\n' ' ')"
+    if [ "$d_rc" -ne 0 ]; then
+        bad "uid 10000 could not list $DD (rc=$d_rc): the listing check is INCONCLUSIVE, not a pass - check DAC/SELinux on $DD"
+    else
+        case "$d_app" in
+            *registered_entry*) bad "the registered entry is STILL in the uid-10000 listing - the dirent layer is not filtering" ;;
+            *) ok "uid 10000: the registered entry is absent from the listing" ;;
+        esac
+        case "$d_app" in
+            *visible_neighbour*) ok "uid 10000: the unregistered neighbour is still listed (so this cannot pass by an empty listing)" ;;
+            *) bad "uid 10000: the unregistered neighbour is missing too - the listing is broken rather than filtered" ;;
+        esac
+    fi
+    case "$d_root" in
+        *registered_entry*) ok "root still sees the registered entry" ;;
+        *) bad "root lost the registered entry as well - that is not the app gate" ;;
+    esac
+
+    # The same question for one of the module's own control nodes: those are self-protect
+    # rules, hidden from EVERY non-root uid, so uid 2000 is the right reader for them.  Both
+    # halves are required and they are different layers - ENOENT from stat is the LSM layer,
+    # absence from a listing is the dirent layer.
+    d_shell=$(nonroot 'ls /proc' 2>&1); d_src=$?
+    d_nodes=$(echo "$d_shell" | grep -c '^susfs_')
+    info "uid 2000 ls /proc rc=$d_src, susfs_* entries = $d_nodes"
+    if [ "$d_src" -ne 0 ]; then
+        bad "uid 2000 could not list /proc (rc=$d_src): inconclusive"
+    elif [ "$d_nodes" = "0" ]; then
+        ok "uid 2000: no susfs_* control node appears in a /proc listing"
+    else
+        bad "uid 2000: $d_nodes susfs_* control node(s) still appear in a /proc listing"
+    fi
+    deny_ok "uid 2000" 2000 /proc/susfs_kstat
+
+    echo "del $DD/registered_entry" > /proc/susfs_path
+    sleep 1
+    d_app=$(app "ls $DD" 2>&1)
+    case "$d_app" in
+        *registered_entry*) ok "after del, uid 10000 sees the entry in the listing again" ;;
+        *) bad "after del, uid 10000 still does not see the entry - the rule table is stuck, or the listing failed: '$d_app'" ;;
+    esac
+    rm -rf "$DD"
 
     sec "6. second procfs instance (a container's /proc), if present"
     if [ -e /data/local/tmp/ubuntu2/proc/susfs_kstat ]; then

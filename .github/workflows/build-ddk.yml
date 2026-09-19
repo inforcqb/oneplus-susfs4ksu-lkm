@@ -217,6 +217,74 @@ jobs:
             exit 1
           fi
 
+      # The dirent layer probes a syscall entry point BY NAME (kernel/sus_path.c:
+      # sus_dirent_candidates[]), and which of those names survives is a property of the
+      # BUILD, not of the source: __arm64_sys_* is referenced by the syscall table and so
+      # always exists, while __do_*/__se_* are `static inline`/`static` with a single caller
+      # and can be inlined away (measured on a 6.1 device: __do_sys_getdents64 and
+      # __do_compat_sys_getdents were both gone, kallsyms_lookup_name() found neither, and
+      # the listing filter was never armed there).
+      #
+      # The module now tries the wrapper first, so what has to hold at runtime is that the
+      # WRAPPER exists.  If this variant's DDK tree ships a built image or a symbol map, that
+      # is checkable here, before anyone loads anything.  If it ships neither - which is the
+      # case for a headers-only DDK image - this step cannot say anything at all and says so
+      # out loud, instead of passing silently as if it had verified something.
+      - name: Check the getdents probe symbols in the DDK tree (best effort)
+        run: |
+          set -e
+          V="${{ matrix.variant }}"
+          S=""
+          for d in "${KDIR:-}" "${KERNEL_SRC:-}" "/opt/ddk/kdir/$V" "/opt/ddk/src/$V" /opt/ddk/kdir/* /opt/ddk/src/*; do
+            if [ -n "$d" ] && { [ -f "$d/vmlinux" ] || [ -f "$d/System.map" ]; }; then S="$d"; break; fi
+          done
+          if [ -z "$S" ]; then
+            echo "no vmlinux/System.map in the DDK image, runtime getdents symbol check skipped"
+            exit 0
+          fi
+          echo "=== symbol source: $S ==="
+          ls -la "$S/vmlinux" "$S/System.map" 2>/dev/null || true
+
+          # System.map first (it is names only and cheap); vmlinux via nm, then via
+          # readelf -sW for an image nm cannot read.  Returns the match count on stdout.
+          sym_count() {
+            _s="$1"; _n=0
+            if [ -f "$S/System.map" ]; then
+              _n=$(grep -cE "(^|[[:space:]])${_s}$" "$S/System.map" 2>/dev/null || true)
+            fi
+            if [ "${_n:-0}" = "0" ] && [ -f "$S/vmlinux" ]; then
+              _n=$(nm "$S/vmlinux" 2>/dev/null | grep -cE "(^|[[:space:]])${_s}$" || true)
+            fi
+            if [ "${_n:-0}" = "0" ] && [ -f "$S/vmlinux" ]; then
+              _n=$(readelf -sW "$S/vmlinux" 2>/dev/null | grep -cE "[[:space:]]${_s}$" || true)
+            fi
+            echo "${_n:-0}"
+          }
+
+          # Informational: the whole candidate list, so a variant's log shows which of the
+          # three fallbacks would have been available as well.
+          echo "--- candidates from kernel/sus_path.c (informational) ---"
+          for s in __arm64_sys_getdents64 __do_sys_getdents64 __se_sys_getdents64 \
+                   __arm64_compat_sys_getdents __do_compat_sys_getdents __se_compat_sys_getdents; do
+            printf '  %-32s %s\n' "$s" "$(sym_count "$s")"
+          done
+
+          # Hard error: the two names the module arms FIRST and therefore depends on at
+          # runtime.  Without them the dirent layer is dead on this variant and a hidden
+          # entry shows up in every listing.
+          echo "--- asserted ---"
+          fail=0
+          for s in __arm64_sys_getdents64 __arm64_compat_sys_getdents; do
+            n=$(sym_count "$s")
+            printf '  %-32s %s\n' "$s" "$n"
+            if [ "$n" = "0" ]; then
+              echo "::error::$s is not in $S (variant $V) - this is the getdents wrapper the LKM arms first (kernel/sus_path.c: sus_dirent_candidates[]); without it the dirent filter cannot arm on this variant"
+              fail=1
+            fi
+          done
+          [ "$fail" = "0" ] || exit 1
+          echo "both getdents wrapper symbols present in $S"
+
       - name: Upload .ko
         uses: actions/upload-artifact@v4
         with:
