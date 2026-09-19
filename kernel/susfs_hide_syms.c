@@ -23,6 +23,8 @@
 #include <linux/string.h>
 #include <linux/proc_fs.h>	/* the runtime control node */
 #include <linux/cred.h>		/* current_uid() */
+#include <linux/slab.h>		/* kvmalloc()/kvfree() on 6.1+ */
+#include <linux/mm.h>		/* kvmalloc()/kvfree() on 5.10-5.15 */
 #include "susfs_log.h"
 #include "susfs.h"		/* sus_path_add_self_hidden / sus_path_del_path */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact (kallsyms_op) */
@@ -139,14 +141,23 @@ static void hide_modules_sync_sysfs(void)
 
 /* Parse @val into @dst and return the count, or a negative errno.  Separators are
  * spaces, commas and tabs, so both the insmod form (hide_modules=a,b) and the /proc
- * form (a b) work. */
+ * form (a b) work.
+ *
+ * @buf is 1136 bytes and the caller below is checked against the same 2048-byte frame
+ * limit, so it is allocated rather than kept on the stack (see hide_modules_command);
+ * both frontends are proc/module_param setters, i.e. process context. */
 static int hide_modules_parse(const char *val, char dst[][MODULE_NAME_LEN], int max)
 {
-	char buf[HIDE_MODULES_CMDLINE];
+	char *buf;
 	const char *p;
 	int n = 0;
+	int rc;
 
-	strscpy(buf, val, sizeof(buf));
+	buf = kvmalloc(HIDE_MODULES_CMDLINE, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	strscpy(buf, val, HIDE_MODULES_CMDLINE);
 	p = buf;
 	while (*p) {
 		char *tok = (char *)p;
@@ -162,15 +173,22 @@ static int hide_modules_parse(const char *val, char dst[][MODULE_NAME_LEN], int 
 		len = (int)(p - tok);
 		if (len <= 0)
 			continue;
-		if (len >= MODULE_NAME_LEN)
-			return -ENAMETOOLONG;	/* longer than any module name */
-		if (n >= max)
-			return -ENOSPC;
+		if (len >= MODULE_NAME_LEN) {
+			rc = -ENAMETOOLONG;	/* longer than any module name */
+			goto out;
+		}
+		if (n >= max) {
+			rc = -ENOSPC;
+			goto out;
+		}
 		memcpy(dst[n], tok, len);
 		dst[n][len] = '\0';
 		n++;
 	}
-	return n;
+	rc = n;
+out:
+	kvfree(buf);
+	return rc;
 }
 
 static void hide_modules_commit(char dst[][MODULE_NAME_LEN], int n)
@@ -192,15 +210,34 @@ static void hide_modules_commit(char dst[][MODULE_NAME_LEN], int n)
  * a bare value (`hide_modules=a,b`), so its setter accepts a command-less list.  The
  * /proc node does NOT: a typo there would otherwise silently *replace* the list with
  * whatever was typed - measured during the first device test, where a deliberately
- * bogus command discarded the list and the next read showed a name nobody meant. */
+ * bogus command discarded the list and the next read showed a name nobody meant.
+ *
+ * The two staging buffers (1136 + 1024 bytes) are heap-allocated: as locals they made
+ * this function's frame 3024 bytes once the inliner folded hide_modules_parse() (and its
+ * own 1136-byte buffer) into it, which the 5.10/5.15 builds reported on every build:
+ *   "ld.lld: warning: stack frame size (3024) exceeds limit (2048) in function
+ *    'hide_modules_command'"
+ * (5.15/android14-5.15 also as "susfs_hide_syms.c:197:0: stack frame size (3024)
+ * exceeds limit (2048)"), and 6.x turns that warning into an error.  Both callers are
+ * proc/module_param setters - process context - so GFP_KERNEL is fine.  The command
+ * semantics are unchanged; the early returns now go through one exit. */
 static int hide_modules_command(const char *val, bool bare_list)
 {
-	char cmd[HIDE_MODULES_CMDLINE];
-	char staged[HIDE_MODULES_MAX][MODULE_NAME_LEN];
+	char *cmd;
+	char (*staged)[MODULE_NAME_LEN];
 	const char *arg;
 	int i, n;
+	int rc = 0;
 
-	strscpy(cmd, val, sizeof(cmd));
+	cmd = kvmalloc(HIDE_MODULES_CMDLINE, GFP_KERNEL);
+	staged = kvmalloc_array(HIDE_MODULES_MAX, MODULE_NAME_LEN, GFP_KERNEL);
+	if (!cmd || !staged) {
+		kvfree(cmd);
+		kvfree(staged);
+		return -ENOMEM;
+	}
+
+	strscpy(cmd, val, HIDE_MODULES_CMDLINE);
 	for (i = (int)strlen(cmd) - 1; i >= 0 && (cmd[i] == '\n' || cmd[i] == '\r' || cmd[i] == ' '); i--)
 		cmd[i] = '\0';
 
@@ -208,17 +245,19 @@ static int hide_modules_command(const char *val, bool bare_list)
 		hide_modules_commit(staged, 0);
 		hide_modules_sync_sysfs();
 		SUSFS_LOGI("hide_modules: list cleared (no module is filtered)\n");
-		return 0;
+		goto out;
 	}
 
 	if (!strncmp(cmd, "set ", 4)) {
 		n = hide_modules_parse(cmd + 4, staged, HIDE_MODULES_MAX);
-		if (n < 0)
-			return n;
+		if (n < 0) {
+			rc = n;
+			goto out;
+		}
 		hide_modules_commit(staged, n);
 		hide_modules_sync_sysfs();
 		SUSFS_LOGI("hide_modules: list set to %d name(s)\n", n);
-		return 0;
+		goto out;
 	}
 
 	if (!strncmp(cmd, "add ", 4) || !strncmp(cmd, "del ", 4)) {
@@ -227,8 +266,10 @@ static int hide_modules_command(const char *val, bool bare_list)
 		arg = cmd + 4;
 		while (*arg == ' ')
 			arg++;
-		if (!*arg || strlen(arg) >= MODULE_NAME_LEN)
-			return -EINVAL;
+		if (!*arg || strlen(arg) >= MODULE_NAME_LEN) {
+			rc = -EINVAL;
+			goto out;
+		}
 
 		/* Rebuild from the current list: one entry added or dropped. */
 		spin_lock(&hide_modules_lock);
@@ -250,7 +291,7 @@ static int hide_modules_command(const char *val, bool bare_list)
 					continue;
 				found = true;
 				if (adding)
-					return 0;		/* already listed */
+					goto out;	/* already listed */
 				memmove(&staged[i], &staged[i + 1],
 					(size_t)(n - i - 1) * MODULE_NAME_LEN);
 				n--;
@@ -258,32 +299,43 @@ static int hide_modules_command(const char *val, bool bare_list)
 			}
 			if (adding) {
 				if (found)
-					return 0;
-				if (n >= HIDE_MODULES_MAX)
-					return -ENOSPC;
+					goto out;
+				if (n >= HIDE_MODULES_MAX) {
+					rc = -ENOSPC;
+					goto out;
+				}
 				strscpy(staged[n], arg, MODULE_NAME_LEN);
 				n++;
 			} else if (!found) {
-				return -ENOENT;			/* not listed */
+				rc = -ENOENT;		/* not listed */
+				goto out;
 			}
 		}
 		hide_modules_commit(staged, n);
 		hide_modules_sync_sysfs();
 		SUSFS_LOGI("hide_modules: %s %s -> %d name(s) filtered\n",
 			adding ? "add" : "del", arg, n);
-		return 0;
+		goto out;
 	}
 
-	if (!bare_list)
-		return -EINVAL;
+	if (!bare_list) {
+		rc = -EINVAL;
+		goto out;
+	}
 
 	n = hide_modules_parse(cmd, staged, HIDE_MODULES_MAX);
-	if (n < 0)
-		return n;
+	if (n < 0) {
+		rc = n;
+		goto out;
+	}
 	hide_modules_commit(staged, n);
 	hide_modules_sync_sysfs();
 	SUSFS_LOGI("hide_modules: list set to %d name(s)\n", n);
-	return 0;
+
+out:
+	kvfree(staged);
+	kvfree(cmd);
+	return rc;
 }
 
 static int hide_modules_format(char *buf, size_t size)
