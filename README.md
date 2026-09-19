@@ -7,22 +7,39 @@ SUSFS 的**可加载内核模块（LKM）移植版**，目标是让锁定 bootlo
 上游 [susfs4ksu](https://gitlab.com/simonpunk/susfs4ksu) 是 KernelSU 的内核补丁，v2.0 起采用**编译期内联**（直接 patch 内核源码树），要求能刷自定义内核。本仓库把它移植为独立 `.ko`：
 
 - **构建**：用 Android DDK 预构建内核头（`ghcr.io/ylarod/ddk-min`），无需完整内核源码树。
-- **符号解析**：模块直接 `extern` 引用未导出符号，由 `ksud insmod` 加载时通过 kallsyms 重定位。
+- **符号解析**：模块直接 `extern` 引用未导出符号，由加载器（`susfs_insmod` 或 KernelSU 的 `ksud`）在装载时通过
+  kallsyms 把运行时地址填进去。
 - **hook 方式**：kprobe（入口/出口） + `patch_memory`（改只读内存/fixmap） + `lsm_hook`（LSM 挂载本身）。
   `lsm_hook` 现在有两条路：`sus_path` 的 13 个 hook 走**头插**——把自己的 `struct security_hook_list` 节点插到
   `security_hook_heads` 对应链表的**头部**（在 SELinux 之前），返回 0 就让内核链继续调用 SELinux，因此函数指针仍由我们写、
   但**不再需要解析并回调 SELinux 的原函数**（也就不再依赖各版本 CFI 方案下的符号形态：5.10/5.15 的 `.cfi_jt` 或 6.1+ 的 kCFI hash）；
   其余仍走"替换槽位 + 保存原函数回调"的路径（`hook->insert` 未置位时）。两条路都用 `__nocfi` 包住我们发起的间接调用。
 
-## 已验证的能力（在目标 GKI 设备上实测）
+## 功能
 
-| 能力 | 结论 |
-|---|---|
-| kprobe/kretprobe hook 非导出符号 | ✅ |
-| 读/写 SELinux 私有结构体（`selinux_state`） | ✅ 偏移精确匹配 |
-| `ksud insmod` 重定位未导出符号 | ✅ |
-| patch 只读内存 + 改 LSM 函数指针（CFI 穿透） | ✅ |
-| **13 个 sus_path hook 头插进 `security_hook_heads`** | ✅ 实测：13/13 条 `inserted <hook> as the first node of its list (head …, before …, replacement …)`，`before` 指向的正是 SELinux 自己的节点；一次 `rmmod` 对应 13 条 `removed … node from its list`；随后 3 轮 `rmmod`+重载中 `BUG:/WARNING:/Oops/CFI failure/list corruption/general protection` 计数为 0，且 `hide_list` 计数在非 root 探测时照常增长（钩子确实在跑） |
+- **kprobe / kretprobe**：挂非导出内核符号的入口与出口（`/proc/mounts`、`/proc/<pid>/mountinfo`、
+  `getdents64`、`statx` 等）。
+- **`patch_memory`**：改写只读内核内存与 fixmap（文本补丁原语）。
+- **`lsm_hook`**：LSM 挂载本身，两条路：
+  - `sus_path` 的 13 个 hook 走**头插**——把自己的 `struct security_hook_list` 节点插到 `security_hook_heads`
+    对应链表的**头部**（在 SELinux 之前），返回 0 就让内核链继续调用 SELinux。因此不需要解析、也不需要回调
+    SELinux 的原函数，也就不依赖各版本 CFI 方案下那个槽位里放的是什么（5.10/5.15 的 `.cfi_jt` 蹦床、6.1+ 的 kCFI hash）；
+    插入的 hook 只可能增加拒绝，不会吞掉其它 LSM 的结论。
+  - 其余 hook 走"替换槽位 + 保存原函数回调"（`hook->insert` 未置位时）。
+  - 两条路都用 `__nocfi` 包住本模块发起的间接调用。
+- **`symbol_resolver`**：运行期按名字解析内核符号（kallsyms 遍历 + kprobe 自举），因此模块可以直接 `extern`
+  引用未导出符号，由加载器在装载时把地址填进去。
+- **`sus_path`**：按路径隐藏（inode 层 + dirent 层 + name 操作），支持 `add` / `del` / `clear`，身份键为
+  `(dev, ino)`（指针只作缓存）。
+- **`hide_modules`**：按名字把其它内核模块从 `/proc/modules`、`/sys/module/<名字>`、`/proc/kallsyms` 去掉。
+- **`hide_mounts`**：可配置的挂载前缀表，决定哪些挂载算"我们的"，配合 `hide_sus_mnts_for_non_su_procs` 对非 su 进程隐藏。
+- **`sus_mount`**：`statx` / `fdinfo` 的 `mnt_id` 改写、挂载表过滤、跨命名空间同步。
+- **`sus_map`**：映射层（`maps` / `smaps` / `pagemap`）。
+- **`sus_kstat`**、**`open_redirect`**、**`spoof_cmdline`**、**`avc_spoof`**、**`uname`**：对应上游各特性。
+- **控制面**：`/proc/susfs_*` 节点 + 同名 sysfs 参数 + KernelSU 超调用；全部由模块自隐藏，非 root 一律 `ENOENT`。
+- **六个 GKI 变体**各一份 `.ko`（`android12-5.10` / `android13-5.10` / `android13-5.15` / `android14-5.15` /
+  `android14-6.1` / `android15-6.6`），每棵树的 hook 原型与 API 差异按版本门控。
+- **自带用户态加载器** `susfs_insmod`：不需要 KernelSU，也不需要内核补丁。
 
 ## 构建
 
@@ -51,36 +68,26 @@ rmmod susfs_guard_lkm
 ksud insmod /data/adb/loader/susfs_guard_lkm.ko
 ```
 
-**为什么不能直接用裸 `insmod`。** 实测（OnePlus SM8550 / 5.15 vendor 内核），同一个文件：
-
-```
-# toybox insmod /data/adb/loader/susfs_guard_lkm.ko
-insmod: failed to load ...: No such file or directory        ← 这是内核模块加载器返回的 -ENOENT，不是文件不存在
-dmesg: 10 行 "Unknown symbol ... (err -2)"
-  init_mm / kallsyms_lookup_name / strnlen_user / saved_boot_config / task_work_add /
-  security_secctx_to_secid / __set_fixmap / copy_to_kernel_nofault /
-  dcache_clean_inval_poc / kallsyms_lookup
-
-# susfs_insmod /data/adb/loader/susfs_guard_lkm.ko
-undefined symbols: 96 → resolved 96/96; unresolved 0
-loaded → OK: /sys/module/susfs_guard_lkm exists            ← rc=0，模块起来，功能照常
-```
-
-原因分两类，都被实测过：
+**为什么不能直接用裸 `insmod`。** 本模块引用的符号里有两类在内核的模块加载器那里过不去：
 
 - **命名空间导入**：`kern_path` / `ihold` / `override_creds` / `revert_creds` 在 GKI 构建里是
   `EXPORT_SYMBOL_NS(…, ANDROID_GKI_VFS_EXPORT_ONLY)`，而各树的 `Makefile` 会在编译前把这个名字改写成那个长串。
   不导入**改写后的串**就会被内核拒绝（`… but does not import it` → `Unknown symbol … (err -22)`）。源码里已经加了
   `MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver)`，CI 还会断言它真的进了产物的 `.modinfo`。
-- **导出表里根本没有的符号**（上面列的那 10 个）：直接 ELF 引用**永远**解析不了，任何加载器都救不了 ——
-  除非像 `susfs_insmod`（和 KernelSU 的 `ksud`）那样，在用户态把每个未定义符号就地改写成
+- **导出表里根本没有的符号**（`kallsyms_lookup_name` / `kallsyms_lookup` / `kallsyms_lookup_size_offset` /
+  `saved_boot_config` / `task_work_add` / `init_mm` / `__set_fixmap` / `copy_to_kernel_nofault` /
+  `dcache_clean_inval_poc`，以及随内核版本变化的 `strnlen_user` / `security_secctx_to_secid`）：直接 ELF 引用
+  **永远**解析不了 —— 除非像 `susfs_insmod`（和 KernelSU 的 `ksud`）那样，在用户态把每个未定义符号就地改写成
   **`SHN_ABS` + `/proc/kallsyms` 里的运行时地址**再调 `init_module(2)`。内核的 `simplify_symbols()` 只对 `SHN_UNDEF`
-  做解析，`SHN_ABS` 直接跳过 ⇒ `Unknown symbol`、命名空间检查、CRC 校验全都不适用。这条路**不需要任何内核补丁**，
-  只要 root + 可读 `/proc/kallsyms`；作为非 root（或 `kptr_restrict=2` 且改不动 sysctl）时它会看到全零地址并**拒绝加载**。
+  做解析，`SHN_ABS` 直接跳过 ⇒ `Unknown symbol`、命名空间检查、CRC 校验全都不适用。这条路不需要内核补丁，
+  只要 root + 可读 `/proc/kallsyms`；非 root（或 `kptr_restrict=2` 且改不动 sysctl）时它会看到全零地址并**拒绝加载**。
 
-顺带：DDK 构建出来的 vermagic 是 `5.15.202-…` 而设备跑 `5.15.180-…`，这**不**是障碍 ——
-本模块的 `__versions` 段存在（大小为 0）会让 `same_magic()` 只比较第一个空格之后的尾巴。加载器仍保留"内核真的抱怨
-vermagic 时，从 `/dev/kmsg` 读出期望值、就地改写 `.modinfo` 后重试一次"的兜底（已用改坏的副本验证过）。
+裸 `insmod` 报的 `insmod: failed to load …: No such file or directory` 里那个 `-ENOENT` 来自内核模块加载器
+（最后一个 `Unknown symbol` 的 errno），**不是文件不存在**，看到它不要去找路径问题。
+
+vermagic 不是障碍：DDK 构建出来的 `5.15.202-…` 与设备上的 `5.15.180-…` 会被接受，因为本模块的 `__versions`
+段存在（大小为 0），`same_magic()` 只比较第一个空格之后的尾巴。加载器仍保留"内核真的抱怨 vermagic 时，
+从 `/dev/kmsg` 读出期望值、就地改写 `.modinfo` 后重试一次"的兜底。
 
 ### 怎么判断它是否已经加载（**不要用 `lsmod`**）
 
@@ -140,7 +147,7 @@ echo "add frida" > /sys/module/susfs_guard_lkm/parameters/hide_modules
 
 默认列表只有**本模块自己**：builtin 版 SUSFS 没有模块条目，留一个下来就是上游没有的痕迹。`clear` 是排查用的模式（`lsmod` 会重新列出本模块）。
 
-**另一个边界（实测）**：只过滤"这个模块自己的那一行"。如果别的模块**依赖**它，`/proc/modules` 的"used by"列里仍会出现它的名字，例如隐藏 `explorer` 之后：
+**另一个边界**：只过滤"这个模块自己的那一行"。如果别的模块**依赖**它，`/proc/modules` 的"used by"列里仍会出现它的名字，例如隐藏 `explorer` 之后：
 
 ```
 camera 10440704 35 explorer, Live 0x0000000000000000 (OE)
@@ -164,22 +171,13 @@ echo reset                   > /proc/susfs_hide_mounts             # 回到默�
 # insmod 时也可以：susfs_guard_lkm.ko hide_mounts=/data/adb/,/data/local/tmp/
 ```
 
-改动列表会**立即重扫当前命名空间**（`mount prefixes: 2/8, rescans=1`），已经在挂的路径不用重新启用；此后新建的挂载由 `attach_recursive_mnt` 的 kretprobe 现挂现记。前缀是**锚定比较**（`strncmp`），不是子串搜索——`/mnt/media_rw/x/data/adb/y` 这种源串不算我们的（实测过，按子串匹配会误伤无关挂载）。
+改动列表会**立即重扫当前命名空间**（`mount prefixes: 2/8, rescans=1`），已经在挂的路径不用重新启用；此后新建的挂载由 `attach_recursive_mnt` 的 kretprobe 现挂现记。前缀是**锚定比较**（`strncmp`），不是子串搜索——`/mnt/media_rw/x/data/adb/y` 这种源串不算我们的。
 
-隐藏本身仍按上游的开关，默认**关**：
+隐藏本身仍按上游的开关，默认**关**，且只对**非 su 进程**生效（su 域始终能看到）：
 
 ```sh
 ksu_susfs hide_sus_mnts_for_non_su_procs 1
 ```
-
-实测（OnePlus SM8550，prefix 加上 `/data/local/tmp/` 后启用，读者＝真实 adb shell，uid 2000、`u:r:shell:s0`）：
-
-| 文件 | 启用前 | 启用后 |
-|---|---|---|
-| `/proc/self/mountinfo` 里 `ubuntu2` 的行数 | 4 | **0** |
-| `/proc/mounts` | 4 | **0** |
-| `/proc/self/mountstats` | 4 | **0** |
-| su 侧（对照，只对非 su 隐藏） | 4 | 4 |
 
 `mount_stat` 里能读到这件事的状态：
 
@@ -213,30 +211,21 @@ show_probes=3/3 (show_vfsstat/show_mountinfo/show_vfsmnt)
 
 ## 另一个需要知道的取舍：被隐藏的路径"更快"
 
-我们的拒绝发生在 DAC/SELinux **之前**，所以隐藏路径的耗时接近"路径存在"那一类。实测（配对采样，`tools/susfs_bench.c -p`，一批 200 次调用、120 个样本）：
+我们的拒绝发生在 DAC/SELinux **之前**，所以隐藏路径的返回耗时接近"路径存在"那一类，而不是"路径不存在"。这个差值**主要来自内核本身**（正 dentry 比负 dentry 贵），本模块只把它改动很小的一点；它只给出 1 bit ——"这个我猜得到名字的路径存在、只是被拒了"，拿不到内容，也不能用来扫描。想彻底关掉这个面，只能让查找阶段本身就失败（需要重做一层入口拦截）或把 dentry 摘出缓存，两者代价都更大，属设计取舍。
 
-| 对比 | 结果 |
-|---|---|
-| 被隐藏 vs 真正不存在（都返回 ENOENT） | 阈值判 0 的分类正确率 95–99%，差值 0.3–1.4 µs |
-| **模块完全没加载时**：存在 vs 不存在 | 97–100%，差值 0.25–1.35 µs |
+## 自检工具：`tools/verify-gki.sh`
 
-也就是说这个信号**几乎全是内核固有的**（正 dentry 比负 dentry 贵），本模块只把差值改了 ±0.2 µs，`openat`/`statx` 甚至更快。它只给出 1 bit："这个我猜得到名字的路径存在、只是被拒了"，拿不到内容、也不能用来扫描。想关掉这个面，只能让查找阶段本身就失败（需要重做一层入口拦截）或把 dentry 摘出缓存——两者代价都更大，属设计取舍。
-
-## 换设备/换内核后的自检：`tools/verify-gki.sh`
-
-一份 `.ko` 换到别的 GKI 变体上是否真的能用，只有那台设备能回答。把脚本和对应变体的 `.ko`、加载器推到设备，然后一条命令：
+换设备或换内核变体后，用它在那台设备上过一遍全部功能（能否加载、13 个 hook 是否头插成功、计数是否增长、各隐藏面是否仍对 2000/10000 返回 ENOENT、普通规则是否仍只对 app 生效、重载是否零告警、挂载层三条探针是否都挂上）：
 
 ```sh
 adb push tools/verify-gki.sh susfs_guard_lkm-android14-6.1.ko susfs_insmod /data/local/tmp/
-adb shell "su -c 'cp /data/local/tmp/susfs_guard_lkm-android14-6.1.ko /data/adb/loader/susfs_guard_lkm.ko'"
+adb shell "su -c 'mkdir -p /data/adb/loader && cp /data/local/tmp/susfs_guard_lkm-android14-6.1.ko /data/adb/loader/susfs_guard_lkm.ko'"
 adb shell "su -c 'sh /data/local/tmp/verify-gki.sh'"
 ```
 
-它会按顺序量：能否加载（6.1+ 上 hook 原型不匹配是 CFI panic，不是警告 —— 若手机在这里重启/黑屏，那本身就是结论，见脚本头部怎么取 pstore）、13 个 hook 是否都作为**链表首节点**插入并且每行 `before` 指向被顶掉的那个节点、非 root 探测时计数是否增长、被隐藏的东西是否仍对 2000/10000 返回 ENOENT（**若返回 EACCES 会单独判失败** —— 那意味着路径可见、只是被 DAC/SELinux 拒了）、普通规则是否仍只对 app 生效、三轮重载是否零告警、挂载层 `show_probes=3/3`。
-
-结果同时写进 `/data/local/tmp/verify-gki-<时间>.txt`，把**那个文件**发回来即可（脚本结束时会把内容重放到 stdout，用的是保存下来的原始 fd，不是 `cat` 到自己的日志里 —— 第一版就是那样把 `/data` 写到 94% 的）。
-
-选项：`--ko <路径>`、`--loader <路径>`、`--cycles <n>`、`--map-rule <真实 .so>`（给 sus_map 加一条规则以激活 6.1+ 的 maple-tree VMA 遍历计数）、`--no-restore`。注意：脚本会多次重载模块，所以**你自己的运行期配置（sus_path 规则、挂载前缀、开关）不会全部恢复**，只有挂载前缀与开关会复原，规则需要你重新加。
+结果同时写入 `/data/local/tmp/verify-gki-<时间>.txt`。选项：`--ko`、`--loader`、`--cycles <n>`、
+`--map-rule <真实 .so>`（给 sus_map 加规则以激活 6.1+ 的 maple-tree VMA 遍历计数）、`--no-restore`。
+注意脚本会多次重载模块，你自己的运行期配置（sus_path 规则等）需要事后重新加。
 
 ## 接口文档
 
