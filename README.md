@@ -22,6 +22,7 @@ SUSFS 的**可加载内核模块（LKM）移植版**，目标是让锁定 bootlo
 | 读/写 SELinux 私有结构体（`selinux_state`） | ✅ 偏移精确匹配 |
 | `ksud insmod` 重定位未导出符号 | ✅ |
 | patch 只读内存 + 改 LSM 函数指针（CFI 穿透） | ✅ |
+| **13 个 sus_path hook 头插进 `security_hook_heads`** | ✅ 实测：13/13 条 `inserted <hook> as the first node of its list (head …, before …, replacement …)`，`before` 指向的正是 SELinux 自己的节点；一次 `rmmod` 对应 13 条 `removed … node from its list`；随后 3 轮 `rmmod`+重载中 `BUG:/WARNING:/Oops/CFI failure/list corruption/general protection` 计数为 0，且 `hide_list` 计数在非 root 探测时照常增长（钩子确实在跑） |
 
 ## 构建
 
