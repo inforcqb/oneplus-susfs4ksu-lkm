@@ -8,7 +8,11 @@ SUSFS 的**可加载内核模块（LKM）移植版**，目标是让锁定 bootlo
 
 - **构建**：用 Android DDK 预构建内核头（`ghcr.io/ylarod/ddk-min`），无需完整内核源码树。
 - **符号解析**：模块直接 `extern` 引用未导出符号，由 `ksud insmod` 加载时通过 kallsyms 重定位。
-- **hook 方式**：kprobe（入口/出口） + `patch_memory`（改只读内存/fixmap） + `lsm_hook`（改 SELinux 函数指针），在 CFI 下用 `__nocfi` replacement 穿透。
+- **hook 方式**：kprobe（入口/出口） + `patch_memory`（改只读内存/fixmap） + `lsm_hook`（LSM 挂载本身）。
+  `lsm_hook` 现在有两条路：`sus_path` 的 13 个 hook 走**头插**——把自己的 `struct security_hook_list` 节点插到
+  `security_hook_heads` 对应链表的**头部**（在 SELinux 之前），返回 0 就让内核链继续调用 SELinux，因此函数指针仍由我们写、
+  但**不再需要解析并回调 SELinux 的原函数**（也就不再依赖各版本 CFI 方案下的符号形态：5.10/5.15 的 `.cfi_jt` 或 6.1+ 的 kCFI hash）；
+  其余仍走"替换槽位 + 保存原函数回调"的路径（`hook->insert` 未置位时）。两条路都用 `__nocfi` 包住我们发起的间接调用。
 
 ## 已验证的能力（在目标 GKI 设备上实测）
 
