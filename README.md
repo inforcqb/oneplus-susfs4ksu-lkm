@@ -36,28 +36,51 @@ make -C $KDIR M=$PWD/kernel ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules
 
 ## 加载
 
+**推荐：用本仓库自己的加载器，不需要 KernelSU。** 从 release 取对应变体的 `.ko` 与 `susfs_insmod`：
+
 ```sh
-ksud insmod /data/local/tmp/susfs_guard_lkm.ko
+# 内核版本对应的那一份，例如 5.15 设备用 susfs_guard_lkm-android13-5.15.ko
+susfs_insmod /data/adb/loader/susfs_guard_lkm.ko
 # 卸载
 rmmod susfs_guard_lkm
 ```
 
-**必须用 `ksud insmod`，不能用裸 `insmod`。** 实测（OnePlus SM8550 / 5.15 vendor 内核）：
+也可以继续用 KernelSU 的加载器（两者等价，任选）：
 
-```
-# insmod /data/adb/loader/susfs_guard_lkm.ko
-insmod: failed to load ...: No such file or directory
-dmesg:
-  susfs_guard_lkm: module uses symbol (kern_path) from namespace
-      VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver, but does not import it.
-  susfs_guard_lkm: Unknown symbol kern_path (err -22)
-  susfs_guard_lkm: Unknown symbol kallsyms_lookup_name (err -2)
-  ... ihold / override_creds / revert_creds / strnlen_user / task_work_add ...
+```sh
+ksud insmod /data/adb/loader/susfs_guard_lkm.ko
 ```
 
-这里的 `-ENOENT` 是内核模块加载器给出的（`Unknown symbol` 的最后一个 errno），**不是文件不存在**——
-同样的文件用 `ksud insmod` 一次就装上。上面那些符号在 GKI 构建树里是导出的、在这台 vendor 内核上不是，
-KernelSU 的加载器会按它自己的方式把它装进去。所以看到这种报错不要去找文件路径的问题。
+**为什么不能直接用裸 `insmod`。** 实测（OnePlus SM8550 / 5.15 vendor 内核），同一个文件：
+
+```
+# toybox insmod /data/adb/loader/susfs_guard_lkm.ko
+insmod: failed to load ...: No such file or directory        ← 这是内核模块加载器返回的 -ENOENT，不是文件不存在
+dmesg: 10 行 "Unknown symbol ... (err -2)"
+  init_mm / kallsyms_lookup_name / strnlen_user / saved_boot_config / task_work_add /
+  security_secctx_to_secid / __set_fixmap / copy_to_kernel_nofault /
+  dcache_clean_inval_poc / kallsyms_lookup
+
+# susfs_insmod /data/adb/loader/susfs_guard_lkm.ko
+undefined symbols: 96 → resolved 96/96; unresolved 0
+loaded → OK: /sys/module/susfs_guard_lkm exists            ← rc=0，模块起来，功能照常
+```
+
+原因分两类，都被实测过：
+
+- **命名空间导入**：`kern_path` / `ihold` / `override_creds` / `revert_creds` 在 GKI 构建里是
+  `EXPORT_SYMBOL_NS(…, ANDROID_GKI_VFS_EXPORT_ONLY)`，而各树的 `Makefile` 会在编译前把这个名字改写成那个长串。
+  不导入**改写后的串**就会被内核拒绝（`… but does not import it` → `Unknown symbol … (err -22)`）。源码里已经加了
+  `MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver)`，CI 还会断言它真的进了产物的 `.modinfo`。
+- **导出表里根本没有的符号**（上面列的那 10 个）：直接 ELF 引用**永远**解析不了，任何加载器都救不了 ——
+  除非像 `susfs_insmod`（和 KernelSU 的 `ksud`）那样，在用户态把每个未定义符号就地改写成
+  **`SHN_ABS` + `/proc/kallsyms` 里的运行时地址**再调 `init_module(2)`。内核的 `simplify_symbols()` 只对 `SHN_UNDEF`
+  做解析，`SHN_ABS` 直接跳过 ⇒ `Unknown symbol`、命名空间检查、CRC 校验全都不适用。这条路**不需要任何内核补丁**，
+  只要 root + 可读 `/proc/kallsyms`；作为非 root（或 `kptr_restrict=2` 且改不动 sysctl）时它会看到全零地址并**拒绝加载**。
+
+顺带：DDK 构建出来的 vermagic 是 `5.15.202-…` 而设备跑 `5.15.180-…`，这**不**是障碍 ——
+本模块的 `__versions` 段存在（大小为 0）会让 `same_magic()` 只比较第一个空格之后的尾巴。加载器仍保留"内核真的抱怨
+vermagic 时，从 `/dev/kmsg` 读出期望值、就地改写 `.modinfo` 后重试一次"的兜底（已用改坏的副本验证过）。
 
 ### 怎么判断它是否已经加载（**不要用 `lsmod`**）
 
