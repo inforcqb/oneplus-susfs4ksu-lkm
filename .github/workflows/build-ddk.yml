@@ -316,3 +316,25 @@ jobs:
           name: susfs_compat_stat
           path: /tmp/susfs_compat_stat
           if-no-files-found: warn
+
+      # The loading half of this project: it loads the .ko on a stock vendor kernel
+      # WITHOUT ksud, by rewriting every undefined symbol of the image to
+      # st_shndx=SHN_ABS / st_value=<kallsyms address> before init_module(2), so the
+      # kernel's SHN_UNDEF branch (resolve_symbol -> export lookup, namespace import,
+      # CRC check, KMI whitelist) is never entered at all.  See the source header.
+      - name: Build module loader (no-ksud insmod)
+        run: |
+          set -e
+          clang --target=aarch64-linux-gnu -O2 -nostdlib -static-pie \
+                -fno-stack-protector -fno-builtin -fuse-ld=lld -Wl,-e,_start \
+                -o /tmp/susfs_insmod tools/susfs_insmod.c
+          file /tmp/susfs_insmod
+          ls -la /tmp/susfs_insmod
+
+      - name: Upload module loader
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs_insmod
+          path: /tmp/susfs_insmod
+          if-no-files-found: warn
